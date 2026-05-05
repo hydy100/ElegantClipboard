@@ -100,11 +100,11 @@ function SortableTagItem({
     isDragging,
   } = useSortable({ id: tag.id });
 
-  const style = {
+  const style = useMemo(() => ({
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.5 : undefined,
-  };
+  }), [transform, transition, isDragging]);
 
   return (
     <div
@@ -281,6 +281,8 @@ export function TagsView() {
     [tags, selectedTagId],
   );
 
+  const tagIds = useMemo(() => tags.map((t) => t.id), [tags]);
+
   const sortedItems = useMemo(() => {
     if (sortMode === "custom") return tagItems;
     const items = [...tagItems];
@@ -305,6 +307,8 @@ export function TagsView() {
         return items;
     }
   }, [tagItems, sortMode]);
+
+  const sortedItemIds = useMemo(() => sortedItems.map((it) => it.id), [sortedItems]);
 
   const handleItemDragEnd = useCallback((event: DragEndEvent) => {
     const { active, over } = event;
@@ -377,7 +381,7 @@ export function TagsView() {
               modifiers={[restrictToVerticalAxis, restrictToParentElement]}
               onDragEnd={handleDragEnd}
             >
-              <SortableContext items={tags.map((t) => t.id)} strategy={verticalListSortingStrategy}>
+              <SortableContext items={tagIds} strategy={verticalListSortingStrategy}>
                 {tags.map((tag) => (
                   <SortableTagItem
                     key={tag.id}
@@ -552,7 +556,7 @@ export function TagsView() {
                   modifiers={[restrictToVerticalAxis, restrictToParentElement]}
                   onDragEnd={handleItemDragEnd}
                 >
-                  <SortableContext items={sortedItems.map((it) => it.id)} strategy={verticalListSortingStrategy}>
+                  <SortableContext items={sortedItemIds} strategy={verticalListSortingStrategy}>
                     {sortedItems.map((item, i) => (
                       <SortableTagItemRow
                         key={item.id}
@@ -861,11 +865,11 @@ function SortableTagItemRow({
     isDragging,
   } = useSortable({ id: item.id });
 
-  const style = {
+  const style = useMemo(() => ({
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.5 : undefined,
-  };
+  }), [transform, transition, isDragging]);
 
   const typeConfig = contentTypeConfig[item.content_type] ?? contentTypeConfig.text;
   const preview = item.preview ?? item.text_content ?? "";

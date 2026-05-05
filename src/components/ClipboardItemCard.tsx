@@ -357,13 +357,13 @@ export const ClipboardItemCard = memo(function ClipboardItemCard({
     },
   });
 
-  const style: React.CSSProperties = {
+  const style = useMemo<React.CSSProperties>(() => ({
     transform: CSS.Transform.toString(transform),
     transition: transition || undefined,
     opacity: isDragging ? 0 : 1,
     cursor: isDragging ? "grabbing" : "pointer",
     zIndex: isDragging ? 1000 : "auto",
-  };
+  }), [transform, transition, isDragging]);
 
   const config = contentTypeConfig[item.content_type] || contentTypeConfig.text;
 
@@ -375,6 +375,15 @@ export const ClipboardItemCard = memo(function ClipboardItemCard({
     if (showByteSize) items.push(formatSize(item.byte_size));
     return items;
   }, [showTime, showCharCount, showByteSize, timeFormat, item.created_at, item.char_count, item.byte_size]);
+
+  const preStyle = useMemo<React.CSSProperties>(() => ({
+    fontFamily: "var(--card-font-family)",
+    fontSize: "var(--card-font-size, 14px)",
+    display: "-webkit-box",
+    WebkitLineClamp: cardMaxLines,
+    WebkitBoxOrient: "vertical",
+    overflow: "hidden",
+  }), [cardMaxLines]);
 
   // ---- 事件处理 ----
   const clearTextPreviewTimer = useCallback(() => {
@@ -778,14 +787,7 @@ export const ClipboardItemCard = memo(function ClipboardItemCard({
             >
               <pre
                 className="clipboard-content leading-relaxed text-foreground/90 whitespace-pre-wrap break-all m-0"
-                style={{
-                  fontFamily: "var(--card-font-family)",
-                  fontSize: "var(--card-font-size, 14px)",
-                  display: "-webkit-box",
-                  WebkitLineClamp: cardMaxLines,
-                  WebkitBoxOrient: "vertical",
-                  overflow: "hidden",
-                }}
+                style={preStyle}
               >
                 {ttsToolbarEnabled ? (
                   <TtsHighlightText

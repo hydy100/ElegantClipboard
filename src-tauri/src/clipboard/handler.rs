@@ -293,6 +293,69 @@ impl ClipboardHandler {
         }
     }
 
+    /// 检查文本内容是否匹配内容过滤规则
+    /// 设置项：
+    ///   - `content_filter_enabled`: "true"/"false"（默认 false）
+    ///   - `content_filter_rules`: 换行分隔的正则表达式列表
+    ///
+    /// 任意一条规则匹配即排除该内容
+    pub fn is_content_excluded_by_rules(&self, content: &ClipboardContent) -> bool {
+        let enabled = self
+            .settings_repo
+            .get("content_filter_enabled")
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        if !enabled {
+            return false;
+        }
+
+        // 仅对文本类内容做正则匹配
+        let text = match content {
+            ClipboardContent::Text(t) => t.as_str(),
+            ClipboardContent::Html { text: Some(t), .. } => t.as_str(),
+            ClipboardContent::Html { html, .. } => html.as_str(),
+            ClipboardContent::Rtf { text: Some(t), .. } => t.as_str(),
+            _ => return false,
+        };
+
+        let rules = self
+            .settings_repo
+            .get("content_filter_rules")
+            .ok()
+            .flatten();
+
+        let rules = match rules {
+            Some(ref s) if !s.is_empty() => s,
+            _ => return false,
+        };
+
+        for line in rules.lines() {
+            let pattern = line.trim();
+            if pattern.is_empty() {
+                continue;
+            }
+            match regex::Regex::new(pattern) {
+                Ok(re) => {
+                    if re.is_match(text) {
+                        debug!(
+                            "内容被过滤规则排除: {:?} (文本长度={})",
+                            pattern,
+                            text.len()
+                        );
+                        return true;
+                    }
+                }
+                Err(e) => {
+                    warn!("无效的内容过滤正则 {:?}: {}", pattern, e);
+                }
+            }
+        }
+
+        false
+    }
+
     /// 处理剪贴板内容，去重后存入数据库
     pub fn process(
         &self,

@@ -30,48 +30,55 @@ interface CardFooterProps {
   sourceAppIcon?: string | null;
 }
 
-export const CardFooter = memo(({
+export const CardFooter = memo(function CardFooter({
   metaItems,
   index,
   showBadge = true,
   isDragOverlay,
   sourceAppName,
   sourceAppIcon,
-}: CardFooterProps) => (
-  <div className="flex items-center justify-between gap-1.5 text-xs text-muted-foreground mt-1.5 min-h-5">
-    <div className="flex items-center gap-1.5 min-w-0">
-      {metaItems.map((info, i) => (
-        <span key={i} className="flex items-center gap-1.5">
-          {i > 0 && <span className="text-muted-foreground/50">·</span>}
-          {info}
-        </span>
-      ))}
+}: CardFooterProps) {
+  const iconSrc = useMemo(
+    () => (sourceAppIcon ? convertFileSrc(sourceAppIcon) : undefined),
+    [sourceAppIcon],
+  );
+
+  return (
+    <div className="flex items-center justify-between gap-1.5 text-xs text-muted-foreground mt-1.5 min-h-5">
+      <div className="flex items-center gap-1.5 min-w-0">
+        {metaItems.map((info, i) => (
+          <span key={i} className="flex items-center gap-1.5">
+            {i > 0 && <span className="text-muted-foreground/50">·</span>}
+            {info}
+          </span>
+        ))}
+      </div>
+      <div className="flex items-center gap-1.5 shrink-0">
+        {iconSrc && (
+          <img
+            src={iconSrc}
+            alt=""
+            className="w-3.5 h-3.5 shrink-0"
+            draggable={false}
+          />
+        )}
+        {sourceAppName && (
+          <span className="truncate max-w-[128px]">{sourceAppName}</span>
+        )}
+        {index !== undefined && index >= 0 && !isDragOverlay && (
+          <span
+            className={cn(
+              "min-w-5 h-5 px-1.5 rounded-full bg-primary/10 flex items-center justify-center text-[10px] font-semibold text-primary transition-opacity duration-150",
+              showBadge ? "opacity-100" : "opacity-0",
+            )}
+          >
+            {index + 1}
+          </span>
+        )}
+      </div>
     </div>
-    <div className="flex items-center gap-1.5 shrink-0">
-      {sourceAppIcon && (
-        <img
-          src={convertFileSrc(sourceAppIcon)}
-          alt=""
-          className="w-3.5 h-3.5 shrink-0"
-          draggable={false}
-        />
-      )}
-      {sourceAppName && (
-        <span className="truncate max-w-[128px]">{sourceAppName}</span>
-      )}
-      {index !== undefined && index >= 0 && !isDragOverlay && (
-        <span
-          className={cn(
-            "min-w-5 h-5 px-1.5 rounded-full bg-primary/10 flex items-center justify-center text-[10px] font-semibold text-primary transition-opacity duration-150",
-            showBadge ? "opacity-100" : "opacity-0",
-          )}
-        >
-          {index + 1}
-        </span>
-      )}
-    </div>
-  </div>
-));
+  );
+});
 
 // ============ 图片悬浮预览（原生窗口） ============
 
@@ -603,6 +610,8 @@ export const ImageCard = memo(function ImageCard({
   // 虚拟列表复用组件时，image_path 变化需重置错误状态
   useEffect(() => setError(false), [image_path]);
 
+  const imgSrc = useMemo(() => convertFileSrc(image_path), [image_path]);
+
   return (
     <div className="flex-1 min-w-0 px-3 py-2.5">
       {error ? (
@@ -614,7 +623,7 @@ export const ImageCard = memo(function ImageCard({
         </div>
       ) : (
         <ImagePreview
-          src={convertFileSrc(image_path)}
+          src={imgSrc}
           alt="Preview"
           onError={() => setError(true)}
           imagePath={image_path}
@@ -653,10 +662,12 @@ const FileImagePreview = memo(function FileImagePreview({
 }) {
   const [imgError, setImgError] = useState(false);
   const showImageFileName = useUISettings((s) => s.showImageFileName);
-  const fileName = getFileNameFromPath(filePath);
+  const fileName = useMemo(() => getFileNameFromPath(filePath), [filePath]);
 
   // 虚拟列表复用组件时，filePath 变化需重置错误状态
   useEffect(() => setImgError(false), [filePath]);
+
+  const imgSrc = useMemo(() => convertFileSrc(filePath), [filePath]);
 
   if (imgError) {
     return (
@@ -689,7 +700,7 @@ const FileImagePreview = memo(function FileImagePreview({
   return (
     <div className="flex-1 min-w-0 px-3 py-2.5">
       <ImagePreview
-        src={convertFileSrc(filePath)}
+        src={imgSrc}
         alt={fileName}
         onError={() => setImgError(true)}
         imagePath={filePath}

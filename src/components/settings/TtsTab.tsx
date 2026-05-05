@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { Speaker216Regular } from "@fluentui/react-icons";
 import { useTtsSettings, type TtsEngine } from "@/stores/tts-settings";
@@ -65,6 +66,7 @@ export function TtsTab() {
     proxyUrl, setProxyUrl,
     highlightWord, setHighlightWord,
     showToolbarTts, setShowToolbarTts,
+    volume, setVolume, persistVolume,
     loaded, loadSettings,
   } = useTtsSettings();
 
@@ -140,6 +142,20 @@ export function TtsTab() {
                 </p>
               </div>
               <Switch checked={showToolbarTts} onCheckedChange={setShowToolbarTts} />
+            </div>
+            <div className="pt-4 mt-1 space-y-2">
+              <div className="flex items-center justify-between">
+                <Label className="text-xs">音量</Label>
+                <span className="text-xs font-medium tabular-nums w-10 text-right">{volume}%</span>
+              </div>
+              <Slider
+                value={[volume]}
+                onValueChange={(v) => setVolume(v[0])}
+                onValueCommit={(v) => persistVolume(v[0])}
+                min={0}
+                max={100}
+                step={1}
+              />
             </div>
           </>
         )}

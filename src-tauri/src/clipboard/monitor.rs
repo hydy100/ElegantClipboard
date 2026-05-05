@@ -191,6 +191,10 @@ impl CMHandler for MonitorHandler {
                 debug!("Clipboard change ignored (content type not allowed)");
                 return CallbackResult::Next;
             }
+            if handler.is_content_excluded_by_rules(&content) {
+                debug!("剪贴板变化已忽略（内容被过滤规则排除）");
+                return CallbackResult::Next;
+            }
             match handler.process(content, source) {
                 Ok(Some(id)) => {
                     debug!("Processed clipboard item: {}", id);

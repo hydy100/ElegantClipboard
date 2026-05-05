@@ -27,6 +27,9 @@ interface ClipboardListProps {
   searchInputRef: RefObject<HTMLInputElement | null>;
 }
 
+const NAV_KEYS_DEFAULT = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Enter", "Delete"]);
+const NAV_KEYS_SEARCH = new Set(["ArrowUp", "ArrowDown"]);
+
 function getPinnedBoundary(items: SortableClipboardItem[]): number {
   const firstUnpinnedIndex = items.findIndex((item) => !item.is_pinned);
   return firstUnpinnedIndex === -1 ? items.length : firstUnpinnedIndex;
@@ -71,6 +74,11 @@ const VIRTUOSO_SCROLL_SEEK_CONFIG = {
 };
 
 const VIRTUOSO_COMPONENTS = { ScrollSeekPlaceholder };
+
+const LIST_CONTAINER_MASK_STYLE: React.CSSProperties = {
+  maskImage: 'linear-gradient(to bottom, transparent, rgba(0,0,0,0.4) 2px, rgba(0,0,0,0.8) 4px, black 6px, black calc(100% - 10px), rgba(0,0,0,0.7) calc(100% - 6px), rgba(0,0,0,0.3) calc(100% - 3px), transparent)',
+  WebkitMaskImage: 'linear-gradient(to bottom, transparent, rgba(0,0,0,0.4) 2px, rgba(0,0,0,0.8) 4px, black 6px, black calc(100% - 10px), rgba(0,0,0,0.7) calc(100% - 6px), rgba(0,0,0,0.3) calc(100% - 3px), transparent)',
+};
 
 export function ClipboardList({ searchInputRef }: ClipboardListProps) {
   const listenerRef = useRef<(() => void) | null>(null);
@@ -429,10 +437,10 @@ export function ClipboardList({ searchInputRef }: ClipboardListProps) {
 
       // 搜索输入框仅透传上下导航，避免破坏左右移动光标/删除/回车输入语义
       const navKeys = isSearchInput
-        ? ["ArrowUp", "ArrowDown"]
-        : ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Enter", "Delete"];
+        ? NAV_KEYS_SEARCH
+        : NAV_KEYS_DEFAULT;
 
-      if (navKeys.includes(e.key)) {
+      if (navKeys.has(e.key)) {
         e.preventDefault();
         handleNavKey(e.key, e.shiftKey, isSearchInput ? "search-input" : "default");
       }
@@ -558,7 +566,7 @@ export function ClipboardList({ searchInputRef }: ClipboardListProps) {
       modifiers={modifiers}
       measuring={measuring}
     >
-      <div ref={listContainerRef} onMouseOver={handleToolbarMouseOver} onMouseOut={handleToolbarMouseOut} className="h-full relative" style={{ maskImage: 'linear-gradient(to bottom, transparent, rgba(0,0,0,0.4) 2px, rgba(0,0,0,0.8) 4px, black 6px, black calc(100% - 10px), rgba(0,0,0,0.7) calc(100% - 6px), rgba(0,0,0,0.3) calc(100% - 3px), transparent)', WebkitMaskImage: 'linear-gradient(to bottom, transparent, rgba(0,0,0,0.4) 2px, rgba(0,0,0,0.8) 4px, black 6px, black calc(100% - 10px), rgba(0,0,0,0.7) calc(100% - 6px), rgba(0,0,0,0.3) calc(100% - 3px), transparent)' }}>
+      <div ref={listContainerRef} onMouseOver={handleToolbarMouseOver} onMouseOut={handleToolbarMouseOut} className="h-full relative" style={LIST_CONTAINER_MASK_STYLE}>
         <OverlayScrollbarsComponent
           element="div"
           options={OVERLAY_SCROLLBARS_OPTIONS}

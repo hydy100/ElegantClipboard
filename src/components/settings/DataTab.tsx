@@ -237,6 +237,10 @@ export function DataTab({ settings, onSettingsChange }: DataTabProps) {
   const [cleanLoading, setCleanLoading] = useState(false);
   const [cleanMsg, setCleanMsg] = useState<string | null>(null);
 
+  // 数据库优化
+  const [vacuuming, setVacuuming] = useState(false);
+  const [vacuumMsg, setVacuumMsg] = useState<string | null>(null);
+
   const cleanActionConfig: Record<CleanAction, {
     title: string;
     description: string;
@@ -604,6 +608,40 @@ export function DataTab({ settings, onSettingsChange }: DataTabProps) {
           <h3 className="text-sm font-medium mb-1">数据清理</h3>
           <p className="text-xs text-muted-foreground mb-4">清理和重置应用数据</p>
           <div className="space-y-3">
+            <div className="flex items-center justify-between gap-4">
+              <div className="min-w-0">
+                <p className="text-sm">整理数据库</p>
+                <p className="text-xs text-muted-foreground">压缩数据库文件，回收碎片空间</p>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="shrink-0"
+                disabled={vacuuming}
+                onClick={async () => {
+                  setVacuuming(true);
+                  setVacuumMsg(null);
+                  try {
+                    await invoke("vacuum_database");
+                    setVacuumMsg("数据库整理完成");
+                    await refreshDataSize();
+                  } catch (error) {
+                    setVacuumMsg(`整理失败: ${error}`);
+                  } finally {
+                    setVacuuming(false);
+                  }
+                }}
+              >
+                <ArrowSync16Regular className={`w-4 h-4 mr-1.5${vacuuming ? " animate-spin" : ""}`} />
+                {vacuuming ? "整理中…" : "整理优化"}
+              </Button>
+            </div>
+            {vacuumMsg && (
+              <p className={`text-xs ${vacuumMsg.includes("失败") ? "text-destructive" : "text-muted-foreground"}`}>
+                {vacuumMsg}
+              </p>
+            )}
+            <div className="h-px bg-border" />
             <div className="flex items-center justify-between gap-4">
               <div className="min-w-0">
                 <p className="text-sm">清空剪贴板历史</p>

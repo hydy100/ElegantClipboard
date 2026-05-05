@@ -37,6 +37,8 @@ export interface TtsSettings {
   highlightWord: boolean;
   /** 悬浮工具栏显示朗读按钮 */
   showToolbarTts: boolean;
+  /** 音量 0–100 */
+  volume: number;
 }
 
 interface TtsSettingsStore extends TtsSettings {
@@ -57,6 +59,8 @@ interface TtsSettingsStore extends TtsSettings {
   setBrowserAccent: (accent: string) => void;
   setHighlightWord: (highlight: boolean) => void;
   setShowToolbarTts: (show: boolean) => void;
+  setVolume: (volume: number) => void;
+  persistVolume: (volume: number) => void;
 }
 
 const SETTING_KEYS: Record<string, keyof TtsSettings> = {
@@ -74,6 +78,7 @@ const SETTING_KEYS: Record<string, keyof TtsSettings> = {
   tts_browser_accent: "browserAccent",
   tts_highlight_word: "highlightWord",
   tts_show_toolbar: "showToolbarTts",
+  tts_volume: "volume",
 };
 
 export const useTtsSettings = create<TtsSettingsStore>((set, get) => ({
@@ -91,6 +96,7 @@ export const useTtsSettings = create<TtsSettingsStore>((set, get) => ({
   browserAccent: "en-US",
   highlightWord: true,
   showToolbarTts: false,
+  volume: 50,
   loaded: false,
 
   loadSettings: async () => {
@@ -115,6 +121,7 @@ export const useTtsSettings = create<TtsSettingsStore>((set, get) => ({
         browserAccent: m.get("tts_browser_accent") || "en-US",
         highlightWord: m.get("tts_highlight_word") !== "false",
         showToolbarTts: m.get("tts_show_toolbar") === "true",
+        volume: m.get("tts_volume") ? parseInt(m.get("tts_volume")!, 10) : 50,
         loaded: true,
       });
     } catch (error) {
@@ -199,6 +206,13 @@ export const useTtsSettings = create<TtsSettingsStore>((set, get) => ({
     set({ showToolbarTts });
     get().saveSetting("tts_show_toolbar", showToolbarTts ? "true" : "false");
     broadcastChange({ showToolbarTts });
+  },
+  setVolume: (volume) => {
+    set({ volume });
+    broadcastChange({ volume });
+  },
+  persistVolume: (volume) => {
+    get().saveSetting("tts_volume", String(volume));
   },
 }));
 

@@ -50,6 +50,8 @@ initTheme();
 // 加载翻译设置
 useTranslateSettings.getState().loadSettings();
 
+const NO_DRAG_STYLE = { WebkitAppRegion: 'no-drag' } as React.CSSProperties;
+
 /** 关闭已打开的弹出层 */
 function dismissOverlays(): boolean {
   const overlay = document.querySelector(
@@ -170,6 +172,10 @@ function App() {
   // 窗口出现时短暂抑制工具栏提示，防止闪烁
   const [suppressTooltips, setSuppressTooltips] = useState(false);
   const suppressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toolbarStyle = useMemo<React.CSSProperties>(() => ({
+    WebkitAppRegion: 'no-drag',
+    pointerEvents: suppressTooltips ? 'none' : undefined,
+  } as React.CSSProperties), [suppressTooltips]);
 
   // 隐藏设置变更时动态刷新主页列表
   const hideSettingsMountRef = useRef(true);
@@ -422,7 +428,7 @@ function App() {
                   ? "text-primary"
                   : "text-muted-foreground hover:text-foreground"
               )}
-              style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+              style={NO_DRAG_STYLE}
             >
               {selectedCategory === "__favorites__" ? (
                 <Star16Filled className="w-4 h-4" />
@@ -446,7 +452,7 @@ function App() {
                   ? "text-primary"
                   : "text-muted-foreground hover:text-foreground"
               )}
-              style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+              style={NO_DRAG_STYLE}
             >
               {tagsViewOpen ? (
                 <Tag16Filled className="w-4 h-4" />
@@ -459,7 +465,7 @@ function App() {
         </Tooltip>
 
         {/* 搜索栏 */}
-        <div className="relative flex-1" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+        <div className="relative flex-1" style={NO_DRAG_STYLE}>
           <Search16Regular className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground z-10" />
           <Input
             ref={inputRef}
@@ -483,7 +489,7 @@ function App() {
         {toolbarButtons.length > 0 && (
           <div 
             className="flex items-center gap-0.5 h-9 px-1 bg-background border rounded-md shadow-sm" 
-            style={{ WebkitAppRegion: 'no-drag', pointerEvents: suppressTooltips ? 'none' : undefined } as React.CSSProperties}
+            style={toolbarStyle}
           >
             {toolbarButtons.map((btn) => renderToolbarButton(btn))}
           </div>
@@ -493,7 +499,7 @@ function App() {
         <button
           onClick={() => invoke("hide_window").catch((e) => logError("Failed to hide window:", e))}
           className="w-7 h-7 flex items-center justify-center text-muted-foreground hover:bg-destructive/10 hover:text-destructive rounded-md transition-colors shrink-0"
-          style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+          style={NO_DRAG_STYLE}
         >
           <Dismiss16Regular className="w-4 h-4" />
         </button>

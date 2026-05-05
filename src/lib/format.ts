@@ -116,8 +116,8 @@ export function formatSize(bytes: number): string {
 }
 
 export function getFileNameFromPath(path: string): string {
-  const parts = path.replace(/\\/g, "/").split("/");
-  return parts[parts.length - 1] || path;
+  const lastSlash = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return lastSlash >= 0 ? path.substring(lastSlash + 1) : path;
 }
 
 export function parseFilePaths(filePathsJson: string | null): string[] {

@@ -29,6 +29,17 @@ let currentAudio: HTMLAudioElement | null = null;
 let currentSpeaking = false;
 let trackingRafId: number | null = null;
 
+// 订阅音量变化，实时应用到当前播放的音频
+let _prevVolume = useTtsSettings.getState().volume;
+useTtsSettings.subscribe((state) => {
+  if (state.volume !== _prevVolume) {
+    _prevVolume = state.volume;
+    if (currentAudio) {
+      currentAudio.volume = state.volume / 100;
+    }
+  }
+});
+
 /** 是否正在朗读 */
 export function isSpeaking(): boolean {
   return currentSpeaking || speechSynthesis.speaking;
@@ -81,6 +92,7 @@ function playBase64AudioWithTracking(
   onError?: (error: string) => void,
 ): void {
   const audio = new Audio(`data:audio/mp3;base64,${base64}`);
+  audio.volume = useTtsSettings.getState().volume / 100;
   currentAudio = audio;
   currentSpeaking = true;
   ttsPlaybackStart(sourceText);
@@ -173,6 +185,7 @@ function speakBrowser(
   const { browserAccent } = useTtsSettings.getState();
 
   const utterance = new SpeechSynthesisUtterance(text);
+  utterance.volume = useTtsSettings.getState().volume / 100;
   const voices = speechSynthesis.getVoices().filter((v) => v.lang.startsWith("en-"));
   const voice = voices.find((v) => v.lang === browserAccent)
     ?? voices.find((v) => v.lang.startsWith(browserAccent))

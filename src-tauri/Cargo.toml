@@ -51,6 +51,9 @@ chrono = "0.4"
 # Hashing (fast)
 blake3 = "1"
 
+# Regex for content filtering
+regex = "1"
+
 # UUID generation (device identification)
 uuid = { version = "1", features = ["v4"] }
 

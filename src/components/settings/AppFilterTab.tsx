@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Delete16Regular } from "@fluentui/react-icons";
+import { Delete16Regular, Warning16Regular } from "@fluentui/react-icons";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { Button } from "@/components/ui/button";
 import {
@@ -57,6 +57,12 @@ export function AppFilterTab() {
   // 缓存进程名 → 应用信息（名称+图标），从选择器中获取
   const appMetaCache = useRef<Map<string, AppMeta>>(new Map());
 
+  // 内容正则过滤
+  const [contentFilterEnabled, setContentFilterEnabled] = useState(false);
+  const [contentFilterRules, setContentFilterRules] = useState<string[]>([]);
+  const [contentRuleInput, setContentRuleInput] = useState("");
+  const [contentRuleError, setContentRuleError] = useState<string | null>(null);
+
   useEffect(() => {
     invoke<string | null>("get_setting", { key: "app_filter_enabled" })
       .then((v) => setAppFilterEnabled(v === "true"))
@@ -86,6 +92,20 @@ export function AppFilterTab() {
       })
       .catch((error) => {
         logError("Failed to load monitor_types:", error);
+      });
+    invoke<string | null>("get_setting", { key: "content_filter_enabled" })
+      .then((v) => setContentFilterEnabled(v === "true"))
+      .catch((error) => {
+        logError("Failed to load content_filter_enabled:", error);
+      });
+    invoke<string | null>("get_setting", { key: "content_filter_rules" })
+      .then((v) => {
+        if (v && v.length > 0) {
+          setContentFilterRules(v.split("\n").filter(Boolean));
+        }
+      })
+      .catch((error) => {
+        logError("Failed to load content_filter_rules:", error);
       });
     // 预加载一次运行中应用来填充图标缓存
     invoke<RunningApp[]>("get_running_apps")
@@ -182,6 +202,48 @@ export function AppFilterTab() {
 
   const getMeta = (process: string): AppMeta | undefined =>
     appMetaCache.current.get(process.toLowerCase());
+
+  const toggleContentFilter = useCallback((enabled: boolean) => {
+    const previous = contentFilterEnabled;
+    setContentFilterEnabled(enabled);
+    invoke("set_setting", { key: "content_filter_enabled", value: String(enabled) }).catch((error) => {
+      logError("Failed to save content_filter_enabled:", error);
+      setContentFilterEnabled(previous);
+    });
+  }, [contentFilterEnabled]);
+
+  const saveContentRules = useCallback((rules: string[]) => {
+    const value = rules.join("\n");
+    invoke("set_setting", { key: "content_filter_rules", value }).catch((error) => {
+      logError("Failed to save content_filter_rules:", error);
+    });
+  }, []);
+
+  const addContentRule = useCallback((pattern: string) => {
+    const trimmed = pattern.trim();
+    if (!trimmed) return;
+    // 基础格式检查（实际匹配在 Rust 后端执行，支持 (?i) 等 Rust regex 语法）
+    if (/[\[\(]$/.test(trimmed) || /^[*+?]/.test(trimmed)) {
+      setContentRuleError(`正则表达式格式有误: ${trimmed}`);
+      return;
+    }
+    setContentRuleError(null);
+    setContentFilterRules((prev) => {
+      if (prev.includes(trimmed)) return prev;
+      const next = [...prev, trimmed];
+      saveContentRules(next);
+      return next;
+    });
+    setContentRuleInput("");
+  }, [saveContentRules]);
+
+  const removeContentRule = useCallback((pattern: string) => {
+    setContentFilterRules((prev) => {
+      const next = prev.filter((r) => r !== pattern);
+      saveContentRules(next);
+      return next;
+    });
+  }, [saveContentRules]);
 
   return (
     <div className="space-y-4">
@@ -391,6 +453,77 @@ export function AppFilterTab() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* 内容正则过滤 */}
+      <div className="rounded-lg border bg-card p-4">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <h3 className="text-sm font-medium">内容过滤</h3>
+            <p className="text-xs text-muted-foreground mt-1">
+              通过正则表达式匹配文本内容，匹配的内容将不会被记录
+            </p>
+          </div>
+          <Switch checked={contentFilterEnabled} onCheckedChange={toggleContentFilter} />
+        </div>
+
+        <div className="flex gap-2 mb-3">
+          <Input
+            value={contentRuleInput}
+            onChange={(e) => { setContentRuleInput(e.target.value); setContentRuleError(null); }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                addContentRule(contentRuleInput);
+              }
+            }}
+            placeholder="输入正则，如 password|token|secret"
+            className="flex-1 h-8 text-xs font-mono"
+          />
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => addContentRule(contentRuleInput)}
+            disabled={!contentRuleInput.trim()}
+            className="h-8 text-xs"
+          >
+            添加
+          </Button>
+        </div>
+
+        {contentRuleError && (
+          <div className="flex items-center gap-1.5 mb-3 text-xs text-destructive">
+            <Warning16Regular className="w-3.5 h-3.5 shrink-0" />
+            {contentRuleError}
+          </div>
+        )}
+
+        {contentFilterRules.length > 0 ? (
+          <div className="space-y-1">
+            {contentFilterRules.map((rule) => (
+              <div
+                key={rule}
+                className="group flex items-center gap-2.5 px-2.5 py-2 rounded-md bg-muted/40 hover:bg-muted/70 transition-colors"
+              >
+                <code className="flex-1 min-w-0 text-xs font-mono truncate">{rule}</code>
+                <button
+                  type="button"
+                  onClick={() => removeContentRule(rule)}
+                  className="shrink-0 w-6 h-6 rounded-md flex items-center justify-center text-muted-foreground opacity-0 group-hover:opacity-100 hover:text-destructive transition-all"
+                  aria-label={`移除 ${rule}`}
+                >
+                  <Delete16Regular className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="text-center py-6">
+            <p className="text-xs text-muted-foreground/60">暂无过滤规则</p>
+            <p className="text-[10px] text-muted-foreground/40 mt-1">
+              添加正则表达式来过滤包含敏感信息的剪贴板内容
+            </p>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

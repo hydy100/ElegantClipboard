@@ -140,9 +140,9 @@ fn calc_follow_cursor(
 ) -> PhysicalPosition<i32> {
     let (w, h) = (window_size.width as i32, window_size.height as i32);
 
-    // 以光标为中心
+    // 光标水平居中，垂直偏上 1/3（更接近列表首条记录）
     let x = cx - w / 2;
-    let y = cy - h / 2;
+    let y = cy - h / 3;
 
     // 钳位到显示器范围内
     let x = x.max(m.x).min(m.x + m.width - w);
