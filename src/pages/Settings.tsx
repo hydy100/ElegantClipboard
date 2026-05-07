@@ -111,6 +111,38 @@ export function Settings() {
     });
   }, []);
 
+  // 拦截窗口关闭请求，改为隐藏（避免每次打开重建 WebView，大幅提升再次打开速度）
+  // 隐藏超过 3 分钟未再次打开则自动销毁，释放内存
+  useEffect(() => {
+    const win = getCurrentWindow();
+    let hidden = false;
+    let destroyTimer: ReturnType<typeof setTimeout> | null = null;
+    const DESTROY_DELAY = 3 * 60 * 1000;
+
+    const unlistenClose = win.onCloseRequested(async (event) => {
+      event.preventDefault();
+      hidden = true;
+      await win.hide();
+      destroyTimer = setTimeout(() => win.destroy(), DESTROY_DELAY);
+    });
+    // 窗口重新显示时刷新设置（防止隐藏期间数据过期）并取消销毁计时
+    const unlistenFocus = win.listen("tauri://focus", () => {
+      if (destroyTimer) {
+        clearTimeout(destroyTimer);
+        destroyTimer = null;
+      }
+      if (hidden && settingsLoadedRef.current) {
+        hidden = false;
+        loadSettings();
+      }
+    });
+    return () => {
+      if (destroyTimer) clearTimeout(destroyTimer);
+      unlistenClose.then((fn) => fn());
+      unlistenFocus.then((fn) => fn());
+    };
+  }, []);
+
   // ESC 关闭设置窗口
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
