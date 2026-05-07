@@ -3,6 +3,48 @@ use crate::config::{self, AppConfig};
 use crate::database;
 use tauri::Manager;
 
+/// 将元数据 JSON 中的图标绝对路径修正为当前 icons 目录下的相应文件名
+pub(crate) fn fix_meta_icon_paths_json(json_str: &str, icons_dir: &std::path::Path) -> Option<String> {
+    let mut meta: std::collections::HashMap<String, serde_json::Value> =
+        serde_json::from_str(json_str).ok()?;
+    let mut changed = false;
+    for value in meta.values_mut() {
+        if let Some(icon) = value.get("icon").and_then(|v| v.as_str()) {
+            if !icon.is_empty() {
+                if let Some(filename) = std::path::Path::new(icon).file_name() {
+                    let new_path = icons_dir.join(filename).to_string_lossy().to_string();
+                    if new_path != icon {
+                        if let Some(obj) = value.as_object_mut() {
+                            obj.insert("icon".to_string(), serde_json::Value::String(new_path));
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if changed { serde_json::to_string(&meta).ok() } else { None }
+}
+
+/// 从元数据设置中收集所有图标路径（用于导出时确保图标文件被包含）
+fn collect_meta_icon_paths(settings_repo: &database::SettingsRepository) -> Vec<String> {
+    let mut paths = Vec::new();
+    for key in &["app_filter_meta", "game_mode_exclusion_meta"] {
+        if let Ok(Some(json_str)) = settings_repo.get(key) {
+            if let Ok(meta) = serde_json::from_str::<std::collections::HashMap<String, serde_json::Value>>(&json_str) {
+                for value in meta.values() {
+                    if let Some(icon) = value.get("icon").and_then(|v| v.as_str()) {
+                        if !icon.is_empty() {
+                            paths.push(icon.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    paths
+}
+
 /// 临时取消设置窗口的置顶状态并隐藏主窗口（如可见），以便系统文件对话框不被遮挡
 fn demote_windows_for_dialog(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("settings") {
@@ -109,11 +151,30 @@ pub(crate) fn apply_pending_import(db_path: &std::path::Path) {
         }
     }
 
-    // 导入的数据库可能来自其他设备，清除 device_id 以便重新生成
+    // 导入的数据库可能来自其他设备，清除 device_id 并修正元数据中的图标路径
     if applied {
         if let Ok(conn) = rusqlite::Connection::open(db_path) {
             let _ = conn.execute("DELETE FROM settings WHERE key = 'device_id'", []);
             tracing::info!("Cleared device_id from imported database");
+
+            // 修正过滤/排除列表元数据中的图标绝对路径为当前数据目录
+            let icons_dir = db_path.parent().unwrap_or(db_path).join("icons");
+            for key in &["app_filter_meta", "game_mode_exclusion_meta"] {
+                let json_str: Option<String> = conn.query_row(
+                    "SELECT value FROM settings WHERE key = ?1",
+                    rusqlite::params![key],
+                    |row| row.get(0),
+                ).ok();
+                if let Some(ref json) = json_str {
+                    if let Some(fixed) = fix_meta_icon_paths_json(json, &icons_dir) {
+                        let _ = conn.execute(
+                            "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?1, ?2, datetime('now', 'localtime'))",
+                            rusqlite::params![key, fixed],
+                        );
+                        tracing::info!("Fixed icon paths in {} for current data directory", key);
+                    }
+                }
+            }
         }
     }
 }
@@ -251,11 +312,12 @@ pub async fn export_data(
         .map_err(|e| e.to_string())?;
     let _ = fs::remove_file(&export_db);
 
-    // 仅导出数据库引用的图片和图标文件（跳过孤立的磁盘文件）
+    // 导出数据库引用的图片和图标文件（跳过孤立的磁盘文件）
     let repo = database::ClipboardRepository::new(&state.db);
     {
         let referenced_images = repo.get_all_image_paths().unwrap_or_default();
         let referenced_icons = repo.get_all_icon_paths().unwrap_or_default();
+        let mut exported_icon_filenames = std::collections::HashSet::new();
         for image_path in &referenced_images {
             let p = std::path::Path::new(image_path);
             if p.is_file() {
@@ -271,10 +333,31 @@ pub async fn export_data(
             let p = std::path::Path::new(icon_path);
             if p.is_file() {
                 if let Some(filename) = p.file_name() {
-                    let zip_name = format!("icons/{}", filename.to_string_lossy());
+                    let filename_str = filename.to_string_lossy().to_string();
+                    let zip_name = format!("icons/{}", filename_str);
                     zip.start_file(&zip_name, options).map_err(|e| e.to_string())?;
                     zip.write_all(&fs::read(p).map_err(|e| format!("读取图标失败: {}", e))?)
                         .map_err(|e| e.to_string())?;
+                    exported_icon_filenames.insert(filename_str);
+                }
+            }
+        }
+        // 补充导出过滤/排除列表元数据引用的图标文件（可能未被剪贴板条目引用）
+        let settings_repo = database::SettingsRepository::new(&state.db);
+        let meta_icon_paths = collect_meta_icon_paths(&settings_repo);
+        for icon_path in &meta_icon_paths {
+            let p = std::path::Path::new(icon_path);
+            if let Some(filename) = p.file_name() {
+                let filename_str = filename.to_string_lossy().to_string();
+                if exported_icon_filenames.contains(&filename_str) {
+                    continue;
+                }
+                if p.is_file() {
+                    let zip_name = format!("icons/{}", filename_str);
+                    zip.start_file(&zip_name, options).map_err(|e| e.to_string())?;
+                    zip.write_all(&fs::read(p).map_err(|e| format!("读取图标失败: {}", e))?)
+                        .map_err(|e| e.to_string())?;
+                    exported_icon_filenames.insert(filename_str);
                 }
             }
         }

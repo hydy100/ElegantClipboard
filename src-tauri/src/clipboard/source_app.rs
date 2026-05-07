@@ -269,7 +269,14 @@ pub fn get_app_display_name_pub(exe_path: &str) -> String {
 
 fn compute_icon_cache_key(exe_path: &str) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(exe_path.to_lowercase().as_bytes());
+    // 逐字符小写直接写入 hasher，避免分配临时 lowercase String
+    let mut buf = [0u8; 4];
+    for c in exe_path.chars() {
+        for lc in c.to_lowercase() {
+            let encoded = lc.encode_utf8(&mut buf);
+            hasher.update(encoded.as_bytes());
+        }
+    }
     hasher.finalize().to_hex()[..12].to_string()
 }
 

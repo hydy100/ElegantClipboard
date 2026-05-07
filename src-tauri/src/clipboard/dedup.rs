@@ -11,33 +11,55 @@ fn hash_with_prefix(prefix: &[u8], bytes: &[u8]) -> String {
 
 /// Normalize user-visible text so semantically equivalent clipboard text
 /// (line endings, zero-width chars, trailing spaces/tabs) hashes consistently.
+///
+/// 单次遍历完成所有标准化操作，避免多次中间 String 分配：
+/// 1. \r\n / \r → \n
+/// 2. 过滤零宽字符
+/// 3. NBSP → 空格
+/// 4. 去除每行行尾空白
+/// 5. 去除末尾连续空行
 pub(crate) fn normalize_semantic_text(text: &str) -> String {
-    let with_lf = text.replace("\r\n", "\n").replace('\r', "\n");
-    let mut cleaned = String::with_capacity(with_lf.len());
-    for ch in with_lf.chars() {
-        if ZERO_WIDTH_CHARS.contains(&ch) {
-            continue;
-        }
-        if ch == '\u{00A0}' {
-            cleaned.push(' ');
-        } else {
-            cleaned.push(ch);
+    let mut result = String::with_capacity(text.len());
+    // 当前行的内容（含行尾空白），遇到换行时裁剪行尾空白后写入 result
+    let mut line_buf = String::new();
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                // \r\n 或 \r 都视为 \n
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                // 行结束：裁剪行尾空白后写入
+                let trimmed = line_buf.trim_end_matches([' ', '\t']);
+                result.push_str(trimmed);
+                result.push('\n');
+                line_buf.clear();
+            }
+            '\n' => {
+                let trimmed = line_buf.trim_end_matches([' ', '\t']);
+                result.push_str(trimmed);
+                result.push('\n');
+                line_buf.clear();
+            }
+            '\u{00A0}' => line_buf.push(' '),
+            c if ZERO_WIDTH_CHARS.contains(&c) => { /* 跳过零宽字符 */ }
+            c => line_buf.push(c),
         }
     }
 
-    let mut normalized = String::with_capacity(cleaned.len());
-    for (i, line) in cleaned.split('\n').enumerate() {
-        if i > 0 {
-            normalized.push('\n');
-        }
-        normalized.push_str(line.trim_end_matches([' ', '\t']));
+    // 处理最后一行（无换行结尾的情况）
+    if !line_buf.is_empty() {
+        let trimmed = line_buf.trim_end_matches([' ', '\t']);
+        result.push_str(trimmed);
     }
 
-    while normalized.ends_with('\n') {
-        normalized.pop();
-    }
+    // 去除末尾连续空行
+    let end = result.trim_end_matches('\n').len();
+    result.truncate(end);
 
-    normalized
+    result
 }
 
 pub(crate) fn semantic_hash_from_text(text: &str) -> Option<String> {

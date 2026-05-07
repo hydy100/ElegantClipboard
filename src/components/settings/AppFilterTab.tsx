@@ -57,6 +57,15 @@ export function AppFilterTab() {
   // 缓存进程名 → 应用信息（名称+图标），从选择器中获取
   const appMetaCache = useRef<Map<string, AppMeta>>(new Map());
 
+  // 持久化元数据到 setting，使重启后图标仍可显示
+  const persistMeta = useCallback(() => {
+    const obj: Record<string, AppMeta> = {};
+    appMetaCache.current.forEach((v, k) => { obj[k] = v; });
+    invoke("set_setting", { key: "app_filter_meta", value: JSON.stringify(obj) }).catch((error) => {
+      logError("Failed to save app_filter_meta:", error);
+    });
+  }, []);
+
   // 内容正则过滤
   const [contentFilterEnabled, setContentFilterEnabled] = useState(false);
   const [contentFilterRules, setContentFilterRules] = useState<string[]>([]);
@@ -107,15 +116,32 @@ export function AppFilterTab() {
       .catch((error) => {
         logError("Failed to load content_filter_rules:", error);
       });
-    // 预加载一次运行中应用来填充图标缓存
-    invoke<RunningApp[]>("get_running_apps")
-      .then((apps) => {
-        for (const app of apps) {
-          appMetaCache.current.set(app.process.toLowerCase(), { name: app.name, icon: app.icon });
+    // 从持久化设置恢复元数据缓存（保证重启后图标可用）
+    invoke<string | null>("get_setting", { key: "app_filter_meta" })
+      .then((v) => {
+        if (v) {
+          try {
+            const obj = JSON.parse(v) as Record<string, AppMeta>;
+            for (const [k, meta] of Object.entries(obj)) {
+              appMetaCache.current.set(k, meta);
+            }
+          } catch { /* ignore */ }
         }
       })
       .catch((error) => {
-        logError("Failed to preload running apps:", error);
+        logError("Failed to load app_filter_meta:", error);
+      })
+      .finally(() => {
+        // 预加载运行中应用来更新图标缓存（覆盖旧数据）
+        invoke<RunningApp[]>("get_running_apps")
+          .then((apps) => {
+            for (const app of apps) {
+              appMetaCache.current.set(app.process.toLowerCase(), { name: app.name, icon: app.icon });
+            }
+          })
+          .catch((error) => {
+            logError("Failed to preload running apps:", error);
+          });
       });
   }, []);
 
@@ -164,6 +190,7 @@ export function AppFilterTab() {
     if (!trimmed) return;
     if (meta) {
       appMetaCache.current.set(trimmed.toLowerCase(), meta);
+      persistMeta();
     }
     setAppFilterList((prev) => {
       if (prev.some((a) => a.toLowerCase() === trimmed.toLowerCase())) return prev;
@@ -174,9 +201,11 @@ export function AppFilterTab() {
       });
       return next;
     });
-  }, []);
+  }, [persistMeta]);
 
   const removeFilterApp = useCallback((name: string) => {
+    appMetaCache.current.delete(name.toLowerCase());
+    persistMeta();
     setAppFilterList((prev) => {
       const next = prev.filter((a) => a !== name);
       invoke("set_setting", { key: "app_filter_list", value: next.join(",") }).catch((error) => {
@@ -185,7 +214,7 @@ export function AppFilterTab() {
       });
       return next;
     });
-  }, []);
+  }, [persistMeta]);
 
   const loadRunningApps = useCallback(async () => {
     try {
