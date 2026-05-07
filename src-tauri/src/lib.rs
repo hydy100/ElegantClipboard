@@ -564,7 +564,11 @@ fn reload_runtime_settings(app: tauri::AppHandle) -> Result<(), String> {
     // 5. 刷新托盘图标可见性
     restore_tray_visibility(&app);
 
-    // 6. 刷新游戏模式
+    // 6. 刷新游戏模式排除列表和开关
+    let exclusion_json = settings_repo.get_or("game_mode_exclusion_list", "[]");
+    let exclusion_list: Vec<String> = serde_json::from_str(&exclusion_json).unwrap_or_default();
+    game_mode::set_exclusion_list(exclusion_list);
+
     let game_mode = settings_repo.get_bool("game_mode_enabled", false);
     if game_mode {
         game_mode::start(app.clone());
@@ -597,6 +601,26 @@ fn is_game_mode_enabled(app: tauri::AppHandle) -> bool {
     let state = app.state::<Arc<AppState>>();
     let settings_repo = database::SettingsRepository::new(&state.db);
     settings_repo.get_bool("game_mode_enabled", false)
+}
+
+#[tauri::command]
+fn get_game_mode_exclusion_list(app: tauri::AppHandle) -> Vec<String> {
+    let state = app.state::<Arc<AppState>>();
+    let settings_repo = database::SettingsRepository::new(&state.db);
+    let json_str = settings_repo.get_or("game_mode_exclusion_list", "[]");
+    serde_json::from_str(&json_str).unwrap_or_default()
+}
+
+#[tauri::command]
+fn set_game_mode_exclusion_list(app: tauri::AppHandle, list: Vec<String>) -> Result<(), String> {
+    let state = app.state::<Arc<AppState>>();
+    let settings_repo = database::SettingsRepository::new(&state.db);
+    let json_str = serde_json::to_string(&list).map_err(|e| format!("序列化失败: {}", e))?;
+    settings_repo
+        .set("game_mode_exclusion_list", &json_str)
+        .map_err(|e| format!("保存排除列表失败: {}", e))?;
+    game_mode::set_exclusion_list(list);
+    Ok(())
 }
 
 #[tauri::command]
@@ -756,7 +780,11 @@ pub fn run() {
             // 注册翻译选中文字快捷键
             commands::translate::register_translate_selection_shortcut(app.handle());
 
-            // 启动游戏模式检测
+            // 加载游戏模式排除列表并启动游戏模式检测
+            let exclusion_json = settings_repo.get_or("game_mode_exclusion_list", "[]");
+            let exclusion_list: Vec<String> = serde_json::from_str(&exclusion_json).unwrap_or_default();
+            game_mode::set_exclusion_list(exclusion_list);
+
             let game_mode = settings_repo.get_bool("game_mode_enabled", false);
             if game_mode {
                 game_mode::start(app.handle().clone());
@@ -928,6 +956,8 @@ pub fn run() {
             reload_runtime_settings,
             set_game_mode_enabled,
             is_game_mode_enabled,
+            get_game_mode_exclusion_list,
+            set_game_mode_exclusion_list,
             get_hotkey_mode,
             set_hotkey_mode,
             commands::clipboard::get_clipboard_items,

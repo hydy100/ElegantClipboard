@@ -196,15 +196,14 @@ impl ClipboardRepository {
     ) -> Result<bool, rusqlite::Error> {
         let conn = self.read_conn.lock();
         let column = column.as_sql();
-        let count: i64 = conn.query_row(
-            &format!(
-                "SELECT COUNT(*) FROM clipboard_items WHERE {} = ?1",
-                column
-            ),
-            params![hash],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+        // 使用 SELECT 1 LIMIT 1 替代 COUNT(*)，找到第一条匹配即返回，避免全表扫描计数
+        let sql = format!(
+            "SELECT 1 FROM clipboard_items WHERE {} = ?1 LIMIT 1",
+            column
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let exists = stmt.exists(params![hash])?;
+        Ok(exists)
     }
 
     /// 更新已有条目的访问时间并置顶
@@ -957,8 +956,9 @@ impl ClipboardRepository {
     }
 
     /// 导入同步条目（基于 content_hash 去重，已存在则跳过）
+    /// 使用事务包裹批量操作，减少 WAL 刷盘次数；复用预编译语句提升逐条处理性能
     pub fn import_sync_items(&self, items: &[ClipboardItem]) -> Result<usize, rusqlite::Error> {
-        let conn = self.write_conn.lock();
+        let mut conn = self.write_conn.lock();
         let mut count = 0usize;
 
         let max_sort_order: i64 = conn
@@ -970,35 +970,38 @@ impl ClipboardRepository {
             .unwrap_or(0);
 
         let total = items.len() as i64;
-        for (i, item) in items.iter().enumerate() {
-            // 跳过已存在的条目
-            let exists: bool = conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM clipboard_items WHERE content_hash = ?1",
-                    params![item.content_hash],
-                    |row| row.get(0),
-                )
-                .unwrap_or(true);
 
-            if exists {
-                // 远端标记失效时，同步更新本地的 files_valid 状态
-                if (item.content_type == "files" || item.content_type == "video") && item.files_valid == Some(false) {
-                    let _ = conn.execute(
-                        "UPDATE clipboard_items SET files_valid = 0 WHERE content_hash = ?1 AND (files_valid IS NULL OR files_valid != 0)",
-                        params![item.content_hash],
-                    );
-                }
-                continue;
-            }
-
-            conn.execute(
+        // 事务包裹：批量导入时仅在结束时刷盘一次，大幅降低 I/O 开销
+        let tx = conn.transaction()?;
+        {
+            let mut exists_stmt = tx.prepare_cached(
+                "SELECT 1 FROM clipboard_items WHERE content_hash = ?1 LIMIT 1"
+            )?;
+            let mut update_stmt = tx.prepare_cached(
+                "UPDATE clipboard_items SET files_valid = 0 WHERE content_hash = ?1 AND (files_valid IS NULL OR files_valid != 0)"
+            )?;
+            let mut insert_stmt = tx.prepare_cached(
                 "INSERT INTO clipboard_items
                  (content_type, text_content, html_content, rtf_content, image_path, file_paths,
                   content_hash, semantic_hash, preview, byte_size, image_width, image_height,
                   is_pinned, is_favorite, sort_order, created_at, updated_at,
                   access_count, last_accessed_at, char_count, source_app_name, source_app_icon, files_valid)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
-                params![
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)"
+            )?;
+
+            for (i, item) in items.iter().enumerate() {
+                // 使用 EXISTS 检查，找到即返回，无需 COUNT 全表扫描
+                let exists = exists_stmt.exists(params![item.content_hash])?;
+
+                if exists {
+                    // 远端标记失效时，同步更新本地的 files_valid 状态
+                    if (item.content_type == "files" || item.content_type == "video") && item.files_valid == Some(false) {
+                        let _ = update_stmt.execute(params![item.content_hash]);
+                    }
+                    continue;
+                }
+
+                insert_stmt.execute(params![
                     item.content_type,
                     item.text_content,
                     item.html_content,
@@ -1022,10 +1025,11 @@ impl ClipboardRepository {
                     item.source_app_name,
                     item.source_app_icon,
                     item.files_valid,
-                ],
-            )?;
-            count += 1;
+                ])?;
+                count += 1;
+            }
         }
+        tx.commit()?;
 
         Ok(count)
     }
@@ -1079,6 +1083,29 @@ impl SettingsRepository {
             .filter_map(|r| r.ok())
             .collect();
         Ok(settings)
+    }
+
+    /// 批量读取多个设置项，一次查询避免多次加锁和多次 SQL 往返
+    pub fn get_multiple(&self, keys: &[&str]) -> Result<std::collections::HashMap<String, String>, rusqlite::Error> {
+        if keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.read_conn.lock();
+        // 构造 IN (?1, ?2, ...) 占位符
+        let placeholders: Vec<String> = (1..=keys.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "SELECT key, value FROM settings WHERE key IN ({})",
+            placeholders.join(", ")
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = keys.iter().map(|k| k as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
     }
 
     /// 读取设置值，出错或不存在时返回默认值

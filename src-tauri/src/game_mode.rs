@@ -10,6 +10,9 @@ use tauri::Manager;
 use crate::commands::AppState;
 use std::sync::Arc;
 
+/// 排除列表（进程名，小写），在排除列表中的进程全屏时不进入游戏模式
+static EXCLUSION_LIST: parking_lot::RwLock<Vec<String>> = parking_lot::RwLock::new(Vec::new());
+
 /// 游戏模式是否启用（用户设置）
 static GAME_MODE_ENABLED: AtomicBool = AtomicBool::new(false);
 /// 当前是否处于抑制状态（检测到全屏应用时为 true）
@@ -52,6 +55,12 @@ pub fn start(app: tauri::AppHandle) {
             run_event_loop(generation);
         })
         .expect("failed to spawn game-mode-watcher thread");
+}
+
+/// 设置排除列表
+pub fn set_exclusion_list(list: Vec<String>) {
+    let normalized: Vec<String> = list.iter().map(|s| s.to_lowercase()).collect();
+    *EXCLUSION_LIST.write() = normalized;
 }
 
 /// 停止游戏模式检测
@@ -198,15 +207,82 @@ fn check_and_update() {
     };
 
     let fullscreen = is_foreground_fullscreen();
+    let excluded = fullscreen && is_foreground_excluded();
+    let effective_fullscreen = fullscreen && !excluded;
+
     let was_suppressed = GAME_MODE_SUPPRESSED.load(Ordering::Relaxed);
-    if fullscreen && !was_suppressed {
+    if effective_fullscreen && !was_suppressed {
         suppress_features(app);
         GAME_MODE_SUPPRESSED.store(true, Ordering::Relaxed);
         tracing::info!("游戏模式: 检测到全屏应用，已暂停功能");
-    } else if !fullscreen && was_suppressed {
+    } else if !effective_fullscreen && was_suppressed {
         restore_features(app);
         GAME_MODE_SUPPRESSED.store(false, Ordering::Relaxed);
-        tracing::info!("游戏模式: 全屏应用已退出，已恢复功能");
+        if excluded {
+            tracing::info!("游戏模式: 全屏应用在排除列表中，已恢复功能");
+        } else {
+            tracing::info!("游戏模式: 全屏应用已退出，已恢复功能");
+        }
+    }
+}
+
+/// 检测前台窗口的进程是否在排除列表中
+#[cfg(target_os = "windows")]
+fn is_foreground_excluded() -> bool {
+    let exclusion_list = EXCLUSION_LIST.read();
+    if exclusion_list.is_empty() {
+        return false;
+    }
+
+    if let Some(exe_name) = get_foreground_process_name() {
+        let exe_lower = exe_name.to_lowercase();
+        exclusion_list.iter().any(|excluded| exe_lower == *excluded)
+    } else {
+        false
+    }
+}
+
+/// 获取前台窗口的进程文件名（如 "chrome.exe"）
+#[cfg(target_os = "windows")]
+fn get_foreground_process_name() -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return None;
+        }
+
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR::from_raw(buf.as_mut_ptr()),
+            &mut size,
+        );
+        let _ = CloseHandle(handle);
+        result.ok()?;
+
+        let path = String::from_utf16_lossy(&buf[..size as usize]);
+        std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
     }
 }
 

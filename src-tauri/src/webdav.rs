@@ -565,6 +565,17 @@ pub fn import_sync_data(
                 }
                 result.settings_imported = true;
                 info!("同步导入: 设置已恢复");
+
+                // 修正过滤/排除列表元数据中的图标路径为当前数据目录
+                let icons_dir = crate::config::AppConfig::load().get_data_dir().join("icons");
+                for meta_key in &["app_filter_meta", "game_mode_exclusion_meta"] {
+                    if let Some(json_val) = settings.get(*meta_key) {
+                        if let Some(fixed) = crate::commands::data_transfer::fix_meta_icon_paths_json(json_val, &icons_dir) {
+                            let _ = settings_repo.set(meta_key, &fixed);
+                            info!("修正 {} 中的图标路径", meta_key);
+                        }
+                    }
+                }
             }
         }
     }
