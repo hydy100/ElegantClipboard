@@ -1,23 +1,23 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { ScanText16Regular, Copy16Regular, Translate16Regular, Edit16Regular } from "@fluentui/react-icons";
-import { TtsButtonLarge } from "@/components/TtsButton";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import Linkify from "linkify-react";
+import { TtsButtonLarge } from "@/components/TtsButton";
+import { TtsHighlightText } from "@/components/TtsHighlightText";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { WindowTitleBar } from "@/components/WindowTitleBar";
 import { logError } from "@/lib/logger";
 import { initTheme } from "@/lib/theme-applier";
 import { translateText } from "@/lib/translate";
-import { useTranslateSettings } from "@/stores/translate-settings";
-import { useOcrSettings } from "@/stores/ocr-settings";
-import { useTtsSettings } from "@/stores/tts-settings";
 import { cn } from "@/lib/utils";
-import { openUrl } from "@tauri-apps/plugin-opener";
-import { TtsHighlightText } from "@/components/TtsHighlightText";
+import { useOcrSettings } from "@/stores/ocr-settings";
+import { useTranslateSettings } from "@/stores/translate-settings";
 import { useTtsPlayback } from "@/stores/tts-playback";
+import { useTtsSettings } from "@/stores/tts-settings";
 
 export function OcrResult() {
   const [text, setText] = useState("");

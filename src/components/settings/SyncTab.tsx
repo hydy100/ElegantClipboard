@@ -1,16 +1,4 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { emit, listen } from "@tauri-apps/api/event";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Switch } from "@/components/ui/switch";
-import { logError } from "@/lib/logger";
-import { loadSyncedSettings } from "@/stores/ui-settings";
-import { useOcrSettings } from "@/stores/ocr-settings";
-import { useTranslateSettings } from "@/stores/translate-settings";
-import { useTtsSettings } from "@/stores/tts-settings";
 import {
   ArrowSync16Regular,
   ArrowUp16Regular,
@@ -19,6 +7,18 @@ import {
   Eye16Regular,
   EyeOff16Regular,
 } from "@fluentui/react-icons";
+import { invoke } from "@tauri-apps/api/core";
+import { emit, listen } from "@tauri-apps/api/event";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Switch } from "@/components/ui/switch";
+import { logError } from "@/lib/logger";
+import { useOcrSettings } from "@/stores/ocr-settings";
+import { useTranslateSettings } from "@/stores/translate-settings";
+import { useTtsSettings } from "@/stores/tts-settings";
+import { loadSyncedSettings } from "@/stores/ui-settings";
 
 export function SyncTab() {
   // WebDAV 配置

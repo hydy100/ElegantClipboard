@@ -19,7 +19,6 @@ import {
 } from "@fluentui/react-icons";
 import { invoke } from "@tauri-apps/api/core";
 import { emitTo, listen } from "@tauri-apps/api/event";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useShallow } from "zustand/react/shallow";
 import {
   CardFooter,
@@ -36,7 +35,6 @@ import {
   type ContextMenuItemConfig,
 } from "@/components/CardSubComponents";
 import { HighlightText } from "@/components/HighlightText";
-import { TtsHighlightText } from "@/components/TtsHighlightText";
 import {
   type ClipboardItemDetail,
   sampleTextPreview,
@@ -50,6 +48,8 @@ import {
   TEXT_PREVIEW_HORIZONTAL_PADDING,
   TEXT_PREVIEW_MIN_CHARS_PER_LINE,
 } from "@/components/text-preview";
+import { TtsButton } from "@/components/TtsButton";
+import { TtsHighlightText } from "@/components/TtsHighlightText";
 import { Card } from "@/components/ui/card";
 import {
   ContextMenu,
@@ -58,8 +58,8 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { focusWindowImmediately } from "@/hooks/useInputFocus";
-import { TtsButton } from "@/components/TtsButton";
 import { useSortable, CSS } from "@/hooks/useSortableList";
 import {
   contentTypeConfig,
@@ -71,14 +71,14 @@ import {
   parseFilePaths,
 } from "@/lib/format";
 import { logError } from "@/lib/logger";
+import { translateText } from "@/lib/translate";
+import { speak, stopSpeaking, isSpeaking } from "@/lib/tts";
 import { cn } from "@/lib/utils";
 import { useClipboardStore, ClipboardItem } from "@/stores/clipboard";
 import { useTagStore } from "@/stores/tags";
-import { useUISettings } from "@/stores/ui-settings";
 import { useTranslateSettings } from "@/stores/translate-settings";
 import { useTtsSettings } from "@/stores/tts-settings";
-import { translateText } from "@/lib/translate";
-import { speak, stopSpeaking, isSpeaking } from "@/lib/tts";
+import { useUISettings } from "@/stores/ui-settings";
 
 // ============ 类型定义 ============
 

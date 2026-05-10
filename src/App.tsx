@@ -39,9 +39,9 @@ import { logError } from "@/lib/logger";
 import { initTheme } from "@/lib/theme-applier";
 import { cn } from "@/lib/utils";
 import { useClipboardStore } from "@/stores/clipboard";
+import { useTranslateSettings } from "@/stores/translate-settings";
 import type { ToolbarButton } from "@/stores/ui-settings";
 import { useUISettings } from "@/stores/ui-settings";
-import { useTranslateSettings } from "@/stores/translate-settings";
 
 
 // 初始化主题

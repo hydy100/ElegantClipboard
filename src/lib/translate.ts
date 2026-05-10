@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useTranslateSettings, type TranslateProvider } from "@/stores/translate-settings";
 import { logError } from "@/lib/logger";
+import { useTranslateSettings, type TranslateProvider } from "@/stores/translate-settings";
 
 // 语言列表
 export const LANGUAGES = [

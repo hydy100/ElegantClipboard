@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { Speaker216Regular, DismissCircle16Regular } from "@fluentui/react-icons";
-import { speak, stopSpeaking, isSpeaking } from "@/lib/tts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { speak, stopSpeaking, isSpeaking } from "@/lib/tts";
 import { useTtsSettings } from "@/stores/tts-settings";
 
 interface TtsButtonProps {

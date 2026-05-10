@@ -35,7 +35,6 @@ import {
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { emitTo } from "@tauri-apps/api/event";
 import { ImagePreview, getPreviewBounds } from "@/components/CardContentRenderers";
-import { HighlightText } from "@/components/HighlightText";
 import {
   acquireTextPreviewLease,
   revokeTextPreviewLease,
@@ -44,6 +43,7 @@ import {
   textPreviewCleanupCallbacks,
   ensureWindowHiddenListener,
 } from "@/components/ClipboardItemCard";
+import { HighlightText } from "@/components/HighlightText";
 import {
   type ClipboardItemDetail,
   sampleTextPreview,

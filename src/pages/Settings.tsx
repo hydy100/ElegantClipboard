@@ -16,19 +16,19 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { AboutTab } from "@/components/settings/AboutTab";
-import { SyncTab } from "@/components/settings/SyncTab";
 import { AppFilterTab } from "@/components/settings/AppFilterTab";
 import { DataTab, DataSettings } from "@/components/settings/DataTab";
 import { DisplayTab } from "@/components/settings/DisplayTab";
 import { GeneralTab, GeneralSettings } from "@/components/settings/GeneralTab";
+import { OcrTab } from "@/components/settings/OcrTab";
 import {
   ShortcutsTab,
   ShortcutSettings,
 } from "@/components/settings/ShortcutsTab";
+import { SyncTab } from "@/components/settings/SyncTab";
 import { ThemeTab } from "@/components/settings/ThemeTab";
 import { TranslateTab } from "@/components/settings/TranslateTab";
 import { TtsTab } from "@/components/settings/TtsTab";
-import { OcrTab } from "@/components/settings/OcrTab";
 import { Card, CardContent } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { WindowTitleBar } from "@/components/WindowTitleBar";

@@ -1,14 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { Eye16Regular, EyeOff16Regular } from "@fluentui/react-icons";
+import { invoke } from "@tauri-apps/api/core";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { Eye16Regular, EyeOff16Regular } from "@fluentui/react-icons";
-import { invoke } from "@tauri-apps/api/core";
-import { useTranslateSettings, type TranslateProvider, type LanguageMode } from "@/stores/translate-settings";
-import { PROVIDER_OPTIONS, LANGUAGES, translateText } from "@/lib/translate";
 import { logError } from "@/lib/logger";
+import { PROVIDER_OPTIONS, LANGUAGES, translateText } from "@/lib/translate";
+import { useTranslateSettings, type TranslateProvider, type LanguageMode } from "@/stores/translate-settings";
 
 /** KeyboardEvent.code 到快捷键名称的映射 */
 const KEY_CODE_MAP: Record<string, string> = {

@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useOcrSettings } from "@/stores/ocr-settings";
 import { logError } from "@/lib/logger";
+import { useOcrSettings } from "@/stores/ocr-settings";
 
 /** 调用百度 OCR识别 */
 export async function recognizeText(imageBase64: string): Promise<string> {

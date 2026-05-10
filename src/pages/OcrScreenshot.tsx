@@ -1,11 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { logError } from "@/lib/logger";
 import { cropScreenRegion, recognizeText } from "@/lib/ocr";
 import { useOcrSettings } from "@/stores/ocr-settings";
-import { logError } from "@/lib/logger";
 
 export function OcrScreenshot() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
