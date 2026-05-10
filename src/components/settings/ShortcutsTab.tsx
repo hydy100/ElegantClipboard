@@ -1,9 +1,10 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   ChevronDown16Regular,
   ChevronUp16Regular,
+  Delete16Regular,
 } from "@fluentui/react-icons";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -63,6 +64,9 @@ export function ShortcutsTab({
 }: ShortcutsTabProps) {
   const keyboardNavigation = useUISettings((s) => s.keyboardNavigation);
   const setKeyboardNavigation = useUISettings((s) => s.setKeyboardNavigation);
+  const [hotkeyMode, setHotkeyMode] = useState("register");
+  const [hotkeySwitching, setHotkeySwitching] = useState(false);
+  const [gameModeEnabled, setGameModeEnabled] = useState(false);
   const [winvLoading, setWinvLoading] = useState(false);
   const [winvError, setWinvError] = useState("");
   const [winvConfirmDialogOpen, setWinvConfirmDialogOpen] = useState(false);
@@ -85,6 +89,24 @@ export function ShortcutsTab({
   const [favPasteLoaded, setFavPasteLoaded] = useState(false);
   const [favPasteExpanded, setFavPasteExpanded] = useState(false);
   const [favSlotErrors, setFavSlotErrors] = useState<Record<number, string>>({});
+
+  // 游戏模式排除列表
+  type RunningApp = { name: string; process: string; icon: string | null };
+  type AppMeta = { name: string; icon: string | null };
+  const [exclusionList, setExclusionList] = useState<string[]>([]);
+  const [exclusionInput, setExclusionInput] = useState("");
+  const [exclusionRunningApps, setExclusionRunningApps] = useState<RunningApp[]>([]);
+  const [showExclusionAppPicker, setShowExclusionAppPicker] = useState(false);
+  const exclusionMetaCache = useRef<Map<string, AppMeta>>(new Map());
+
+  // 持久化排除列表元数据到 setting，使重启后图标仍可显示
+  const persistExclusionMeta = useCallback(() => {
+    const obj: Record<string, AppMeta> = {};
+    exclusionMetaCache.current.forEach((v, k) => { obj[k] = v; });
+    invoke("set_setting", { key: "game_mode_exclusion_meta", value: JSON.stringify(obj) }).catch((error) => {
+      logError("Failed to save game_mode_exclusion_meta:", error);
+    });
+  }, []);
 
   // 处理快捷键录入的键盘事件
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
@@ -141,6 +163,119 @@ export function ShortcutsTab({
       return () => window.removeEventListener("keydown", handleKeyDown);
     }
   }, [recordingShortcut, handleKeyDown]);
+
+  useEffect(() => {
+    invoke<string>("get_hotkey_mode")
+      .then((v) => setHotkeyMode(v))
+      .catch((error) => logError("Failed to load hotkey_mode:", error));
+    invoke<boolean>("is_game_mode_enabled")
+      .then((v) => setGameModeEnabled(v))
+      .catch((error) => logError("Failed to load game_mode_enabled:", error));
+  }, []);
+
+  const switchHotkeyMode = async (mode: string) => {
+    if (mode === hotkeyMode || hotkeySwitching) return;
+    setHotkeySwitching(true);
+    const prev = hotkeyMode;
+    setHotkeyMode(mode);
+    try {
+      await invoke("set_hotkey_mode", { mode });
+    } catch (error) {
+      logError("Failed to set hotkey mode:", error);
+      setHotkeyMode(prev);
+    } finally {
+      setHotkeySwitching(false);
+    }
+  };
+
+  const toggleGameMode = async (enabled: boolean) => {
+    setGameModeEnabled(enabled);
+    try {
+      await invoke("set_game_mode_enabled", { enabled });
+    } catch (error) {
+      logError("Failed to set game mode:", error);
+      setGameModeEnabled(!enabled);
+    }
+  };
+
+  // 加载排除列表
+  useEffect(() => {
+    invoke<string[]>("get_game_mode_exclusion_list")
+      .then((list) => {
+        if (Array.isArray(list)) setExclusionList(list);
+      })
+      .catch((error) => logError("Failed to load exclusion list:", error));
+    // 从持久化设置恢复元数据缓存（保证重启后图标可用）
+    invoke<string | null>("get_setting", { key: "game_mode_exclusion_meta" })
+      .then((v) => {
+        if (v) {
+          try {
+            const obj = JSON.parse(v) as Record<string, AppMeta>;
+            for (const [k, meta] of Object.entries(obj)) {
+              exclusionMetaCache.current.set(k, meta);
+            }
+          } catch { /* ignore */ }
+        }
+      })
+      .catch((error) => logError("Failed to load game_mode_exclusion_meta:", error))
+      .finally(() => {
+        // 预加载运行中应用来更新图标缓存（覆盖旧数据）
+        invoke<RunningApp[]>("get_running_apps")
+          .then((apps) => {
+            for (const app of apps) {
+              exclusionMetaCache.current.set(app.process.toLowerCase(), { name: app.name, icon: app.icon });
+            }
+          })
+          .catch((error) => logError("Failed to preload running apps:", error));
+      });
+  }, []);
+
+  const addExclusion = useCallback((process: string, meta?: AppMeta) => {
+    const trimmed = process.trim();
+    if (!trimmed) return;
+    if (meta) {
+      exclusionMetaCache.current.set(trimmed.toLowerCase(), meta);
+      persistExclusionMeta();
+    }
+    setExclusionList((prev) => {
+      if (prev.some((a) => a.toLowerCase() === trimmed.toLowerCase())) return prev;
+      const next = [...prev, trimmed];
+      invoke("set_game_mode_exclusion_list", { list: next }).catch((error) => {
+        logError("Failed to save exclusion list:", error);
+        setExclusionList(prev);
+      });
+      return next;
+    });
+  }, [persistExclusionMeta]);
+
+  const removeExclusion = useCallback((process: string) => {
+    exclusionMetaCache.current.delete(process.toLowerCase());
+    persistExclusionMeta();
+    setExclusionList((prev) => {
+      const next = prev.filter((a) => a !== process);
+      invoke("set_game_mode_exclusion_list", { list: next }).catch((error) => {
+        logError("Failed to save exclusion list:", error);
+        setExclusionList(prev);
+      });
+      return next;
+    });
+  }, [persistExclusionMeta]);
+
+  const loadExclusionRunningApps = useCallback(async () => {
+    try {
+      const apps = await invoke<RunningApp[]>("get_running_apps");
+      setExclusionRunningApps(apps);
+      for (const app of apps) {
+        exclusionMetaCache.current.set(app.process.toLowerCase(), { name: app.name, icon: app.icon });
+      }
+      setShowExclusionAppPicker(true);
+    } catch (error) {
+      logError("Failed to load running apps:", error);
+    }
+  }, []);
+
+  const getExclusionMeta = (process: string): AppMeta | undefined =>
+    exclusionMetaCache.current.get(process.toLowerCase());
 
   useEffect(() => {
     let disposed = false;
@@ -356,6 +491,232 @@ export function ShortcutsTab({
   return (
     <>
       <div className="space-y-4">
+        {/* Hotkey Mode Card */}
+        <div className="rounded-lg border bg-card p-4">
+          <h3 className="text-sm font-medium mb-3">热键注册方式</h3>
+          <p className="text-xs text-muted-foreground mb-4">
+            选择全局快捷键的注册方式。切换后所有快捷键会自动重新注册。
+            如果未开启游戏模式但热键仍无法在某些应用中生效，建议切换为「低级键盘钩子」。
+          </p>
+          <div className="space-y-3">
+            <label
+              className={cn(
+                "flex items-start gap-3 rounded-md border p-3 cursor-pointer transition-colors",
+                hotkeyMode === "register" ? "border-primary bg-primary/5" : "hover:bg-muted/50",
+                hotkeySwitching && "opacity-50 pointer-events-none"
+              )}
+              onClick={() => switchHotkeyMode("register")}
+            >
+              <div className={cn(
+                "mt-0.5 h-4 w-4 rounded-full border-2 flex items-center justify-center flex-shrink-0",
+                hotkeyMode === "register" ? "border-primary" : "border-muted-foreground/40"
+              )}>
+                {hotkeyMode === "register" && <div className="h-2 w-2 rounded-full bg-primary" />}
+              </div>
+              <div className="space-y-0.5">
+                <div className="text-xs font-medium">系统标准API（默认）</div>
+                <p className="text-xs text-muted-foreground">
+                  在窗口化全屏（无边框窗口）下仍可生效，但在真全屏（独占全屏）应用中不生效。
+                </p>
+              </div>
+            </label>
+            <label
+              className={cn(
+                "flex items-start gap-3 rounded-md border p-3 cursor-pointer transition-colors",
+                hotkeyMode === "hook" ? "border-primary bg-primary/5" : "hover:bg-muted/50",
+                hotkeySwitching && "opacity-50 pointer-events-none"
+              )}
+              onClick={() => switchHotkeyMode("hook")}
+            >
+              <div className={cn(
+                "mt-0.5 h-4 w-4 rounded-full border-2 flex items-center justify-center flex-shrink-0",
+                hotkeyMode === "hook" ? "border-primary" : "border-muted-foreground/40"
+              )}>
+                {hotkeyMode === "hook" && <div className="h-2 w-2 rounded-full bg-primary" />}
+              </div>
+              <div className="space-y-0.5">
+                <div className="text-xs font-medium">低级键盘钩子</div>
+                <p className="text-xs text-muted-foreground">
+                  可穿透真全屏（独占全屏）应用，适合需要在全屏游戏中使用快捷键或截图的场景。
+                </p>
+              </div>
+            </label>
+          </div>
+        </div>
+
+        {/* Game Mode Card */}
+        <div className="rounded-lg border bg-card p-4">
+          <h3 className="text-sm font-medium mb-3">游戏模式</h3>
+          <p className="text-xs text-muted-foreground mb-4">
+            检测到全屏应用（包括窗口化全屏和独占全屏）时，自动暂停剪贴板监控和所有全局快捷键，退出全屏后自动恢复
+          </p>
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <Label className="text-xs">启用游戏模式</Label>
+              <p className="text-xs text-muted-foreground">
+                切换窗口时自动检测，空闲时零开销
+              </p>
+            </div>
+            <Switch checked={gameModeEnabled} onCheckedChange={toggleGameMode} />
+          </div>
+
+          {/* 排除列表 */}
+          {gameModeEnabled && (
+            <>
+              <div className="border-t my-4" />
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="space-y-0.5">
+                    <Label className="text-xs">排除列表</Label>
+                    <p className="text-xs text-muted-foreground">
+                      以下应用全屏时不进入游戏模式
+                    </p>
+                  </div>
+                  <Button variant="outline" size="sm" onClick={loadExclusionRunningApps} className="h-7 text-xs">
+                    选择应用
+                  </Button>
+                </div>
+
+                <div className="flex gap-2">
+                  <Input
+                    value={exclusionInput}
+                    onChange={(e) => setExclusionInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        addExclusion(exclusionInput);
+                        setExclusionInput("");
+                      }
+                    }}
+                    placeholder="手动输入进程名，如 chrome.exe"
+                    className="flex-1 h-8 text-xs"
+                  />
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => { addExclusion(exclusionInput); setExclusionInput(""); }}
+                    disabled={!exclusionInput.trim()}
+                    className="h-8 text-xs"
+                  >
+                    添加
+                  </Button>
+                </div>
+
+                {exclusionList.length > 0 ? (
+                  <div className="space-y-1">
+                    {exclusionList.map((proc) => {
+                      const meta = getExclusionMeta(proc);
+                      return (
+                        <div
+                          key={proc}
+                          className="group flex items-center gap-2.5 px-2.5 py-2 rounded-md bg-muted/40 hover:bg-muted/70 transition-colors"
+                        >
+                          {meta?.icon ? (
+                            <img
+                              src={convertFileSrc(meta.icon)}
+                              alt=""
+                              className="w-5 h-5 shrink-0 object-contain"
+                              onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                            />
+                          ) : (
+                            <div className="w-5 h-5 shrink-0 rounded bg-muted flex items-center justify-center text-[10px] text-muted-foreground">
+                              ?
+                            </div>
+                          )}
+                          <div className="flex-1 min-w-0">
+                            {meta ? (
+                              <>
+                                <div className="text-xs font-medium truncate">{meta.name}</div>
+                                <div className="text-[10px] text-muted-foreground truncate">{proc}</div>
+                              </>
+                            ) : (
+                              <div className="text-xs font-medium truncate">{proc}</div>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => removeExclusion(proc)}
+                            className="shrink-0 w-6 h-6 rounded-md flex items-center justify-center text-muted-foreground opacity-0 group-hover:opacity-100 hover:text-destructive transition-all"
+                            aria-label={`移除 ${proc}`}
+                          >
+                            <Delete16Regular className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="text-center py-4">
+                    <p className="text-xs text-muted-foreground/60">暂无排除项</p>
+                    <p className="text-[10px] text-muted-foreground/40 mt-1">
+                      点击"选择应用"从运行中的应用添加，或手动输入进程名
+                    </p>
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Exclusion App Picker Dialog */}
+        <Dialog open={showExclusionAppPicker} onOpenChange={setShowExclusionAppPicker}>
+          <DialogContent className="max-w-md max-h-[70vh] flex flex-col">
+            <DialogHeader>
+              <DialogTitle className="text-sm">选择要排除的应用</DialogTitle>
+              <DialogDescription className="text-xs">
+                点击应用即可添加到排除列表，该应用全屏时将不触发游戏模式
+              </DialogDescription>
+            </DialogHeader>
+            <div className="flex-1 overflow-y-auto -mx-1 px-1 space-y-0.5">
+              {exclusionRunningApps.map((app) => {
+                const alreadyAdded = exclusionList.some(
+                  (f) => f.toLowerCase() === app.process.toLowerCase()
+                );
+                return (
+                  <button
+                    key={app.process}
+                    type="button"
+                    disabled={alreadyAdded}
+                    onClick={() => addExclusion(app.process, { name: app.name, icon: app.icon })}
+                    className={`w-full flex items-center gap-2.5 px-2.5 py-2 rounded-md text-left transition-colors ${
+                      alreadyAdded
+                        ? "opacity-40 cursor-not-allowed"
+                        : "hover:bg-accent"
+                    }`}
+                  >
+                    {app.icon ? (
+                      <img
+                        src={convertFileSrc(app.icon)}
+                        alt=""
+                        className="w-5 h-5 shrink-0 object-contain"
+                        onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                      />
+                    ) : (
+                      <div className="w-5 h-5 shrink-0 rounded bg-muted flex items-center justify-center text-[10px] text-muted-foreground">
+                        ?
+                      </div>
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs font-medium truncate">{app.name}</div>
+                      <div className="text-[10px] text-muted-foreground truncate">{app.process}</div>
+                    </div>
+                    {alreadyAdded && (
+                      <span className="text-[10px] text-muted-foreground shrink-0">已添加</span>
+                    )}
+                  </button>
+                );
+              })}
+              {exclusionRunningApps.length === 0 && (
+                <p className="text-xs text-muted-foreground text-center py-8">加载中...</p>
+              )}
+            </div>
+            <DialogFooter>
+              <Button variant="outline" size="sm" onClick={() => setShowExclusionAppPicker(false)} className="text-xs">
+                关闭
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
         {/* Keyboard Navigation Card */}
         <div className="rounded-lg border bg-card p-4">
           <h3 className="text-sm font-medium mb-3">快捷导航</h3>
@@ -365,7 +726,7 @@ export function ShortcutsTab({
               <div className="space-y-0.5">
                 <Label className="text-xs">键盘导航</Label>
                 <p className="text-xs text-muted-foreground">
-                  方向键选择条目和切换分组、Enter 粘贴、Shift+Enter 纯文本粘贴、Delete 删除
+                  方向键选择条目和切换分类、Enter 粘贴、Shift+Enter 纯文本粘贴、Delete 删除
                 </p>
               </div>
               <Switch

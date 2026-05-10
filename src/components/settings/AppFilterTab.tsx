@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Delete16Regular } from "@fluentui/react-icons";
+import { Delete16Regular, Warning16Regular } from "@fluentui/react-icons";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { Button } from "@/components/ui/button";
 import {
@@ -13,18 +13,38 @@ import {
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { logError } from "@/lib/logger";
+import { useUISettings } from "@/stores/ui-settings";
 
 interface AppMeta { name: string; icon: string | null }
 type RunningApp = { name: string; process: string; icon: string | null };
 
-const ALL_MONITOR_TYPES = ["text", "html", "rtf", "image", "files"] as const;
+const ALL_MONITOR_TYPES = ["text", "image", "files", "video"] as const;
 const TYPE_LABELS: Record<string, string> = {
-  text: "纯文本",
-  html: "HTML",
-  rtf: "RTF",
+  text: "文本",
   image: "图片",
   files: "文件",
+  video: "视频",
 };
+
+/** UI 类型 → 后端原始类型（文本统一包含 text、html、rtf） */
+function uiTypesToRaw(uiTypes: Set<string>): string[] {
+  const raw: string[] = [];
+  if (uiTypes.has("text")) raw.push("text", "html", "rtf");
+  if (uiTypes.has("image")) raw.push("image");
+  if (uiTypes.has("files")) raw.push("files");
+  if (uiTypes.has("video")) raw.push("video");
+  return raw;
+}
+
+/** 后端原始类型 → UI 类型 */
+function rawTypesToUI(rawTypes: Set<string>): Set<string> {
+  const ui = new Set<string>();
+  if (rawTypes.has("text") || rawTypes.has("html") || rawTypes.has("rtf")) ui.add("text");
+  if (rawTypes.has("image")) ui.add("image");
+  if (rawTypes.has("files")) ui.add("files");
+  if (rawTypes.has("video")) ui.add("video");
+  return ui;
+}
 
 export function AppFilterTab() {
   const [appFilterEnabled, setAppFilterEnabled] = useState(false);
@@ -36,6 +56,21 @@ export function AppFilterTab() {
   const [monitorTypes, setMonitorTypes] = useState<Set<string>>(new Set(ALL_MONITOR_TYPES));
   // 缓存进程名 → 应用信息（名称+图标），从选择器中获取
   const appMetaCache = useRef<Map<string, AppMeta>>(new Map());
+
+  // 持久化元数据到 setting，使重启后图标仍可显示
+  const persistMeta = useCallback(() => {
+    const obj: Record<string, AppMeta> = {};
+    appMetaCache.current.forEach((v, k) => { obj[k] = v; });
+    invoke("set_setting", { key: "app_filter_meta", value: JSON.stringify(obj) }).catch((error) => {
+      logError("Failed to save app_filter_meta:", error);
+    });
+  }, []);
+
+  // 内容正则过滤
+  const [contentFilterEnabled, setContentFilterEnabled] = useState(false);
+  const [contentFilterRules, setContentFilterRules] = useState<string[]>([]);
+  const [contentRuleInput, setContentRuleInput] = useState("");
+  const [contentRuleError, setContentRuleError] = useState<string | null>(null);
 
   useEffect(() => {
     invoke<string | null>("get_setting", { key: "app_filter_enabled" })
@@ -60,21 +95,53 @@ export function AppFilterTab() {
     invoke<string | null>("get_setting", { key: "monitor_types" })
       .then((v) => {
         if (v && v.length > 0) {
-          setMonitorTypes(new Set(v.split(",").map((t) => t.trim()).filter(Boolean)));
+          const rawSet = new Set(v.split(",").map((t) => t.trim()).filter(Boolean));
+          setMonitorTypes(rawTypesToUI(rawSet));
         }
       })
       .catch((error) => {
         logError("Failed to load monitor_types:", error);
       });
-    // 预加载一次运行中应用来填充图标缓存
-    invoke<RunningApp[]>("get_running_apps")
-      .then((apps) => {
-        for (const app of apps) {
-          appMetaCache.current.set(app.process.toLowerCase(), { name: app.name, icon: app.icon });
+    invoke<string | null>("get_setting", { key: "content_filter_enabled" })
+      .then((v) => setContentFilterEnabled(v === "true"))
+      .catch((error) => {
+        logError("Failed to load content_filter_enabled:", error);
+      });
+    invoke<string | null>("get_setting", { key: "content_filter_rules" })
+      .then((v) => {
+        if (v && v.length > 0) {
+          setContentFilterRules(v.split("\n").filter(Boolean));
         }
       })
       .catch((error) => {
-        logError("Failed to preload running apps:", error);
+        logError("Failed to load content_filter_rules:", error);
+      });
+    // 从持久化设置恢复元数据缓存（保证重启后图标可用）
+    invoke<string | null>("get_setting", { key: "app_filter_meta" })
+      .then((v) => {
+        if (v) {
+          try {
+            const obj = JSON.parse(v) as Record<string, AppMeta>;
+            for (const [k, meta] of Object.entries(obj)) {
+              appMetaCache.current.set(k, meta);
+            }
+          } catch { /* ignore */ }
+        }
+      })
+      .catch((error) => {
+        logError("Failed to load app_filter_meta:", error);
+      })
+      .finally(() => {
+        // 预加载运行中应用来更新图标缓存（覆盖旧数据）
+        invoke<RunningApp[]>("get_running_apps")
+          .then((apps) => {
+            for (const app of apps) {
+              appMetaCache.current.set(app.process.toLowerCase(), { name: app.name, icon: app.icon });
+            }
+          })
+          .catch((error) => {
+            logError("Failed to preload running apps:", error);
+          });
       });
   }, []);
 
@@ -82,18 +149,20 @@ export function AppFilterTab() {
     setMonitorTypes((prev) => {
       const next = new Set(prev);
       if (next.has(type)) {
-        // 至少保留一种类型
-        if (next.size <= 1) return prev;
+        // 确保转换后至少保留一种后端类型
         next.delete(type);
+        if (uiTypesToRaw(next).length === 0) return prev;
       } else {
         next.add(type);
       }
-      const value = Array.from(next).join(",");
+      const value = uiTypesToRaw(next).join(",");
       const rollback = new Set(prev);
       invoke("set_setting", { key: "monitor_types", value }).catch((error) => {
         logError("Failed to save monitor_types:", error);
         setMonitorTypes(rollback);
+        useUISettings.getState().setEnabledMonitorTypes(Array.from(rollback));
       });
+      useUISettings.getState().setEnabledMonitorTypes(Array.from(next));
       return next;
     });
   }, []);
@@ -121,6 +190,7 @@ export function AppFilterTab() {
     if (!trimmed) return;
     if (meta) {
       appMetaCache.current.set(trimmed.toLowerCase(), meta);
+      persistMeta();
     }
     setAppFilterList((prev) => {
       if (prev.some((a) => a.toLowerCase() === trimmed.toLowerCase())) return prev;
@@ -131,9 +201,11 @@ export function AppFilterTab() {
       });
       return next;
     });
-  }, []);
+  }, [persistMeta]);
 
   const removeFilterApp = useCallback((name: string) => {
+    appMetaCache.current.delete(name.toLowerCase());
+    persistMeta();
     setAppFilterList((prev) => {
       const next = prev.filter((a) => a !== name);
       invoke("set_setting", { key: "app_filter_list", value: next.join(",") }).catch((error) => {
@@ -142,7 +214,7 @@ export function AppFilterTab() {
       });
       return next;
     });
-  }, []);
+  }, [persistMeta]);
 
   const loadRunningApps = useCallback(async () => {
     try {
@@ -159,6 +231,48 @@ export function AppFilterTab() {
 
   const getMeta = (process: string): AppMeta | undefined =>
     appMetaCache.current.get(process.toLowerCase());
+
+  const toggleContentFilter = useCallback((enabled: boolean) => {
+    const previous = contentFilterEnabled;
+    setContentFilterEnabled(enabled);
+    invoke("set_setting", { key: "content_filter_enabled", value: String(enabled) }).catch((error) => {
+      logError("Failed to save content_filter_enabled:", error);
+      setContentFilterEnabled(previous);
+    });
+  }, [contentFilterEnabled]);
+
+  const saveContentRules = useCallback((rules: string[]) => {
+    const value = rules.join("\n");
+    invoke("set_setting", { key: "content_filter_rules", value }).catch((error) => {
+      logError("Failed to save content_filter_rules:", error);
+    });
+  }, []);
+
+  const addContentRule = useCallback((pattern: string) => {
+    const trimmed = pattern.trim();
+    if (!trimmed) return;
+    // 基础格式检查（实际匹配在 Rust 后端执行，支持 (?i) 等 Rust regex 语法）
+    if (/[\[\(]$/.test(trimmed) || /^[*+?]/.test(trimmed)) {
+      setContentRuleError(`正则表达式格式有误: ${trimmed}`);
+      return;
+    }
+    setContentRuleError(null);
+    setContentFilterRules((prev) => {
+      if (prev.includes(trimmed)) return prev;
+      const next = [...prev, trimmed];
+      saveContentRules(next);
+      return next;
+    });
+    setContentRuleInput("");
+  }, [saveContentRules]);
+
+  const removeContentRule = useCallback((pattern: string) => {
+    setContentFilterRules((prev) => {
+      const next = prev.filter((r) => r !== pattern);
+      saveContentRules(next);
+      return next;
+    });
+  }, [saveContentRules]);
 
   return (
     <div className="space-y-4">
@@ -368,6 +482,77 @@ export function AppFilterTab() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* 内容正则过滤 */}
+      <div className="rounded-lg border bg-card p-4">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <h3 className="text-sm font-medium">内容过滤</h3>
+            <p className="text-xs text-muted-foreground mt-1">
+              通过正则表达式匹配文本内容，匹配的内容将不会被记录
+            </p>
+          </div>
+          <Switch checked={contentFilterEnabled} onCheckedChange={toggleContentFilter} />
+        </div>
+
+        <div className="flex gap-2 mb-3">
+          <Input
+            value={contentRuleInput}
+            onChange={(e) => { setContentRuleInput(e.target.value); setContentRuleError(null); }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                addContentRule(contentRuleInput);
+              }
+            }}
+            placeholder="输入正则，如 password|token|secret"
+            className="flex-1 h-8 text-xs font-mono"
+          />
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => addContentRule(contentRuleInput)}
+            disabled={!contentRuleInput.trim()}
+            className="h-8 text-xs"
+          >
+            添加
+          </Button>
+        </div>
+
+        {contentRuleError && (
+          <div className="flex items-center gap-1.5 mb-3 text-xs text-destructive">
+            <Warning16Regular className="w-3.5 h-3.5 shrink-0" />
+            {contentRuleError}
+          </div>
+        )}
+
+        {contentFilterRules.length > 0 ? (
+          <div className="space-y-1">
+            {contentFilterRules.map((rule) => (
+              <div
+                key={rule}
+                className="group flex items-center gap-2.5 px-2.5 py-2 rounded-md bg-muted/40 hover:bg-muted/70 transition-colors"
+              >
+                <code className="flex-1 min-w-0 text-xs font-mono truncate">{rule}</code>
+                <button
+                  type="button"
+                  onClick={() => removeContentRule(rule)}
+                  className="shrink-0 w-6 h-6 rounded-md flex items-center justify-center text-muted-foreground opacity-0 group-hover:opacity-100 hover:text-destructive transition-all"
+                  aria-label={`移除 ${rule}`}
+                >
+                  <Delete16Regular className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="text-center py-6">
+            <p className="text-xs text-muted-foreground/60">暂无过滤规则</p>
+            <p className="text-[10px] text-muted-foreground/40 mt-1">
+              添加正则表达式来过滤包含敏感信息的剪贴板内容
+            </p>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

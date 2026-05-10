@@ -7,23 +7,28 @@ import {
   Color16Regular,
   Keyboard16Regular,
   Info16Regular,
-  ArrowSync16Regular,
-  Speaker216Regular,
   Filter16Regular,
+  ArrowSync16Regular,
+  Translate16Regular,
+  ScanText16Regular,
+  Speaker216Regular,
 } from "@fluentui/react-icons";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { AboutTab } from "@/components/settings/AboutTab";
 import { AppFilterTab } from "@/components/settings/AppFilterTab";
-import { AudioTab } from "@/components/settings/AudioTab";
 import { DataTab, DataSettings } from "@/components/settings/DataTab";
 import { DisplayTab } from "@/components/settings/DisplayTab";
 import { GeneralTab, GeneralSettings } from "@/components/settings/GeneralTab";
+import { OcrTab } from "@/components/settings/OcrTab";
 import {
   ShortcutsTab,
   ShortcutSettings,
 } from "@/components/settings/ShortcutsTab";
+import { SyncTab } from "@/components/settings/SyncTab";
 import { ThemeTab } from "@/components/settings/ThemeTab";
+import { TranslateTab } from "@/components/settings/TranslateTab";
+import { TtsTab } from "@/components/settings/TtsTab";
 import { UpdateDialog } from "@/components/settings/UpdateDialog";
 import { Card, CardContent } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -40,7 +45,7 @@ function normalizePositionMode(raw: string | null | undefined): import("@/compon
   return "follow_cursor";
 }
 
-type TabType = "general" | "display" | "theme" | "data" | "appfilter" | "audio" | "shortcuts" | "about";
+type TabType = "general" | "display" | "theme" | "data" | "appfilter" | "audio" | "shortcuts" | "ocr" | "translate" | "tts" | "sync" | "about";
 
 const navItems: {
   id: TabType;
@@ -52,8 +57,11 @@ const navItems: {
   { id: "theme", label: "外观主题", icon: Color16Regular },
   { id: "data", label: "数据管理", icon: Database16Regular },
   { id: "appfilter", label: "监听过滤", icon: Filter16Regular },
-  { id: "audio", label: "音效设置", icon: Speaker216Regular },
   { id: "shortcuts", label: "快捷按键", icon: Keyboard16Regular },
+  { id: "ocr", label: "OCR识别", icon: ScanText16Regular },
+  { id: "translate", label: "条目翻译", icon: Translate16Regular },
+  { id: "tts", label: "语音朗读", icon: Speaker216Regular },
+  { id: "sync", label: "云端同步", icon: ArrowSync16Regular },
   { id: "about", label: "关于软件", icon: Info16Regular },
 ];
 
@@ -64,6 +72,9 @@ export function Settings() {
     data_path: "",
     max_history_count: 1000,
     max_content_size_kb: 1024,
+    max_image_size_kb: 0,
+    max_file_size_kb: 0,
+    max_video_size_kb: 0,
     auto_cleanup_days: 30,
     auto_start: false,
     admin_launch: false,
@@ -102,6 +113,38 @@ export function Settings() {
     });
   }, []);
 
+  // 拦截窗口关闭请求，改为隐藏（避免每次打开重建 WebView，大幅提升再次打开速度）
+  // 隐藏超过 3 分钟未再次打开则自动销毁，释放内存
+  useEffect(() => {
+    const win = getCurrentWindow();
+    let hidden = false;
+    let destroyTimer: ReturnType<typeof setTimeout> | null = null;
+    const DESTROY_DELAY = 3 * 60 * 1000;
+
+    const unlistenClose = win.onCloseRequested(async (event) => {
+      event.preventDefault();
+      hidden = true;
+      await win.hide();
+      destroyTimer = setTimeout(() => win.destroy(), DESTROY_DELAY);
+    });
+    // 窗口重新显示时刷新设置（防止隐藏期间数据过期）并取消销毁计时
+    const unlistenFocus = win.listen("tauri://focus", () => {
+      if (destroyTimer) {
+        clearTimeout(destroyTimer);
+        destroyTimer = null;
+      }
+      if (hidden && settingsLoadedRef.current) {
+        hidden = false;
+        loadSettings();
+      }
+    });
+    return () => {
+      if (destroyTimer) clearTimeout(destroyTimer);
+      unlistenClose.then((fn) => fn());
+      unlistenFocus.then((fn) => fn());
+    };
+  }, []);
+
   // ESC 关闭设置窗口
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -128,6 +171,9 @@ export function Settings() {
   }, [
     settings.max_history_count,
     settings.max_content_size_kb,
+    settings.max_image_size_kb,
+    settings.max_file_size_kb,
+    settings.max_video_size_kb,
     settings.auto_cleanup_days,
     settings.auto_start,
     settings.admin_launch,
@@ -139,6 +185,9 @@ export function Settings() {
         dataPath,
         maxHistoryCount,
         maxContentSize,
+        maxImageSize,
+        maxFileSize,
+        maxVideoSize,
         autoCleanupDays,
         positionMode,
         autoStart,
@@ -153,6 +202,9 @@ export function Settings() {
         invoke<string>("get_default_data_path"),
         invoke<string>("get_setting", { key: "max_history_count" }),
         invoke<string>("get_setting", { key: "max_content_size_kb" }),
+        invoke<string>("get_setting", { key: "max_image_size_kb" }),
+        invoke<string>("get_setting", { key: "max_file_size_kb" }),
+        invoke<string>("get_setting", { key: "max_video_size_kb" }),
         invoke<string>("get_setting", { key: "auto_cleanup_days" }),
         invoke<string | null>("get_setting", { key: "position_mode" }),
         invoke<boolean>("is_autostart_enabled"),
@@ -169,6 +221,9 @@ export function Settings() {
         data_path: dataPath || "",
         max_history_count: maxHistoryCount ? parseInt(maxHistoryCount) : 1000,
         max_content_size_kb: maxContentSize ? parseInt(maxContentSize) : 1024,
+        max_image_size_kb: maxImageSize ? parseInt(maxImageSize) : 0,
+        max_file_size_kb: maxFileSize ? parseInt(maxFileSize) : 0,
+        max_video_size_kb: maxVideoSize ? parseInt(maxVideoSize) : 0,
         auto_cleanup_days: autoCleanupDays ? parseInt(autoCleanupDays) : 30,
         auto_start: autoStart,
         admin_launch: adminLaunch,
@@ -196,6 +251,18 @@ export function Settings() {
       await invoke("set_setting", {
         key: "max_content_size_kb",
         value: settings.max_content_size_kb.toString(),
+      });
+      await invoke("set_setting", {
+        key: "max_image_size_kb",
+        value: settings.max_image_size_kb.toString(),
+      });
+      await invoke("set_setting", {
+        key: "max_file_size_kb",
+        value: settings.max_file_size_kb.toString(),
+      });
+      await invoke("set_setting", {
+        key: "max_video_size_kb",
+        value: settings.max_video_size_kb.toString(),
       });
       await invoke("set_setting", {
         key: "auto_cleanup_days",
@@ -314,8 +381,6 @@ export function Settings() {
 
               {activeTab === "theme" && <ThemeTab />}
 
-              {activeTab === "audio" && <AudioTab />}
-
               {activeTab === "shortcuts" && (
                 <ShortcutsTab
                   settings={settings}
@@ -324,6 +389,14 @@ export function Settings() {
                   }
                 />
               )}
+
+              {activeTab === "ocr" && <OcrTab />}
+
+              {activeTab === "translate" && <TranslateTab />}
+
+              {activeTab === "tts" && <TtsTab />}
+
+              {activeTab === "sync" && <SyncTab />}
             </div>
           </ScrollArea>
         )}
