@@ -1075,6 +1075,7 @@ pub fn run() {
             commands::ocr::ocr_recognize_baidu,
             commands::ocr::open_ocr_screenshot_window,
             commands::ocr::ocr_screenshot_ready,
+            commands::ocr::hide_ocr_screenshot_window,
             commands::ocr::open_ocr_result_window,
             commands::ocr::get_pending_ocr_text,
             commands::ocr::update_ocr_shortcut,
