@@ -7,6 +7,9 @@ pub(crate) static TEXT_PREVIEW_UPDATE_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static IMAGE_PREVIEW_TOKEN: AtomicU64 = AtomicU64::new(0);
 static TEXT_PREVIEW_TOKEN: AtomicU64 = AtomicU64::new(0);
+static IMAGE_PREVIEW_DESTROY_SEQ: AtomicU64 = AtomicU64::new(0);
+static TEXT_PREVIEW_DESTROY_SEQ: AtomicU64 = AtomicU64::new(0);
+const PREVIEW_DESTROY_DELAY: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[inline]
 fn promote_preview_token(slot: &AtomicU64, token: u64) -> bool {
@@ -22,6 +25,26 @@ fn is_preview_token_current(slot: &AtomicU64, token: u64) -> bool {
 #[inline]
 fn invalidate_preview_token(slot: &AtomicU64, token: u64) {
     slot.fetch_max(token.saturating_add(1), Ordering::AcqRel);
+}
+
+#[inline]
+fn cancel_preview_destroy(slot: &AtomicU64) {
+    slot.fetch_add(1, Ordering::AcqRel);
+}
+
+fn schedule_preview_destroy(app: tauri::AppHandle, label: &'static str, slot: &'static AtomicU64) {
+    let seq = slot.fetch_add(1, Ordering::AcqRel) + 1;
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(PREVIEW_DESTROY_DELAY).await;
+        if slot.load(Ordering::Acquire) != seq {
+            return;
+        }
+        if let Some(window) = app.get_webview_window(label)
+            && !window.is_visible().unwrap_or(false)
+        {
+            let _ = window.close();
+        }
+    });
 }
 
 #[tauri::command]
@@ -48,6 +71,7 @@ pub async fn show_image_preview(
     if token != 0 && !promote_preview_token(&IMAGE_PREVIEW_TOKEN, token) {
         return Ok(());
     }
+    cancel_preview_destroy(&IMAGE_PREVIEW_DESTROY_SEQ);
 
     let mut newly_created = false;
     let window = if let Some(w) = app.get_webview_window("image-preview") {
@@ -141,6 +165,7 @@ pub async fn show_video_preview(
     if token != 0 && !promote_preview_token(&IMAGE_PREVIEW_TOKEN, token) {
         return Ok(());
     }
+    cancel_preview_destroy(&IMAGE_PREVIEW_DESTROY_SEQ);
 
     let mut newly_created = false;
     let window = if let Some(w) = app.get_webview_window("image-preview") {
@@ -227,6 +252,7 @@ pub async fn hide_image_preview(app: tauri::AppHandle, token: Option<u64>) {
     if let Some(window) = app.get_webview_window("image-preview") {
         let _ = window.hide();
         let _ = window.emit("image-preview-clear", ());
+        schedule_preview_destroy(app, "image-preview", &IMAGE_PREVIEW_DESTROY_SEQ);
         tracing::debug!("image-preview hidden");
     }
 }
@@ -252,6 +278,7 @@ pub async fn show_text_preview(
     if token != 0 && !promote_preview_token(&TEXT_PREVIEW_TOKEN, token) {
         return Ok(());
     }
+    cancel_preview_destroy(&TEXT_PREVIEW_DESTROY_SEQ);
 
     if token != 0 && !is_preview_token_current(&TEXT_PREVIEW_TOKEN, token) {
         return Ok(());
@@ -353,6 +380,7 @@ pub async fn hide_text_preview(app: tauri::AppHandle, token: Option<u64>) {
     if let Some(window) = app.get_webview_window("text-preview") {
         let _ = window.hide();
         let _ = window.emit("text-preview-clear", ());
+        schedule_preview_destroy(app, "text-preview", &TEXT_PREVIEW_DESTROY_SEQ);
         tracing::debug!("text-preview hidden");
     }
 }

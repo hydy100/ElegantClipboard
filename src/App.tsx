@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useState, useMemo, useRef } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useState, useMemo, useRef } from "react";
 import {
   Search16Regular,
   Dismiss16Regular,
@@ -15,7 +15,6 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { useShallow } from "zustand/react/shallow";
 import { ClipboardList } from "@/components/ClipboardList";
-import { TagsView } from "@/components/TagsView";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -47,8 +46,20 @@ import { useUISettings } from "@/stores/ui-settings";
 // 初始化主题
 initTheme();
 
-// 加载翻译设置
-useTranslateSettings.getState().loadSettings();
+// 加载翻译设置放到首帧之后，避免启动显示时和主列表初始化争抢资源
+const scheduleTranslateSettingsLoad = () => {
+  const load = () => {
+    useTranslateSettings.getState().loadSettings();
+  };
+  if ("requestIdleCallback" in window) {
+    window.requestIdleCallback(load, { timeout: 1500 });
+    return;
+  }
+  globalThis.setTimeout(load, 800);
+};
+scheduleTranslateSettingsLoad();
+
+const TagsView = lazy(() => import("@/components/TagsView").then((m) => ({ default: m.TagsView })));
 
 const NO_DRAG_STYLE = { WebkitAppRegion: 'no-drag' } as React.CSSProperties;
 
@@ -429,7 +440,9 @@ function App() {
       {/* 主内容区域 */}
       <div className="flex-1 overflow-hidden">
         {tagsViewOpen ? (
-          <TagsView />
+          <Suspense fallback={null}>
+            <TagsView />
+          </Suspense>
         ) : (
           <ClipboardList searchInputRef={inputRef} />
         )}

@@ -111,13 +111,12 @@ export function Settings() {
     });
   }, []);
 
-  // 拦截窗口关闭请求，改为隐藏（避免每次打开重建 WebView，大幅提升再次打开速度）
-  // 隐藏超过 3 分钟未再次打开则自动销毁，释放内存
+  // 拦截窗口关闭请求，改为短暂隐藏；闲置 30 秒后销毁以释放 WebView2 renderer。
   useEffect(() => {
     const win = getCurrentWindow();
     let hidden = false;
     let destroyTimer: ReturnType<typeof setTimeout> | null = null;
-    const DESTROY_DELAY = 3 * 60 * 1000;
+    const DESTROY_DELAY = 30 * 1000;
 
     const unlistenClose = win.onCloseRequested(async (event) => {
       event.preventDefault();

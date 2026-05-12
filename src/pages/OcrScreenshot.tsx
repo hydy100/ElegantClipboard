@@ -158,8 +158,9 @@ export function OcrScreenshot() {
   };
 
   const closeWindow = () => {
-    // 隐藏而非关闭，下次热键可复用窗口
-    getCurrentWindow().hide();
+    invoke("hide_ocr_screenshot_window").catch(() => {
+      getCurrentWindow().hide();
+    });
   };
 
   // ESC 关闭

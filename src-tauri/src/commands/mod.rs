@@ -79,6 +79,13 @@ pub(crate) fn hide_image_preview_window<R: tauri::Runtime>(app: &tauri::AppHandl
     if let Some(preview) = app.get_webview_window("image-preview") {
         let _ = preview.hide();
         let _ = preview.emit("image-preview-clear", ());
+        let preview = preview.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            if !preview.is_visible().unwrap_or(false) {
+                let _ = preview.close();
+            }
+        });
     }
 }
 
@@ -89,6 +96,13 @@ pub(crate) fn hide_text_preview_window<R: tauri::Runtime>(app: &tauri::AppHandle
     if let Some(preview) = app.get_webview_window("text-preview") {
         let _ = preview.hide();
         let _ = preview.emit("text-preview-clear", ());
+        let preview = preview.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            if !preview.is_visible().unwrap_or(false) {
+                let _ = preview.close();
+            }
+        });
     }
 }
 
