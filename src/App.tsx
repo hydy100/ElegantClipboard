@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useState, useMemo, useRef } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useState, useMemo, useRef } from "react";
 import {
   Search16Regular,
   Dismiss16Regular,
@@ -13,11 +13,8 @@ import {
   Tag16Filled,
 } from "@fluentui/react-icons";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import debounce from "lodash.debounce";
 import { useShallow } from "zustand/react/shallow";
 import { ClipboardList } from "@/components/ClipboardList";
-import { TagsView } from "@/components/TagsView";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -33,7 +30,9 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { useInputFocus, focusWindowImmediately } from "@/hooks/useInputFocus";
+import { useInputFocus } from "@/hooks/useInputFocus";
+import { useSearchDebounce } from "@/hooks/useSearchDebounce";
+import { useWindowLifecycle } from "@/hooks/useWindowLifecycle";
 import { LOGICAL_TYPE_BACKEND_MAP, getVisibleCategories } from "@/lib/constants";
 import { logError } from "@/lib/logger";
 import { initTheme } from "@/lib/theme-applier";
@@ -47,8 +46,20 @@ import { useUISettings } from "@/stores/ui-settings";
 // 初始化主题
 initTheme();
 
-// 加载翻译设置
-useTranslateSettings.getState().loadSettings();
+// 加载翻译设置放到首帧之后，避免启动显示时和主列表初始化争抢资源
+const scheduleTranslateSettingsLoad = () => {
+  const load = () => {
+    useTranslateSettings.getState().loadSettings();
+  };
+  if ("requestIdleCallback" in window) {
+    window.requestIdleCallback(load, { timeout: 1500 });
+    return;
+  }
+  globalThis.setTimeout(load, 800);
+};
+scheduleTranslateSettingsLoad();
+
+const TagsView = lazy(() => import("@/components/TagsView").then((m) => ({ default: m.TagsView })));
 
 const NO_DRAG_STYLE = { WebkitAppRegion: 'no-drag' } as React.CSSProperties;
 
@@ -66,7 +77,6 @@ function dismissOverlays(): boolean {
 
 function App() {
   const [clearDialogOpen, setClearDialogOpen] = useState(false);
-  const [isPinned, setIsPinned] = useState(false);
   const [tagsViewOpen, setTagsViewOpen] = useState(false);
 
   const { searchQuery, selectedCategory, setSearchQuery, setSelectedCategory, fetchItems, clearHistory, refresh, resetView } = useClipboardStore(
@@ -97,13 +107,9 @@ function App() {
   const hideFavoritedFromMain = useUISettings((s) => s.hideFavoritedFromMain);
   const hideTaggedFromMain = useUISettings((s) => s.hideTaggedFromMain);
   const inputRef = useInputFocus<HTMLInputElement>();
-  // 追踪窗口隐藏期间是否有剪贴板变化
-  const clipboardDirtyRef = useRef(false);
   const segmentRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const segmentContainerRef = useRef<HTMLDivElement>(null);
   const [segmentIndicator, setSegmentIndicator] = useState({ left: 0, width: 0 });
-  // 窗口入场动画状态：null = 初始（不添加任何 class），true = 入场动画，false = 隐藏
-  const [windowVisible, setWindowVisible] = useState<boolean | null>(null);
 
   const visibleCategories = useMemo(
     () => getVisibleCategories(enabledMonitorTypes),
@@ -146,32 +152,22 @@ function App() {
     }
   }, [visibleCategories, setSelectedCategory]);
 
-  // 切换视图（主页/收藏/标签）时刷新文件有效性
-  const viewSwitchRef = useRef(false);
-  useEffect(() => {
-    if (!viewSwitchRef.current) { viewSwitchRef.current = true; return; }
-    invoke("refresh_files_validity").then((changed) => {
-      if (changed as number > 0) refresh();
-    });
-  }, [tagsViewOpen, selectedCategory, refresh]);
-
-  // 应用卡片密度到根元素
-  useEffect(() => {
-    document.documentElement.dataset.density = cardDensity;
-  }, [cardDensity]);
-
-  // 加载置顶状态 & 同步键盘导航设置到后端
-  useEffect(() => {
-    invoke<boolean>("is_window_pinned").then(setIsPinned);
-    const kbNav = useUISettings.getState().keyboardNavigation;
-    invoke("set_keyboard_nav_enabled", { enabled: kbNav }).catch((error) => {
-      logError("Failed to sync keyboard navigation setting:", error);
-    });
-  }, []);
-
-  // 窗口出现时短暂抑制工具栏提示，防止闪烁
-  const [suppressTooltips, setSuppressTooltips] = useState(false);
-  const suppressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const { isPinned, setIsPinned, suppressTooltips, windowVisible } = useWindowLifecycle({
+    autoResetState,
+    searchAutoClear,
+    searchAutoFocus,
+    cardDensity,
+    tagsViewOpen,
+    selectedCategory,
+    inputRef,
+    fetchItems,
+    refresh,
+    resetView,
+    setBatchMode,
+    setSearchQuery,
+    setTagsViewOpen,
+    dismissOverlays,
+  });
   const toolbarStyle = useMemo<React.CSSProperties>(() => ({
     WebkitAppRegion: 'no-drag',
     pointerEvents: suppressTooltips ? 'none' : undefined,
@@ -184,113 +180,10 @@ function App() {
     refresh();
   }, [hideFavoritedFromMain, hideTaggedFromMain, refresh]);
 
-  // 监听剪贴板变化，标记脏数据
-  useEffect(() => {
-    const unlisten = listen("clipboard-updated", () => {
-      clipboardDirtyRef.current = true;
-    });
-    return () => { unlisten.then((fn) => fn()); };
-  }, []);
-
-  // 窗口显示时按需刷新数据
-  useEffect(() => {
-    const unlisten = listen("window-shown", () => {
-      setWindowVisible(true);
-      // 重新读取设置（可能在设置窗口中更改）
-      useUISettings.persist.rehydrate();
-      // 后端批量检查文件有效性并更新数据库，然后刷新前端数据
-      invoke("refresh_files_validity").finally(() => {
-        if (searchAutoClear) {
-          setSearchQuery("");
-          fetchItems({ search: "" });
-        } else {
-          refresh();
-        }
-      });
-      clipboardDirtyRef.current = false;
-      if (searchAutoFocus) {
-        focusWindowImmediately().then(() => {
-          inputRef.current?.focus();
-        });
-      }
-      setSuppressTooltips(true);
-      if (suppressTimerRef.current) clearTimeout(suppressTimerRef.current);
-      suppressTimerRef.current = setTimeout(() => setSuppressTooltips(false), 400);
-    });
-    return () => {
-      unlisten.then((fn) => fn());
-      if (suppressTimerRef.current) clearTimeout(suppressTimerRef.current);
-    };
-  }, [refresh, fetchItems, setSearchQuery, searchAutoFocus, searchAutoClear]);
-
-  // 窗口隐藏时关闭弹出层并可选重置状态
-  useEffect(() => {
-    const unlisten = listen("window-hidden", () => {
-      setWindowVisible(false);
-      dismissOverlays();
-      setBatchMode(false);
-      if (autoResetState) {
-        setTagsViewOpen(false);
-        resetView();
-      }
-    });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, [resetView, autoResetState]);
-
-  // ESC 键处理（后端钩子 + DOM 双通道）
-  const handleEscape = useCallback(async () => {
-    if (dismissOverlays()) return;
-    if (useClipboardStore.getState().batchMode) {
-      setBatchMode(false);
-      return;
-    }
-    try {
-      await invoke("hide_window");
-    } catch (error) {
-      logError("Failed to hide window:", error);
-    }
-  }, [setBatchMode]);
-
-  // 通道1：后端键盘钩子
-  useEffect(() => {
-    const unlisten = listen("escape-pressed", handleEscape);
-    return () => { unlisten.then((fn) => fn()); };
-  }, [handleEscape]);
-
-  // DOM 键盘事件通道
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && e.isTrusted) {
-        e.preventDefault();
-        handleEscape();
-      }
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [handleEscape]);
-
-  // 防抖搜索
-  const debouncedSearch = useMemo(
-    () => debounce(() => {
-      fetchItems();
-    }, 300),
-    [fetchItems]
-  );
-
-  // 卸载时取消防抖
-  useEffect(() => {
-    return () => {
-      debouncedSearch.cancel();
-    };
-  }, [debouncedSearch]);
-
-  const handleSearchChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const value = e.target.value;
-    setSearchQuery(value);
-    debouncedSearch();
-  };
+  const { handleSearchChange, clearSearch } = useSearchDebounce({
+    fetchItems,
+    setSearchQuery,
+  });
 
   const clearScopeText = useMemo(() => {
     if (selectedCategory === "__favorites__") {
@@ -477,7 +370,7 @@ function App() {
           />
           {searchQuery && (
             <button
-              onClick={() => { setSearchQuery(""); fetchItems({ search: "" }); }}
+              onClick={clearSearch}
               className="absolute right-2 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center text-muted-foreground hover:text-foreground rounded-sm transition-colors z-10"
             >
               <Dismiss16Regular className="w-3.5 h-3.5" />
@@ -547,7 +440,9 @@ function App() {
       {/* 主内容区域 */}
       <div className="flex-1 overflow-hidden">
         {tagsViewOpen ? (
-          <TagsView />
+          <Suspense fallback={null}>
+            <TagsView />
+          </Suspense>
         ) : (
           <ClipboardList searchInputRef={inputRef} />
         )}

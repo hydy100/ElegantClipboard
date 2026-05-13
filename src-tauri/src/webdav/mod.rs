@@ -22,6 +22,9 @@ pub struct WebDavConfig {
     /// 自定义代理地址，如 `http://127.0.0.1:7890` 或 `socks5://127.0.0.1:1080`
     #[serde(default)]
     pub proxy_url: String,
+    /// 是否接受无效 TLS 证书。默认关闭，仅用于自签名 WebDAV 服务兼容。
+    #[serde(default)]
+    pub accept_invalid_certs: bool,
 }
 
 /// 同步选项
@@ -57,6 +60,7 @@ impl Default for SyncOptions {
 
 
 const SYNC_FILENAME: &str = "clipboard_sync.zip";
+const MAX_SYNC_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// 媒体文件映射条目（记录每个文件的 hash 和本地路径，用于下载时定位）
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -89,8 +93,21 @@ pub fn get_or_create_device_id(db: &crate::database::Database) -> String {
 }
 
 /// 计算文件内容的 blake3 hash（hex）
-fn file_hash(data: &[u8]) -> String {
-    blake3::hash(data).to_hex().to_string()
+fn file_hash_from_path(path: &Path) -> Result<(String, u64), String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("读取文件失败 {}: {}", path.display(), e))?;
+    let mut hasher = blake3::Hasher::new();
+    let bytes = std::io::copy(&mut file, &mut hasher)
+        .map_err(|e| format!("计算文件 hash 失败 {}: {}", path.display(), e))?;
+    Ok((hasher.finalize().to_hex().to_string(), bytes))
+}
+
+fn file_len_if_within_limit(path: &Path, max_bytes: i64) -> Option<u64> {
+    let len = std::fs::metadata(path).ok()?.len();
+    if max_bytes >= 0 && len > max_bytes as u64 {
+        return None;
+    }
+    Some(len)
 }
 
 /// 构建 Basic Auth 头
@@ -117,10 +134,14 @@ fn default_proxy_mode() -> String { "system".to_string() }
 /// - none: 不使用任何代理
 /// - custom: 使用自定义代理地址（支持 http/https/socks5）
 fn build_client(config: &WebDavConfig) -> Result<reqwest::blocking::Client, String> {
-    let builder = reqwest::blocking::Client::builder()
+    let mut builder = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(60))
-        .danger_accept_invalid_certs(true);
+        .timeout(std::time::Duration::from_secs(60));
+
+    if config.accept_invalid_certs {
+        builder = builder.danger_accept_invalid_certs(true);
+        info!("WebDAV TLS 证书校验已关闭，仅用于自签名服务兼容");
+    }
 
     let builder = crate::proxy::apply_proxy(builder, &config.proxy_mode, &config.proxy_url)?;
 
@@ -321,6 +342,7 @@ pub fn build_media_map(
     device_id: &str,
 ) -> Vec<MediaEntry> {
     let images_dir = data_dir.join("images");
+    let icons_dir = data_dir.join("icons");
     let mut seen_hashes = std::collections::HashSet::new();
     let mut map = Vec::new();
 
@@ -338,9 +360,8 @@ pub fn build_media_map(
                     } else {
                         images_dir.join(img_path)
                     };
-                    if let Ok(data) = std::fs::read(&full_path) {
-                        if (data.len() as i64) <= max_image_bytes {
-                            let hash = file_hash(&data);
+                    if file_len_if_within_limit(&full_path, max_image_bytes).is_some()
+                        && let Ok((hash, _)) = file_hash_from_path(&full_path) {
                             if seen_hashes.insert(hash.clone()) {
                                 let ext = full_path.extension()
                                     .unwrap_or_default().to_string_lossy().to_string();
@@ -352,6 +373,37 @@ pub fn build_media_map(
                                     device_id: device_id.to_string(),
                                 });
                             }
+                    }
+                }
+            }
+        }
+    }
+
+    // 应用图标（始终同步，体积极小）
+    {
+        let mut seen_icon_paths = std::collections::HashSet::new();
+        for item in items {
+            if let Some(ref icon_path) = item.source_app_icon {
+                if !seen_icon_paths.insert(icon_path.clone()) {
+                    continue;
+                }
+                let full_path = if Path::new(icon_path).is_absolute() {
+                    PathBuf::from(icon_path)
+                } else {
+                    icons_dir.join(icon_path)
+                };
+                if full_path.is_file() {
+                    if let Ok((hash, _)) = file_hash_from_path(&full_path) {
+                        if seen_hashes.insert(hash.clone()) {
+                            let ext = full_path.extension()
+                                .unwrap_or_default().to_string_lossy().to_string();
+                            map.push(MediaEntry {
+                                hash,
+                                ext,
+                                media_type: "icon".to_string(),
+                                local_path: icon_path.clone(),
+                                device_id: device_id.to_string(),
+                            });
                         }
                     }
                 }
@@ -380,9 +432,8 @@ pub fn build_media_map(
 
                 for file_path in &paths {
                     let p = Path::new(file_path);
-                    if let Ok(data) = std::fs::read(p) {
-                        if (data.len() as i64) <= limit {
-                            let hash = file_hash(&data);
+                    if file_len_if_within_limit(p, limit).is_some()
+                        && let Ok((hash, _)) = file_hash_from_path(p) {
                             if seen_hashes.insert(hash.clone()) {
                                 let ext = p.extension()
                                     .unwrap_or_default().to_string_lossy().to_string();
@@ -394,7 +445,6 @@ pub fn build_media_map(
                                     device_id: device_id.to_string(),
                                 });
                             }
-                        }
                     }
                 }
             }
@@ -415,6 +465,7 @@ pub fn upload_media_files(
     let auth = basic_auth(&config.username, &config.password);
     let base_url = normalize_url(&config.url, &config.remote_dir);
     let images_dir = data_dir.join("images");
+    let icons_dir = data_dir.join("icons");
 
     let mut uploaded = 0usize;
     let mut skipped = 0usize;
@@ -440,29 +491,49 @@ pub fn upload_media_files(
             continue;
         }
 
-        // 读取本地文件
-        let local_path = if entry.media_type == "image" {
-            if Path::new(&entry.local_path).is_absolute() {
-                PathBuf::from(&entry.local_path)
-            } else {
-                images_dir.join(&entry.local_path)
+        let local_path = match entry.media_type.as_str() {
+            "image" => {
+                if Path::new(&entry.local_path).is_absolute() {
+                    PathBuf::from(&entry.local_path)
+                } else {
+                    images_dir.join(&entry.local_path)
+                }
             }
-        } else {
-            PathBuf::from(&entry.local_path)
+            "icon" => {
+                if Path::new(&entry.local_path).is_absolute() {
+                    PathBuf::from(&entry.local_path)
+                } else {
+                    icons_dir.join(&entry.local_path)
+                }
+            }
+            _ => PathBuf::from(&entry.local_path),
         };
 
-        if let Ok(data) = std::fs::read(&local_path) {
-            let resp = client.put(&remote_url)
-                .header("Authorization", &auth)
-                .header("Content-Type", "application/octet-stream")
-                .body(data.to_vec())
-                .send()
-                .map_err(|e| format!("上传 {} 失败: {}", remote_path, e))?;
-
-            if resp.status().is_success() {
-                total_bytes += data.len() as u64;
-                uploaded += 1;
+        let file = match std::fs::File::open(&local_path) {
+            Ok(file) => file,
+            Err(e) => {
+                debug!("媒体上传跳过，无法打开 {}: {}", local_path.display(), e);
+                continue;
             }
+        };
+        let data_len = match file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(e) => {
+                debug!("媒体上传跳过，无法读取 metadata {}: {}", local_path.display(), e);
+                continue;
+            }
+        };
+        let resp = client.put(&remote_url)
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/octet-stream")
+            .header("Content-Length", data_len)
+            .body(reqwest::blocking::Body::new(file))
+            .send()
+            .map_err(|e| format!("上传 {} 失败: {}", remote_path, e))?;
+
+        if resp.status().is_success() {
+            total_bytes += data_len;
+            uploaded += 1;
         }
     }
 
@@ -481,20 +552,30 @@ pub fn download_missing_media(
     let auth = basic_auth(&config.username, &config.password);
     let base_url = normalize_url(&config.url, &config.remote_dir);
     let images_dir = data_dir.join("images");
+    let icons_dir = data_dir.join("icons");
     let _ = std::fs::create_dir_all(&images_dir);
+    let _ = std::fs::create_dir_all(&icons_dir);
 
     let mut downloaded = 0usize;
 
     for entry in entries {
         // 确定本地目标路径
-        let local_path = if entry.media_type == "image" {
-            if Path::new(&entry.local_path).is_absolute() {
-                PathBuf::from(&entry.local_path)
-            } else {
-                images_dir.join(&entry.local_path)
+        let local_path = match entry.media_type.as_str() {
+            "image" => {
+                if Path::new(&entry.local_path).is_absolute() {
+                    PathBuf::from(&entry.local_path)
+                } else {
+                    images_dir.join(&entry.local_path)
+                }
             }
-        } else {
-            PathBuf::from(&entry.local_path)
+            "icon" => {
+                if Path::new(&entry.local_path).is_absolute() {
+                    PathBuf::from(&entry.local_path)
+                } else {
+                    icons_dir.join(&entry.local_path)
+                }
+            }
+            _ => PathBuf::from(&entry.local_path),
         };
 
         // 如果本地已存在则跳过
@@ -512,14 +593,30 @@ pub fn download_missing_media(
             .map_err(|e| format!("下载 {} 失败: {}", remote_path, e))?;
 
         if resp.status().is_success() {
-            let bytes = resp.bytes().map_err(|e| e.to_string())?;
             // 确保父目录存在
             if let Some(parent) = local_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            if std::fs::write(&local_path, &bytes).is_ok() {
-                downloaded += 1;
-                info!("媒体下载: {} -> {}", remote_path, local_path.display());
+            let tmp_path = local_path.with_extension(format!(
+                "{}.download",
+                local_path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("tmp")
+            ));
+            let mut body = resp;
+            match std::fs::File::create(&tmp_path)
+                .and_then(|mut file| std::io::copy(&mut body, &mut file).map(|_| ()))
+                .and_then(|_| std::fs::rename(&tmp_path, &local_path))
+            {
+                Ok(()) => {
+                    downloaded += 1;
+                    info!("媒体下载: {} -> {}", remote_path, local_path.display());
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    debug!("媒体下载写入失败 {}: {}", local_path.display(), e);
+                }
             }
         }
     }
@@ -778,8 +875,11 @@ pub fn cleanup_orphaned_remote_media(
         merged_map.iter().map(|e| e.hash.as_str()).collect();
 
     // 从远端文件名提取 hash（文件名格式: {hash}.{ext}）
+    fn remote_hash(filename: &str) -> Option<&str> {
+        filename.rsplit_once('.').map(|(hash, _)| hash)
+    }
     let orphan_files: Vec<&String> = remote_files.iter().filter(|f| {
-        if let Some(hash) = f.rsplit('.').last() {
+        if let Some(hash) = remote_hash(f) {
             !referenced_hashes.contains(hash)
         } else {
             false
@@ -814,7 +914,7 @@ pub fn cleanup_orphaned_remote_media(
 
     // 同步更新 media_map.json（移除已删除条目的引用）
     let orphan_hashes: std::collections::HashSet<&str> = orphan_files.iter().filter_map(|f| {
-        f.rsplit('.').last()
+        remote_hash(f)
     }).collect();
     if !orphan_hashes.is_empty() {
         if let Ok(mut map) = download_media_map(config) {
@@ -894,8 +994,9 @@ fn load_config_and_options(db: &crate::database::Database) -> Option<(WebDavConf
 
     let proxy_mode = repo.get("webdav_proxy_mode").ok().flatten().unwrap_or_else(|| "system".to_string());
     let proxy_url = repo.get("webdav_proxy_url").ok().flatten().unwrap_or_default();
+    let accept_invalid_certs = get_bool("webdav_accept_invalid_certs", false);
 
-    Some((WebDavConfig { url, username, password, remote_dir, proxy_mode, proxy_url }, options))
+    Some((WebDavConfig { url, username, password, remote_dir, proxy_mode, proxy_url, accept_invalid_certs }, options))
 }
 
 /// 用于追踪媒体同步是否正在进行
@@ -987,6 +1088,7 @@ pub fn start_auto_sync_task(db: crate::database::Database, data_dir: std::path::
                             let local_images: Vec<MediaEntry> = local_map.iter().filter(|e| e.media_type == "image").cloned().collect();
                             let local_files: Vec<MediaEntry> = local_map.iter().filter(|e| e.media_type == "file").cloned().collect();
                             let local_videos: Vec<MediaEntry> = local_map.iter().filter(|e| e.media_type == "video").cloned().collect();
+                            let local_icons: Vec<MediaEntry> = local_map.iter().filter(|e| e.media_type == "icon").cloned().collect();
 
                             // 仅下载本地数据库已有条目引用的媒体（避免下载未导入元数据的其他设备文件成为孤立文件）
                             let mut local_referenced_paths = std::collections::HashSet::new();
@@ -995,6 +1097,9 @@ pub fn start_auto_sync_task(db: crate::database::Database, data_dir: std::path::
                                     if let Some(ref p) = item.image_path {
                                         local_referenced_paths.insert(p.clone());
                                     }
+                                }
+                                if let Some(ref p) = item.source_app_icon {
+                                    local_referenced_paths.insert(p.clone());
                                 }
                                 if item.content_type == "files" || item.content_type == "video" {
                                     if let Some(ref paths_json) = item.file_paths {
@@ -1010,6 +1115,9 @@ pub fn start_auto_sync_task(db: crate::database::Database, data_dir: std::path::
                                 .get_invalid_file_paths_set();
                             let dl_images: Vec<MediaEntry> = merged_map.iter()
                                 .filter(|e| e.media_type == "image" && local_referenced_paths.contains(&e.local_path))
+                                .cloned().collect();
+                            let dl_icons: Vec<MediaEntry> = merged_map.iter()
+                                .filter(|e| e.media_type == "icon" && local_referenced_paths.contains(&e.local_path))
                                 .cloned().collect();
                             let dl_files: Vec<MediaEntry> = merged_map.iter()
                                 .filter(|e| e.media_type == "file"
@@ -1109,6 +1217,34 @@ pub fn start_auto_sync_task(db: crate::database::Database, data_dir: std::path::
                                     .ok();
                             }
 
+                            // 图标同步线程（始终同步，体积极小）
+                            if !local_icons.is_empty() || !dl_icons.is_empty() {
+                                pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let cfg = config.clone();
+                                let dir = data_dir.clone();
+                                let cnt = pending.clone();
+                                std::thread::Builder::new()
+                                    .name("webdav-sync-icons".into())
+                                    .spawn(move || {
+                                        if !local_icons.is_empty() {
+                                            match upload_media_files(&cfg, &local_icons, &dir) {
+                                                Ok((u, s, _)) => info!("图标上传: {} 新, {} 跳过", u, s),
+                                                Err(e) => info!("图标上传失败: {}", e),
+                                            }
+                                        }
+                                        if !dl_icons.is_empty() {
+                                            match download_missing_media(&cfg, &dl_icons, &dir) {
+                                                Ok(n) => { if n > 0 { info!("图标下载: {} 个", n); } }
+                                                Err(e) => info!("图标下载失败: {}", e),
+                                            }
+                                        }
+                                        if cnt.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+                                            MEDIA_SYNC_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                    })
+                                    .ok();
+                            }
+
                             // 如果没有启动任何线程，立即清除标志
                             if pending.load(std::sync::atomic::Ordering::Relaxed) == 0 {
                                 MEDIA_SYNC_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1145,9 +1281,28 @@ pub fn download_sync(config: &WebDavConfig, filename: &str) -> Result<Option<Vec
     let status = resp.status().as_u16();
     match status {
         200..=299 => {
-            let bytes = resp.bytes().map_err(|e| format!("读取响应失败: {}", e))?;
-            info!("WebDAV 下载成功: {} bytes", bytes.len());
-            Ok(Some(bytes.to_vec()))
+            if let Some(len) = resp.content_length() {
+                if len > MAX_SYNC_DOWNLOAD_BYTES {
+                    return Err(format!(
+                        "同步文件过大: {} bytes，超过 {} bytes 上限",
+                        len, MAX_SYNC_DOWNLOAD_BYTES
+                    ));
+                }
+            }
+
+            let mut limited = resp.take(MAX_SYNC_DOWNLOAD_BYTES + 1);
+            let mut data = Vec::new();
+            limited
+                .read_to_end(&mut data)
+                .map_err(|e| format!("读取响应失败: {}", e))?;
+            if data.len() as u64 > MAX_SYNC_DOWNLOAD_BYTES {
+                return Err(format!(
+                    "同步文件过大: 超过 {} bytes 上限",
+                    MAX_SYNC_DOWNLOAD_BYTES
+                ));
+            }
+            info!("WebDAV 下载成功: {} bytes", data.len());
+            Ok(Some(data))
         }
         404 => {
             info!("远端无同步文件");

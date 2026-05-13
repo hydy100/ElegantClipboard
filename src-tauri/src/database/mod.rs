@@ -1,7 +1,9 @@
 mod repository;
+pub mod repos;
 mod schema;
 
 pub use repository::*;
+pub use repos::*;
 pub use schema::*;
 
 use crate::clipboard::compute_semantic_hash;
@@ -50,17 +52,17 @@ impl Database {
         if read_only {
             conn.execute_batch(
                 "PRAGMA query_only = ON;
-                 PRAGMA cache_size = -32000;
+                 PRAGMA cache_size = -8000;
                  PRAGMA temp_store = MEMORY;
-                 PRAGMA mmap_size = 268435456;",
+                 PRAGMA mmap_size = 67108864;",
             )?;
         } else {
             conn.execute_batch(
                 "PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = NORMAL;
-                 PRAGMA cache_size = -64000;
+                 PRAGMA cache_size = -16000;
                  PRAGMA temp_store = MEMORY;
-                 PRAGMA mmap_size = 268435456;
+                 PRAGMA mmap_size = 67108864;
                  PRAGMA foreign_keys = ON;",
             )?;
         }

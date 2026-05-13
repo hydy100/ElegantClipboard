@@ -1,10 +1,32 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{Emitter, Manager};
 use super::AppState;
 use crate::database;
 
 /// 暂存待显示的 OCR 文本（供新窗口挂载后主动获取）
 static PENDING_OCR_TEXT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static OCR_SCREENSHOT_DESTROY_SEQ: AtomicU64 = AtomicU64::new(0);
+const OCR_SCREENSHOT_DESTROY_DELAY: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn cancel_ocr_screenshot_destroy() {
+    OCR_SCREENSHOT_DESTROY_SEQ.fetch_add(1, Ordering::AcqRel);
+}
+
+fn schedule_ocr_screenshot_destroy(app: tauri::AppHandle) {
+    let seq = OCR_SCREENSHOT_DESTROY_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(OCR_SCREENSHOT_DESTROY_DELAY).await;
+        if OCR_SCREENSHOT_DESTROY_SEQ.load(Ordering::Acquire) != seq {
+            return;
+        }
+        if let Some(window) = app.get_webview_window("ocr-screenshot")
+            && !window.is_visible().unwrap_or(false)
+        {
+            let _ = window.close();
+        }
+    });
+}
 
 /// 百度 access_token 缓存: (api_key, secret_key) -> (token, 过期时间)
 static BAIDU_TOKEN_CACHE: std::sync::Mutex<Option<(String, String, String, std::time::Instant)>> =
@@ -301,6 +323,8 @@ fn urlencoded(s: &str) -> String {
 /// 如果窗口已存在则复用（通过事件通知前端更新），否则首次创建。
 #[tauri::command]
 pub async fn open_ocr_screenshot_window(app: tauri::AppHandle, screenshot_path: String) -> Result<(), String> {
+    cancel_ocr_screenshot_destroy();
+
     // 复用已有窗口：先移到屏幕外（防止 WebView2 缓存帧闪烁旧选区），再发事件让前端加载新图片
     if let Some(w) = app.get_webview_window("ocr-screenshot") {
         let _ = w.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(-10000, -10000)));
@@ -338,6 +362,7 @@ pub async fn open_ocr_screenshot_window(app: tauri::AppHandle, screenshot_path: 
 /// 前端截图加载完成后调用，将窗口移到正确位置并显示
 #[tauri::command]
 pub async fn ocr_screenshot_ready(app: tauri::AppHandle) -> Result<(), String> {
+    cancel_ocr_screenshot_destroy();
     let window = app.get_webview_window("ocr-screenshot")
         .ok_or("截图窗口不存在")?;
 
@@ -368,6 +393,15 @@ pub async fn ocr_screenshot_ready(app: tauri::AppHandle) -> Result<(), String> {
     let _ = window.set_focus();
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn hide_ocr_screenshot_window(app: tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("ocr-screenshot") {
+        let _ = window.hide();
+        let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(-10000, -10000)));
+        schedule_ocr_screenshot_destroy(app);
+    }
 }
 
 /// 打开 OCR识别结果窗口
