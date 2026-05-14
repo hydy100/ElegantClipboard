@@ -201,6 +201,16 @@ fn is_video_path(path: &str) -> bool {
     VIDEO_EXTENSIONS.contains(&ext.as_str())
 }
 
+/// 流式计算文件 blake3 hash，不将整个文件读入内存。
+/// 返回 (hex_hash, file_size)，失败返回 None。
+fn stream_file_hash(path: &str) -> Option<(String, u64)> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let file_size = file.metadata().ok()?.len();
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some((hasher.finalize().to_hex().to_string(), file_size))
+}
+
 /// 获取数据目录大小明细（数据库+图片+文件+视频）
 /// 文件/视频按实际磁盘路径去重，失效条目不计入大小但标注数量
 #[tauri::command]
@@ -227,10 +237,9 @@ pub async fn get_data_size(
         let mut count = 0u64;
         let mut seen_hashes = std::collections::HashSet::<String>::new();
         for path in &referenced {
-            if let Ok(data) = std::fs::read(path) {
-                let hash = blake3::hash(&data).to_hex().to_string();
+            if let Some((hash, file_size)) = stream_file_hash(path) {
                 if seen_hashes.insert(hash) {
-                    size += data.len() as u64;
+                    size += file_size;
                     count += 1;
                 }
             }
@@ -264,10 +273,8 @@ pub async fn get_data_size(
 
             // 有效条目：按内容 hash 去重后累计实际磁盘大小和数量
             for p in &paths {
-                if let Ok(data) = std::fs::read(p) {
-                    let hash = blake3::hash(&data).to_hex().to_string();
+                if let Some((hash, file_size)) = stream_file_hash(p) {
                     if seen_hashes.insert(hash) {
-                        let file_size = data.len() as u64;
                         if is_video {
                             v_size += file_size;
                             v_count += 1;
