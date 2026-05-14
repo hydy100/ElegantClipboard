@@ -389,13 +389,21 @@ pub async fn export_data(
             if !p.is_file() {
                 continue;
             }
-            let data = match fs::read(p) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            let hash = blake3::hash(&data).to_hex().to_string();
 
-            // 相同内容已写入过 ZIP，直接复用其路径
+            // 先流式计算 hash（不读入内存），用于去重判断
+            let hash = {
+                let mut file = match std::fs::File::open(p) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                let mut hasher = blake3::Hasher::new();
+                if std::io::copy(&mut file, &mut hasher).is_err() {
+                    continue;
+                }
+                hasher.finalize().to_hex().to_string()
+            };
+
+            // 相同内容已写入过 ZIP，直接复用其路径（无需读取文件内容）
             if let Some(existing_zip_rel) = hash_to_zip_rel.get(&hash) {
                 files_manifest.insert(abs_path.clone(), existing_zip_rel.clone());
                 files_deduped += 1;
@@ -412,7 +420,10 @@ pub async fn export_data(
                 counter += 1;
             }
             zip.start_file(&zip_rel, options).map_err(|e| e.to_string())?;
-            zip.write_all(&data).map_err(|e| e.to_string())?;
+            // 流式写入 ZIP，避免将大文件完整读入内存
+            let mut file = std::fs::File::open(p)
+                .map_err(|e| format!("打开文件失败 {}: {}", abs_path, e))?;
+            std::io::copy(&mut file, &mut zip).map_err(|e| e.to_string())?;
             files_manifest.insert(abs_path.clone(), zip_rel.clone());
             hash_to_zip_rel.insert(hash, zip_rel);
             files_exported += 1;
