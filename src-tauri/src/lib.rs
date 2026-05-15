@@ -1074,6 +1074,7 @@ pub fn run() {
             commands::ocr::ocr_capture_screen,
             commands::ocr::ocr_crop_region,
             commands::ocr::ocr_recognize_baidu,
+            commands::ocr::ocr_recognize_custom,
             commands::ocr::open_ocr_screenshot_window,
             commands::ocr::ocr_screenshot_ready,
             commands::ocr::hide_ocr_screenshot_window,
