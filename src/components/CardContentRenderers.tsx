@@ -1,6 +1,6 @@
 // 剪贴板卡片内容渲染器：图片预览、文件内容、卡片底栏
 
-import { memo, useEffect, useState, useMemo } from "react";
+import { memo, useCallback, useEffect, useState, useMemo } from "react";
 import {
   Document16Regular,
   Warning16Regular,
@@ -9,6 +9,7 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { FileIconLayout } from "@/components/FileIconLayout";
 import { HighlightText } from "@/components/HighlightText";
 import { useImagePreview } from "@/hooks/useImagePreview";
+import { shouldSkipFileImagePreview } from "@/lib/file-preview-limits";
 import { getFileNameFromPath, isImageFile } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { useUISettings } from "@/stores/ui-settings";
@@ -95,7 +96,6 @@ export const ImagePreview = memo(function ImagePreview({
     containerRef,
     handleMouseEnter,
     hidePreview,
-    handleWheel,
     handleImgLoad,
     containerStyle,
     imgClass,
@@ -109,7 +109,6 @@ export const ImagePreview = memo(function ImagePreview({
       style={containerStyle}
       onMouseEnter={handleMouseEnter}
       onMouseLeave={hidePreview}
-      onWheel={handleWheel}
     >
       <img
         src={src}
@@ -192,6 +191,7 @@ const FileImagePreview = memo(function FileImagePreview({
   isDragOverlay,
   sourceAppName,
   sourceAppIcon,
+  skipPreview = false,
 }: {
   filePath: string;
   metaItems: string[];
@@ -200,17 +200,42 @@ const FileImagePreview = memo(function FileImagePreview({
   isDragOverlay?: boolean;
   sourceAppName?: string | null;
   sourceAppIcon?: string | null;
+  skipPreview?: boolean;
 }) {
-  const [imgError, setImgError] = useState(false);
+  const [imgError, setImgError] = useState(() => {
+    try {
+      return sessionStorage.getItem(`preview_fail:${filePath}`) === "1";
+    } catch {
+      return false;
+    }
+  });
   const showImageFileName = useUISettings((s) => s.showImageFileName);
   const fileName = useMemo(() => getFileNameFromPath(filePath), [filePath]);
 
   // 虚拟列表复用组件时，filePath 变化需重置错误状态
-  useEffect(() => setImgError(false), [filePath]);
+  useEffect(() => {
+    try {
+      setImgError(sessionStorage.getItem(`preview_fail:${filePath}`) === "1");
+    } catch {
+      setImgError(false);
+    }
+  }, [filePath]);
 
-  const imgSrc = useMemo(() => convertFileSrc(filePath), [filePath]);
+  const handleError = useCallback(() => {
+    try {
+      sessionStorage.setItem(`preview_fail:${filePath}`, "1");
+    } catch {
+      // Keep the in-memory fallback when sessionStorage is unavailable.
+    }
+    setImgError(true);
+  }, [filePath]);
 
-  if (imgError) {
+  const imgSrc = useMemo(
+    () => (skipPreview || imgError ? "" : convertFileSrc(filePath)),
+    [filePath, imgError, skipPreview],
+  );
+
+  if (imgError || skipPreview) {
     return (
       <div className="flex-1 min-w-0 px-3 py-2.5">
         <div className="flex items-start gap-2.5">
@@ -243,7 +268,7 @@ const FileImagePreview = memo(function FileImagePreview({
       <ImagePreview
         src={imgSrc}
         alt={fileName}
-        onError={() => setImgError(true)}
+        onError={handleError}
         imagePath={filePath}
         overlay={
           showImageFileName ? (
@@ -277,6 +302,8 @@ interface FileContentProps {
   isDragOverlay?: boolean;
   sourceAppName?: string | null;
   sourceAppIcon?: string | null;
+  byteSize?: number;
+  tooLarge?: boolean;
 }
 
 export const FileContent = memo(function FileContent({
@@ -289,12 +316,19 @@ export const FileContent = memo(function FileContent({
   isDragOverlay,
   sourceAppName,
   sourceAppIcon,
+  byteSize,
+  tooLarge: backendTooLarge = false,
 }: FileContentProps) {
   const isMultiple = filePaths.length > 1;
+  const tooLarge =
+    !isMultiple &&
+    filePaths.length === 1 &&
+    shouldSkipFileImagePreview(filePaths[0], byteSize, backendTooLarge);
   const isSingleImage =
     !isMultiple &&
     filePaths.length === 1 &&
     !filesInvalid &&
+    !tooLarge &&
     isImageFile(filePaths[0]);
 
   if (isSingleImage) {
@@ -307,6 +341,7 @@ export const FileContent = memo(function FileContent({
         isDragOverlay={isDragOverlay}
         sourceAppName={sourceAppName}
         sourceAppIcon={sourceAppIcon}
+        skipPreview={tooLarge}
       />
     );
   }
@@ -325,6 +360,7 @@ export const FileContent = memo(function FileContent({
       colorScheme="blue"
       singleIcon={Document16Regular}
       multiLabel="个文件"
+      previewSkipped={tooLarge}
     />
   );
 });

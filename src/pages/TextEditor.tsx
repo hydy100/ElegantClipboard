@@ -26,8 +26,9 @@ export function TextEditor() {
       const win = getCurrentWindow();
       document.body.getBoundingClientRect();
       await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      win.show();
-      win.setFocus();
+      await win.show();
+      await win.setFocus();
+      await invoke("managed_window_ready");
       await new Promise((r) => requestAnimationFrame(r));
       setThemeReady(true);
     });

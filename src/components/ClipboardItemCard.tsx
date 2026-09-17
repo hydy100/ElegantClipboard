@@ -38,6 +38,10 @@ import { useSortable, CSS } from "@/hooks/useSortableList";
 import { useTextPreview } from "@/hooks/useTextPreview";
 import { cachedCheckFilesExist } from "@/lib/file-check-cache";
 import {
+  isKnownTooLargeForPreview,
+  shouldSkipFileImagePreview,
+} from "@/lib/file-preview-limits";
+import {
   contentTypeConfig,
   formatTime,
   formatCharCount,
@@ -180,10 +184,51 @@ export const ClipboardItemCard = memo(function ClipboardItemCard({
     () => (item.content_type === "files" || item.content_type === "video") ? parseFilePaths(item.file_paths) : [],
     [item.content_type, item.file_paths],
   );
+  const [backendTooLarge, setBackendTooLarge] = useState<boolean | undefined>(
+    undefined,
+  );
+
+  useEffect(() => {
+    if (item.content_type !== "files" || filePaths.length !== 1) {
+      setBackendTooLarge(undefined);
+      return;
+    }
+
+    // 已知超限时不再发起文件状态 IPC；这条路径只渲染文件卡片。
+    if (isKnownTooLargeForPreview(filePaths[0], item.byte_size)) {
+      setBackendTooLarge(true);
+      return;
+    }
+
+    let cancelled = false;
+    invoke<{ too_large?: boolean }>("get_item_file_status", { id: item.id })
+      .then((status) => {
+        if (!cancelled) setBackendTooLarge(status.too_large === true);
+      })
+      .catch((error) => {
+        logError("Failed to check file preview status:", error);
+        if (!cancelled) setBackendTooLarge(undefined);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [item.content_type, item.id, item.byte_size, filePaths]);
+
+  const previewTooLarge = useMemo(
+    () =>
+      item.content_type === "files" &&
+      filePaths.length === 1 &&
+      shouldSkipFileImagePreview(
+        filePaths[0],
+        item.byte_size,
+        backendTooLarge === true,
+      ),
+    [item.content_type, item.byte_size, filePaths, backendTooLarge],
+  );
   const filesInvalid =
     (item.content_type === "files" || item.content_type === "video") && item.files_valid === false;
   const isTextLikeContent =
-    item.content_type === "text" || item.content_type === "html" || item.content_type === "rtf";
+    item.content_type === "text" || item.content_type === "html" || item.content_type === "rtf" || item.content_type === "url";
 
   const {
     attributes,
@@ -236,7 +281,6 @@ export const ClipboardItemCard = memo(function ClipboardItemCard({
     textPreviewAnchorRef,
     handleTextMouseEnter,
     handleTextMouseLeave,
-    handleTextWheel,
     hideTextPreview,
   } = useTextPreview({
     itemId: item.id,
@@ -440,6 +484,8 @@ export const ClipboardItemCard = memo(function ClipboardItemCard({
               isDragOverlay={isDragOverlay}
               sourceAppName={showSourceApp && sourceAppDisplay !== "icon" ? item.source_app_name : undefined}
               sourceAppIcon={showSourceApp && sourceAppDisplay !== "name" ? item.source_app_icon : undefined}
+              byteSize={item.byte_size}
+              tooLarge={previewTooLarge}
             />
           ) : (
             <div
@@ -447,7 +493,6 @@ export const ClipboardItemCard = memo(function ClipboardItemCard({
               className="flex-1 min-w-0 px-3 py-2.5"
               onMouseEnter={handleTextMouseEnter}
               onMouseLeave={handleTextMouseLeave}
-              onWheel={handleTextWheel}
             >
               <pre
                 className="clipboard-content leading-relaxed text-foreground/90 whitespace-pre-wrap break-all m-0"
@@ -563,7 +608,7 @@ export const ClipboardItemCard = memo(function ClipboardItemCard({
   const contextMenuItems = useMemo<ContextMenuItemConfig[] | null>(() => {
     if (isDragOverlay || batchMode) return null;
     // 文本类内容可编辑
-    if (item.content_type === "text" || item.content_type === "html" || item.content_type === "rtf") {
+    if (item.content_type === "text" || item.content_type === "html" || item.content_type === "rtf" || item.content_type === "url") {
       const items: ContextMenuItemConfig[] = [
         { icon: ClipboardPaste16Regular, label: "粘贴", onClick: () => pasteContent(item.id) },
         { icon: TextDescription16Regular, label: "粘贴为纯文本", onClick: () => pasteAsPlainText(item.id) },

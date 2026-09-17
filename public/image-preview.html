@@ -131,6 +131,7 @@
       const { listen } = window.__TAURI__.event;
       const { convertFileSrc } = window.__TAURI__.core;
 
+      const listenersReady = Promise.all([
       listen('video-preview-update', (event) => {
         const { videoPath, width, height, offsetY, align, duration } = event.payload;
         // 隐藏图片，显示视频
@@ -155,7 +156,7 @@
         if (videoTimer) clearTimeout(videoTimer);
         const dur = (duration || 5) * 1000;
         videoTimer = setTimeout(() => { video.pause(); }, dur);
-      });
+      }),
 
       listen('video-preview-clear', () => {
         if (videoTimer) { clearTimeout(videoTimer); videoTimer = null; }
@@ -175,7 +176,7 @@
         targetRect.height = 0;
         targetRect.top = 0;
         applyRect(currentRect);
-      });
+      }),
 
       listen('image-preview-update', (event) => {
         const { imagePath, width, height, offsetY, align } = event.payload;
@@ -197,7 +198,7 @@
         targetRect.top = currentRect.top;
         applyRect(currentRect);
         img.src = convertFileSrc(imagePath);
-      });
+      }),
 
       listen('image-preview-zoom', (event) => {
         const { width, height, offsetY, percent, active, align } = event.payload;
@@ -207,7 +208,7 @@
         targetRect.top = offsetY || 0;
         startRectAnimation();
         if (active) showBadge(percent + '%');
-      });
+      }),
 
       listen('image-preview-clear', () => {
         if (videoTimer) { clearTimeout(videoTimer); videoTimer = null; }
@@ -226,10 +227,14 @@
         targetRect.height = 0;
         targetRect.top = 0;
         applyRect(currentRect);
-      });
+      }),
+      ]);
 
       img.addEventListener('load', () => img.classList.add('loaded'));
       img.addEventListener('error', () => img.classList.remove('loaded'));
+      void listenersReady
+        .then(() => window.__TAURI__.core.invoke('managed_window_ready'))
+        .catch((error) => console.error('Failed to confirm image preview readiness:', error));
     }
   </script>
 </body>

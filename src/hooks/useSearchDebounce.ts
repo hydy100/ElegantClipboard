@@ -28,9 +28,10 @@ export function useSearchDebounce({ fetchItems, setSearchQuery }: UseSearchDebou
   }, [debouncedSearch, setSearchQuery]);
 
   const clearSearch = useCallback(() => {
+    debouncedSearch.cancel();
     setSearchQuery("");
     fetchItems({ search: "" });
-  }, [fetchItems, setSearchQuery]);
+  }, [debouncedSearch, fetchItems, setSearchQuery]);
 
   return { handleSearchChange, clearSearch };
 }

@@ -18,6 +18,7 @@ import {
   TEXT_PREVIEW_MIN_CHARS_PER_LINE,
 } from "@/components/text-preview";
 import { getPreviewBounds } from "@/hooks/useImagePreview";
+import { useNonPassiveWheel } from "@/hooks/useNonPassiveWheel";
 import { logError } from "@/lib/logger";
 import { useClipboardStore } from "@/stores/clipboard";
 import { useUISettings } from "@/stores/ui-settings";
@@ -252,7 +253,7 @@ export function useTextPreview({
     hideTextPreview();
   }, [hideTextPreview]);
 
-  const handleTextWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
+  const handleTextWheel = useCallback((e: WheelEvent) => {
     if (!e.ctrlKey || !textPreviewVisibleRef.current) return;
     e.preventDefault();
     e.stopPropagation();
@@ -271,6 +272,12 @@ export function useTextPreview({
       });
     }
   }, []);
+
+  const textPreviewWheelRef = useNonPassiveWheel(handleTextWheel);
+  const setTextPreviewAnchorRef = useCallback((node: HTMLDivElement | null) => {
+    textPreviewAnchorRef.current = node;
+    textPreviewWheelRef(node);
+  }, [textPreviewWheelRef]);
 
   useEffect(() => {
     if (!textPreviewEnabled || !isTextLikeContent) {
@@ -298,7 +305,7 @@ export function useTextPreview({
   }, [hideTextPreview]);
 
   return {
-    textPreviewAnchorRef,
+    textPreviewAnchorRef: setTextPreviewAnchorRef,
     handleTextMouseEnter,
     handleTextMouseLeave,
     handleTextWheel,

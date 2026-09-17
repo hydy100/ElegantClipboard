@@ -238,26 +238,32 @@ pub(crate) fn toggle_window_visibility(app: &tauri::AppHandle, reposition: bool)
 }
 
 #[tauri::command]
-pub async fn show_window(window: tauri::WebviewWindow) {
-    let _ = window.show();
-    crate::keyboard_hook::set_window_state(crate::keyboard_hook::WindowState::Visible);
-    let _ = window.emit("window-shown", ());
+pub async fn show_window(window: tauri::WebviewWindow) -> Result<(), String> {
+    super::run_blocking("show_window", move || {
+        let _ = window.show();
+        crate::keyboard_hook::set_window_state(crate::keyboard_hook::WindowState::Visible);
+        let _ = window.emit("window-shown", ());
+            Ok(())
+    }).await
 }
 
 #[tauri::command]
-pub async fn hide_window(window: tauri::WebviewWindow) {
-    save_window_size_if_enabled(window.app_handle(), &window);
-    let _ = window.set_focusable(false);
-    let _ = window.hide();
-    crate::keyboard_hook::set_window_state(crate::keyboard_hook::WindowState::Hidden);
-    crate::input_monitor::disable_mouse_monitoring();
-    crate::commands::hide_preview_windows(window.app_handle());
-    let _ = window.emit("window-hidden", ());
-    // 延迟释放工作集内存，等待 WebView2 内部清理完成
-    tauri::async_runtime::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        trim_working_set();
-    });
+pub async fn hide_window(window: tauri::WebviewWindow) -> Result<(), String> {
+    super::run_blocking("hide_window", move || {
+        save_window_size_if_enabled(window.app_handle(), &window);
+        let _ = window.set_focusable(false);
+        let _ = window.hide();
+        crate::keyboard_hook::set_window_state(crate::keyboard_hook::WindowState::Hidden);
+        crate::input_monitor::disable_mouse_monitoring();
+        crate::commands::hide_preview_windows(window.app_handle());
+        let _ = window.emit("window-hidden", ());
+        // 延迟释放工作集内存，等待 WebView2 内部清理完成
+        tauri::async_runtime::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            trim_working_set();
+        });
+            Ok(())
+    }).await
 }
 
 #[tauri::command]
@@ -275,56 +281,68 @@ pub fn set_window_visibility(visible: bool) {
 }
 
 #[tauri::command]
-pub async fn minimize_window(window: tauri::WebviewWindow) {
-    let _ = window.minimize();
+pub async fn minimize_window(window: tauri::WebviewWindow) -> Result<(), String> {
+    super::run_blocking("minimize_window", move || {
+        let _ = window.minimize();
+            Ok(())
+    }).await
 }
 
 #[tauri::command]
-pub async fn toggle_maximize(window: tauri::WebviewWindow) {
-    if window.is_maximized().unwrap_or(false) {
-        let _ = window.unmaximize();
-    } else {
-        let _ = window.maximize();
-    }
+pub async fn toggle_maximize(window: tauri::WebviewWindow) -> Result<(), String> {
+    super::run_blocking("toggle_maximize", move || {
+        if window.is_maximized().unwrap_or(false) {
+            let _ = window.unmaximize();
+        } else {
+            let _ = window.maximize();
+        }
+            Ok(())
+    }).await
 }
 
 #[tauri::command]
-pub async fn close_window(window: tauri::WebviewWindow) {
-    save_window_size_if_enabled(window.app_handle(), &window);
-    let _ = window.set_focusable(false);
-    let _ = window.hide();
-    crate::keyboard_hook::set_window_state(crate::keyboard_hook::WindowState::Hidden);
-    crate::input_monitor::disable_mouse_monitoring();
-    crate::commands::hide_preview_windows(window.app_handle());
-    let _ = window.emit("window-hidden", ());
-    // 延迟释放工作集内存
-    tauri::async_runtime::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        trim_working_set();
-    });
-}
-
-#[tauri::command]
-pub async fn set_window_pinned(window: tauri::WebviewWindow, pinned: bool) {
-    crate::input_monitor::set_window_pinned(pinned);
-    // 持久化到设置表，重启和云端同步时可恢复
-    if let Some(state) = window.app_handle().try_state::<std::sync::Arc<AppState>>() {
-        let settings_repo = database::SettingsRepository::new(&state.db);
-        let _ = settings_repo.set("window_pinned", if pinned { "true" } else { "false" });
-    }
-    if pinned {
+pub async fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
+    super::run_blocking("close_window", move || {
+        save_window_size_if_enabled(window.app_handle(), &window);
         let _ = window.set_focusable(false);
-        #[cfg(windows)]
-        {
-            let prev = crate::input_monitor::get_prev_foreground_hwnd();
-            if prev != 0 {
-                unsafe {
-                    let hwnd = windows::Win32::Foundation::HWND(prev as *mut _);
-                    let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+        let _ = window.hide();
+        crate::keyboard_hook::set_window_state(crate::keyboard_hook::WindowState::Hidden);
+        crate::input_monitor::disable_mouse_monitoring();
+        crate::commands::hide_preview_windows(window.app_handle());
+        let _ = window.emit("window-hidden", ());
+        // 延迟释放工作集内存
+        tauri::async_runtime::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            trim_working_set();
+        });
+            Ok(())
+    }).await
+}
+
+#[tauri::command]
+pub async fn set_window_pinned(window: tauri::WebviewWindow, pinned: bool) -> Result<(), String> {
+    super::run_blocking("set_window_pinned", move || {
+        crate::input_monitor::set_window_pinned(pinned);
+        // 持久化到设置表，重启和云端同步时可恢复
+        if let Some(state) = window.app_handle().try_state::<std::sync::Arc<AppState>>() {
+            let settings_repo = database::SettingsRepository::new(&state.db);
+            let _ = settings_repo.set("window_pinned", if pinned { "true" } else { "false" });
+        }
+        if pinned {
+            let _ = window.set_focusable(false);
+            #[cfg(windows)]
+            {
+                let prev = crate::input_monitor::get_prev_foreground_hwnd();
+                if prev != 0 {
+                    unsafe {
+                        let hwnd = windows::Win32::Foundation::HWND(prev as *mut _);
+                        let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+                    }
                 }
             }
         }
-    }
+            Ok(())
+    }).await
 }
 
 #[tauri::command]
@@ -434,13 +452,19 @@ pub fn set_window_effect(
 }
 
 #[tauri::command]
-pub async fn focus_clipboard_window(window: tauri::WebviewWindow) {
-    crate::input_monitor::focus_clipboard_window(&window);
+pub async fn focus_clipboard_window(window: tauri::WebviewWindow) -> Result<(), String> {
+    super::run_blocking("focus_clipboard_window", move || {
+        crate::input_monitor::focus_clipboard_window(&window);
+            Ok(())
+    }).await
 }
 
 #[tauri::command]
-pub async fn restore_last_focus(window: tauri::WebviewWindow) {
-    crate::input_monitor::restore_last_focus(&window);
+pub async fn restore_last_focus(window: tauri::WebviewWindow) -> Result<(), String> {
+    super::run_blocking("restore_last_focus", move || {
+        crate::input_monitor::restore_last_focus(&window);
+            Ok(())
+    }).await
 }
 
 #[tauri::command]
@@ -449,21 +473,24 @@ pub fn save_current_focus() {
 }
 
 #[tauri::command]
-pub async fn set_keyboard_nav_enabled(window: tauri::WebviewWindow, enabled: bool) {
-    crate::input_monitor::set_keyboard_nav_enabled(enabled);
-    // 不再因键盘导航切换而抢焦点，导航键通过低级钩子转发
-    // 仅主窗口在关闭键盘导航时尝试还原焦点，避免设置窗口被意外切走
-    let is_main_window = window.label() == "main";
-    if is_main_window
-        && !enabled
-        && window.is_visible().unwrap_or(false)
-        && !crate::input_monitor::is_window_pinned()
-    {
-        // 关闭时若窗口仍聚焦则恢复
-        if window.is_focused().unwrap_or(false) {
-            crate::input_monitor::restore_last_focus(&window);
+pub async fn set_keyboard_nav_enabled(window: tauri::WebviewWindow, enabled: bool) -> Result<(), String> {
+    super::run_blocking("set_keyboard_nav_enabled", move || {
+        crate::input_monitor::set_keyboard_nav_enabled(enabled);
+        // 不再因键盘导航切换而抢焦点，导航键通过低级钩子转发
+        // 仅主窗口在关闭键盘导航时尝试还原焦点，避免设置窗口被意外切走
+        let is_main_window = window.label() == "main";
+        if is_main_window
+            && !enabled
+            && window.is_visible().unwrap_or(false)
+            && !crate::input_monitor::is_window_pinned()
+        {
+            // 关闭时若窗口仍聚焦则恢复
+            if window.is_focused().unwrap_or(false) {
+                crate::input_monitor::restore_last_focus(&window);
+            }
         }
-    }
+            Ok(())
+    }).await
 }
 
 #[tauri::command]

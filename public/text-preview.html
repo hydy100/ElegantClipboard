@@ -108,7 +108,8 @@
     if (window.__TAURI__) {
       const { listen } = window.__TAURI__.event;
 
-      listen('text-preview-update', (event) => {
+      const listenersReady = Promise.all([
+        listen('text-preview-update', (event) => {
         const { text, align, theme, sharpCorners, fontFamily, fontSize } = event.payload || {};
         setTheme(theme);
         setSharpCorners(Boolean(sharpCorners));
@@ -125,22 +126,26 @@
         }
         content.textContent = typeof text === 'string' ? text : '';
         panel.classList.add('visible');
-      });
+        }),
 
-      listen('text-preview-clear', () => {
-        clearPreview();
-      });
+        listen('text-preview-clear', () => {
+          clearPreview();
+        }),
 
-      listen('text-preview-scroll', (event) => {
-        const deltaY = Number(event?.payload?.deltaY ?? 0);
-        if (!Number.isFinite(deltaY) || deltaY === 0) return;
-        content.scrollTop += deltaY;
-      });
+        listen('text-preview-scroll', (event) => {
+          const deltaY = Number(event?.payload?.deltaY ?? 0);
+          if (!Number.isFinite(deltaY) || deltaY === 0) return;
+          content.scrollTop += deltaY;
+        }),
 
-      listen('text-preview-theme', (event) => {
-        const next = event?.payload?.theme ?? event?.payload;
-        setTheme(next);
-      });
+        listen('text-preview-theme', (event) => {
+          const next = event?.payload?.theme ?? event?.payload;
+          setTheme(next);
+        }),
+      ]);
+      void listenersReady
+        .then(() => window.__TAURI__.core.invoke('managed_window_ready'))
+        .catch((error) => console.error('Failed to confirm text preview readiness:', error));
     }
   </script>
 </body>

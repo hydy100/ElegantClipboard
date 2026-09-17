@@ -31,6 +31,7 @@ interface FileIconLayoutProps {
   colorScheme: ColorScheme;
   singleIcon: FluentIcon;
   multiLabel: string;
+  previewSkipped?: boolean;
 }
 
 export const FileIconLayout = memo(function FileIconLayout({
@@ -46,6 +47,7 @@ export const FileIconLayout = memo(function FileIconLayout({
   colorScheme,
   singleIcon: SingleIcon,
   multiLabel,
+  previewSkipped = false,
 }: FileIconLayoutProps) {
   const isMultiple = filePaths.length > 1;
   const colors = colorMap[colorScheme];
@@ -80,6 +82,9 @@ export const FileIconLayout = memo(function FileIconLayout({
                 {filesInvalid && (
                   <span className="ml-1.5 text-xs font-normal">(已失效)</span>
                 )}
+                {previewSkipped && !filesInvalid && (
+                  <span className="ml-1.5 text-xs font-normal text-muted-foreground/70">(已跳过预览)</span>
+                )}
               </p>
               <p
                 className={cn(
@@ -110,6 +115,9 @@ export const FileIconLayout = memo(function FileIconLayout({
                 />
                 {filesInvalid && (
                   <span className="ml-1.5 text-xs font-normal">(已失效)</span>
+                )}
+                {previewSkipped && !filesInvalid && (
+                  <span className="ml-1.5 text-xs font-normal text-muted-foreground/70">(已跳过预览)</span>
                 )}
               </p>
               <p

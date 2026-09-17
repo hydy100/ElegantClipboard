@@ -136,9 +136,21 @@ export function useInputFocus<T extends HTMLElement>() {
 }
 
 /** 取消待执行的焦点恢复（粘贴操作前调用，避免恢复焦点与粘贴流程冲突） */
-export function cancelPendingFocusRestore() {
+function resetWebViewFocus() {
   clearAllTimers();
   currentFocusState = "normal";
+  const activeElement = document.activeElement;
+  if (activeElement instanceof HTMLElement) {
+    activeElement.blur();
+  }
+}
+
+export function cancelPendingFocusRestore() {
+  resetWebViewFocus();
+}
+
+export function releaseWebViewFocus() {
+  resetWebViewFocus();
 }
 
 /** 立即启用窗口焦点（跳过防抖） */

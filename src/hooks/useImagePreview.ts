@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { emitTo, listen } from "@tauri-apps/api/event";
 import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
 import { useShallow } from "zustand/react/shallow";
+import { useNonPassiveWheel } from "@/hooks/useNonPassiveWheel";
 import { logError } from "@/lib/logger";
 import { useClipboardStore } from "@/stores/clipboard";
 import { useUISettings } from "@/stores/ui-settings";
@@ -377,7 +378,7 @@ export function useImagePreview(imagePath?: string) {
 
   // Ctrl+滚轮缩放
   const handleWheel = useCallback(
-    (e: React.WheelEvent) => {
+    (e: WheelEvent) => {
       if (!e.ctrlKey || !ps.current.visible || !ps.current.bounds) return;
       e.preventDefault();
       e.stopPropagation();
@@ -450,6 +451,12 @@ export function useImagePreview(imagePath?: string) {
     [previewZoomStep, previewUnboundedMode],
   );
 
+  const imagePreviewWheelRef = useNonPassiveWheel(handleWheel);
+  const setContainerRef = useCallback((node: HTMLDivElement | null) => {
+    containerRef.current = node;
+    imagePreviewWheelRef(node);
+  }, [imagePreviewWheelRef]);
+
   const handleImgLoad = useCallback(
     (e: React.SyntheticEvent<HTMLImageElement>) => {
       const img = e.currentTarget;
@@ -485,7 +492,7 @@ export function useImagePreview(imagePath?: string) {
   }, [imageAutoHeight, imageMaxHeight]);
 
   return {
-    containerRef,
+    containerRef: setContainerRef,
     handleMouseEnter,
     hidePreview,
     handleWheel,

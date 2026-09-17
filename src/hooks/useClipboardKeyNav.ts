@@ -172,7 +172,6 @@ export function useClipboardKeyNav({ searchInputRef, virtuosoRef }: UseClipboard
     let unlisten: (() => void) | undefined;
     let disposed = false;
     listen<{ key: string; shift: boolean }>("keyboard-nav", (event) => {
-      if (document.hasFocus()) return;
       handleNavKey(event.payload.key, event.payload.shift);
     }).then((fn) => {
       if (disposed) fn(); else unlisten = fn;

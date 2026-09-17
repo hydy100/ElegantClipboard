@@ -32,19 +32,35 @@ fn cancel_preview_destroy(slot: &AtomicU64) {
     slot.fetch_add(1, Ordering::AcqRel);
 }
 
-fn schedule_preview_destroy(app: tauri::AppHandle, label: &'static str, slot: &'static AtomicU64) {
+fn schedule_preview_destroy<R: tauri::Runtime>(app: tauri::AppHandle<R>, label: &'static str, slot: &'static AtomicU64) {
     let seq = slot.fetch_add(1, Ordering::AcqRel) + 1;
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(PREVIEW_DESTROY_DELAY).await;
-        if slot.load(Ordering::Acquire) != seq {
-            return;
-        }
-        if let Some(window) = app.get_webview_window(label)
-            && !window.is_visible().unwrap_or(false)
-        {
-            let _ = window.close();
-        }
+        let _creation = super::WINDOW_CREATION.lock().await;
+        let _ = super::run_blocking("destroy_preview", move || {
+            if slot.load(Ordering::Acquire) != seq { return Ok(()); }
+            if let Some(window) = app.get_webview_window(label)
+                && !window.is_visible().unwrap_or(false) {
+                let _ = window.close();
+            }
+            Ok(())
+        }).await;
     });
+}
+
+pub(crate) fn hide_preview_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>, image: bool) {
+    let (label, event, token, destroy) = if image {
+        ("image-preview", "image-preview-clear", &IMAGE_PREVIEW_TOKEN, &IMAGE_PREVIEW_DESTROY_SEQ)
+    } else {
+        TEXT_PREVIEW_UPDATE_SEQ.fetch_add(1, Ordering::AcqRel);
+        ("text-preview", "text-preview-clear", &TEXT_PREVIEW_TOKEN, &TEXT_PREVIEW_DESTROY_SEQ)
+    };
+    token.fetch_add(1, Ordering::AcqRel);
+    if let Some(window) = app.get_webview_window(label) {
+        let _ = window.hide();
+        let _ = window.emit(event, ());
+        schedule_preview_destroy(app.clone(), label, destroy);
+    }
 }
 
 #[tauri::command]
@@ -67,82 +83,103 @@ pub async fn show_image_preview(
     align: Option<String>,
     token: Option<u64>,
 ) -> Result<(), String> {
-    let token = token.unwrap_or(0);
-    if token != 0 && !promote_preview_token(&IMAGE_PREVIEW_TOKEN, token) {
-        return Ok(());
-    }
-    cancel_preview_destroy(&IMAGE_PREVIEW_DESTROY_SEQ);
+    let _creation = super::WINDOW_CREATION.lock().await;
+    super::run_blocking("show_image_preview", move || {
+        let token = token.unwrap_or(0);
+        if token != 0 && !promote_preview_token(&IMAGE_PREVIEW_TOKEN, token) {
+            return Ok(());
+        }
+        cancel_preview_destroy(&IMAGE_PREVIEW_DESTROY_SEQ);
 
-    let mut newly_created = false;
-    let window = if let Some(w) = app.get_webview_window("image-preview") {
-        w
-    } else {
-        newly_created = true;
-        tauri::WebviewWindowBuilder::new(
-            &app,
-            "image-preview",
-            tauri::WebviewUrl::App("/image-preview.html".into()),
-        )
-        .title("")
-        .decorations(false)
-        .transparent(true)
-        .shadow(false)
-        .resizable(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .focused(false)
-        .visible(false)
-        .build()
-        .map_err(|e| format!("创建预览窗口失败: {}", e))?
-    };
+        let mut newly_created = false;
+        let window = if let Some(w) = app.get_webview_window("image-preview") {
+            w
+        } else {
+            crate::webview_runtime::ensure_runtime_current(&app)?;
+            let creation_guard =
+                crate::webview_runtime::WindowCreationGuard::start(&app, "image-preview");
+            let page_load_guard = creation_guard.clone();
+            newly_created = true;
+            let build_result = tauri::WebviewWindowBuilder::new(
+                &app,
+                "image-preview",
+                tauri::WebviewUrl::App("/image-preview.html".into()),
+            )
+            .title("")
+            .decorations(false)
+            .transparent(true)
+            .shadow(false)
+            .resizable(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .focused(false)
+            .visible(false)
+            .on_page_load(move |window, payload| {
+                page_load_guard.on_page_load(&window, &payload);
+            })
+            .build();
+            match build_result {
+                Ok(window) => window,
+                Err(error) => {
+                    creation_guard.cancel();
+                    return Err(crate::webview_runtime::window_operation_error(
+                        &app,
+                        "image-preview",
+                        "创建预览窗口失败",
+                        error,
+                    ));
+                }
+            }
+        };
 
-    if token != 0 && !is_preview_token_current(&IMAGE_PREVIEW_TOKEN, token) {
-        return Ok(());
-    }
-
-    let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
-        width: win_width as u32,
-        height: win_height as u32,
-    }));
-    let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
-        x: win_x as i32,
-        y: win_y as i32,
-    }));
-
-    if newly_created {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         if token != 0 && !is_preview_token_current(&IMAGE_PREVIEW_TOKEN, token) {
             return Ok(());
         }
-    }
 
-    let _ = window.set_always_on_top(true);
-    // 透明区域点击穿透，避免截图工具捕获
-    let _ = window.set_ignore_cursor_events(true);
+        let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
+            width: win_width as u32,
+            height: win_height as u32,
+        }));
+        let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
+            x: win_x as i32,
+            y: win_y as i32,
+        }));
 
-    let _ = window.emit(
-        "image-preview-update",
-        serde_json::json!({
-            "imagePath": image_path,
-            "width": img_width,
-            "height": img_height,
-            "offsetY": offset_y,
-            "align": align.as_deref().unwrap_or("left"),
-        }),
-    );
+        if newly_created {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if token != 0 && !is_preview_token_current(&IMAGE_PREVIEW_TOKEN, token) {
+                return Ok(());
+            }
+        }
 
-    if token != 0 && !is_preview_token_current(&IMAGE_PREVIEW_TOKEN, token) {
-        return Ok(());
-    }
+        let _ = window.set_always_on_top(true);
+        // 透明区域点击穿透，避免截图工具捕获
+        let _ = window.set_ignore_cursor_events(true);
 
-    let _ = window.show();
-    if token != 0 && !is_preview_token_current(&IMAGE_PREVIEW_TOKEN, token) {
-        let _ = window.hide();
-        return Ok(());
-    }
-    crate::positioning::force_topmost(&window);
-    tracing::debug!("image-preview shown at ({}, {}), size {}x{}, created={}", win_x, win_y, win_width, win_height, newly_created);
-    Ok(())
+        let _ = window.emit(
+            "image-preview-update",
+            serde_json::json!({
+                "imagePath": image_path,
+                "width": img_width,
+                "height": img_height,
+                "offsetY": offset_y,
+                "align": align.as_deref().unwrap_or("left"),
+            }),
+        );
+
+        if token != 0 && !is_preview_token_current(&IMAGE_PREVIEW_TOKEN, token) {
+            return Ok(());
+        }
+
+        let _ = window.show();
+        if token != 0 && !is_preview_token_current(&IMAGE_PREVIEW_TOKEN, token) {
+            let _ = window.hide();
+            return Ok(());
+        }
+        crate::positioning::force_topmost(&window);
+        tracing::debug!("image-preview shown at ({}, {}), size {}x{}, created={}", win_x, win_y, win_width, win_height, newly_created);
+        Ok(())
+    }).await
 }
 
 #[tauri::command]
@@ -161,92 +198,113 @@ pub async fn show_video_preview(
     duration: Option<f64>,
     token: Option<u64>,
 ) -> Result<(), String> {
-    let token = token.unwrap_or(0);
-    if token != 0 && !promote_preview_token(&IMAGE_PREVIEW_TOKEN, token) {
-        return Ok(());
-    }
-    cancel_preview_destroy(&IMAGE_PREVIEW_DESTROY_SEQ);
+    let _creation = super::WINDOW_CREATION.lock().await;
+    super::run_blocking("show_video_preview", move || {
+        let token = token.unwrap_or(0);
+        if token != 0 && !promote_preview_token(&IMAGE_PREVIEW_TOKEN, token) {
+            return Ok(());
+        }
+        cancel_preview_destroy(&IMAGE_PREVIEW_DESTROY_SEQ);
 
-    // 守卫：主窗必须可见，否则拒绝显示预览（防止孤儿预览窗口）
-    if !app
-        .get_webview_window("main")
-        .and_then(|w| w.is_visible().ok())
-        .unwrap_or(false)
-    {
-        crate::commands::hide_image_preview_window(&app);
-        return Ok(());
-    }
+        // 守卫：主窗必须可见，否则拒绝显示预览（防止孤儿预览窗口）
+        if !app
+            .get_webview_window("main")
+            .and_then(|w| w.is_visible().ok())
+            .unwrap_or(false)
+        {
+            crate::commands::hide_image_preview_window(&app);
+            return Ok(());
+        }
 
-    let mut newly_created = false;
-    let window = if let Some(w) = app.get_webview_window("image-preview") {
-        w
-    } else {
-        newly_created = true;
-        tauri::WebviewWindowBuilder::new(
-            &app,
-            "image-preview",
-            tauri::WebviewUrl::App("/image-preview.html".into()),
-        )
-        .title("")
-        .decorations(false)
-        .transparent(true)
-        .shadow(false)
-        .resizable(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .focused(false)
-        .visible(false)
-        .build()
-        .map_err(|e| format!("创建预览窗口失败: {}", e))?
-    };
+        let mut newly_created = false;
+        let window = if let Some(w) = app.get_webview_window("image-preview") {
+            w
+        } else {
+            crate::webview_runtime::ensure_runtime_current(&app)?;
+            let creation_guard =
+                crate::webview_runtime::WindowCreationGuard::start(&app, "image-preview");
+            let page_load_guard = creation_guard.clone();
+            newly_created = true;
+            let build_result = tauri::WebviewWindowBuilder::new(
+                &app,
+                "image-preview",
+                tauri::WebviewUrl::App("/image-preview.html".into()),
+            )
+            .title("")
+            .decorations(false)
+            .transparent(true)
+            .shadow(false)
+            .resizable(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .focused(false)
+            .visible(false)
+            .on_page_load(move |window, payload| {
+                page_load_guard.on_page_load(&window, &payload);
+            })
+            .build();
+            match build_result {
+                Ok(window) => window,
+                Err(error) => {
+                    creation_guard.cancel();
+                    return Err(crate::webview_runtime::window_operation_error(
+                        &app,
+                        "image-preview",
+                        "创建视频预览窗口失败",
+                        error,
+                    ));
+                }
+            }
+        };
 
-    if token != 0 && !is_preview_token_current(&IMAGE_PREVIEW_TOKEN, token) {
-        return Ok(());
-    }
-
-    let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
-        width: win_width as u32,
-        height: win_height as u32,
-    }));
-    let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
-        x: win_x as i32,
-        y: win_y as i32,
-    }));
-
-    if newly_created {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         if token != 0 && !is_preview_token_current(&IMAGE_PREVIEW_TOKEN, token) {
             return Ok(());
         }
-    }
 
-    let _ = window.set_always_on_top(true);
-    let _ = window.set_ignore_cursor_events(true);
+        let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
+            width: win_width as u32,
+            height: win_height as u32,
+        }));
+        let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
+            x: win_x as i32,
+            y: win_y as i32,
+        }));
 
-    let _ = window.emit(
-        "video-preview-update",
-        serde_json::json!({
-            "videoPath": video_path,
-            "width": width,
-            "height": height,
-            "offsetY": offset_y,
-            "align": align.as_deref().unwrap_or("left"),
-            "duration": duration.unwrap_or(5.0),
-        }),
-    );
+        if newly_created {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if token != 0 && !is_preview_token_current(&IMAGE_PREVIEW_TOKEN, token) {
+                return Ok(());
+            }
+        }
 
-    if token != 0 && !is_preview_token_current(&IMAGE_PREVIEW_TOKEN, token) {
-        return Ok(());
-    }
+        let _ = window.set_always_on_top(true);
+        let _ = window.set_ignore_cursor_events(true);
 
-    let _ = window.show();
-    if token != 0 && !is_preview_token_current(&IMAGE_PREVIEW_TOKEN, token) {
-        let _ = window.hide();
-        return Ok(());
-    }
-    crate::positioning::force_topmost(&window);
-    tracing::debug!("video-preview shown at ({}, {}), size {}x{}, created={}", win_x, win_y, win_width, win_height, newly_created);
-    Ok(())
+        let _ = window.emit(
+            "video-preview-update",
+            serde_json::json!({
+                "videoPath": video_path,
+                "width": width,
+                "height": height,
+                "offsetY": offset_y,
+                "align": align.as_deref().unwrap_or("left"),
+                "duration": duration.unwrap_or(5.0),
+            }),
+        );
+
+        if token != 0 && !is_preview_token_current(&IMAGE_PREVIEW_TOKEN, token) {
+            return Ok(());
+        }
+
+        let _ = window.show();
+        if token != 0 && !is_preview_token_current(&IMAGE_PREVIEW_TOKEN, token) {
+            let _ = window.hide();
+            return Ok(());
+        }
+        crate::positioning::force_topmost(&window);
+        tracing::debug!("video-preview shown at ({}, {}), size {}x{}, created={}", win_x, win_y, win_width, win_height, newly_created);
+        Ok(())
+    }).await
 }
 
 #[tauri::command]
@@ -259,12 +317,7 @@ pub async fn hide_image_preview(app: tauri::AppHandle, token: Option<u64>) {
         }
         invalidate_preview_token(&IMAGE_PREVIEW_TOKEN, t);
     }
-    if let Some(window) = app.get_webview_window("image-preview") {
-        let _ = window.hide();
-        let _ = window.emit("image-preview-clear", ());
-        schedule_preview_destroy(app, "image-preview", &IMAGE_PREVIEW_DESTROY_SEQ);
-        tracing::debug!("image-preview hidden");
-    }
+    hide_preview_window(&app, true);
 }
 
 #[tauri::command]
@@ -284,96 +337,117 @@ pub async fn show_text_preview(
     font_size: Option<f64>,
     token: Option<u64>,
 ) -> Result<(), String> {
-    let token = token.unwrap_or(0);
-    if token != 0 && !promote_preview_token(&TEXT_PREVIEW_TOKEN, token) {
-        return Ok(());
-    }
-    cancel_preview_destroy(&TEXT_PREVIEW_DESTROY_SEQ);
+    let _creation = super::WINDOW_CREATION.lock().await;
+    super::run_blocking("show_text_preview", move || {
+        let token = token.unwrap_or(0);
+        if token != 0 && !promote_preview_token(&TEXT_PREVIEW_TOKEN, token) {
+            return Ok(());
+        }
+        cancel_preview_destroy(&TEXT_PREVIEW_DESTROY_SEQ);
 
-    if token != 0 && !is_preview_token_current(&TEXT_PREVIEW_TOKEN, token) {
-        return Ok(());
-    }
+        if token != 0 && !is_preview_token_current(&TEXT_PREVIEW_TOKEN, token) {
+            return Ok(());
+        }
 
-    let seq = TEXT_PREVIEW_UPDATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-    let mut newly_created = false;
-    let window = if let Some(w) = app.get_webview_window("text-preview") {
-        w
-    } else {
-        newly_created = true;
-        let w = tauri::WebviewWindowBuilder::new(
-            &app,
-            "text-preview",
-            tauri::WebviewUrl::App("/text-preview.html".into()),
-        )
-        .title("")
-        .decorations(false)
-        .transparent(true)
-        .shadow(false)
-        .resizable(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .focused(false)
-        .visible(false)
-        .build()
-        .map_err(|e| format!("创建文本预览窗口失败: {}", e))?;
-
-        // 应用窗口特效，与主窗口保持一致
-        apply_preview_window_effect(&w, window_effect.as_deref());
-
-        w
-    };
-
-    if token != 0 && !is_preview_token_current(&TEXT_PREVIEW_TOKEN, token) {
-        return Ok(());
-    }
-
-    let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
-        width: win_width as u32,
-        height: win_height as u32,
-    }));
-    let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
-        x: win_x as i32,
-        y: win_y as i32,
-    }));
-
-    let _ = window.set_always_on_top(true);
-    // 点击穿透，滚动由主窗口 Ctrl+滚轮驱动
-    let _ = window.set_ignore_cursor_events(true);
-
-    let update_payload = serde_json::json!({
-        "text": text,
-        "align": align.as_deref().unwrap_or("left"),
-        "theme": theme.as_deref().unwrap_or("light"),
-        "sharpCorners": sharp_corners.unwrap_or(false),
-        "fontFamily": font_family,
-        "fontSize": font_size,
-    });
-    let _ = window.emit("text-preview-update", update_payload.clone());
-    if token != 0 && !is_preview_token_current(&TEXT_PREVIEW_TOKEN, token) {
-        return Ok(());
-    }
-    let _ = window.show();
-    if token != 0 && !is_preview_token_current(&TEXT_PREVIEW_TOKEN, token) {
-        let _ = window.hide();
-        return Ok(());
-    }
-    crate::positioning::force_topmost(&window);
-    tracing::debug!("text-preview shown at ({}, {}), size {}x{}, created={}", win_x, win_y, win_width, win_height, newly_created);
-
-    if newly_created {
-        let window_clone = window.clone();
-        tauri::async_runtime::spawn(async move {
-            for delay_ms in [120_u64, 260, 420, 680] {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                if TEXT_PREVIEW_UPDATE_SEQ.load(std::sync::atomic::Ordering::Acquire) != seq {
-                    return;
+        let seq = TEXT_PREVIEW_UPDATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        let mut newly_created = false;
+        let window = if let Some(w) = app.get_webview_window("text-preview") {
+            w
+        } else {
+            crate::webview_runtime::ensure_runtime_current(&app)?;
+            let creation_guard =
+                crate::webview_runtime::WindowCreationGuard::start(&app, "text-preview");
+            let page_load_guard = creation_guard.clone();
+            newly_created = true;
+            let build_result = tauri::WebviewWindowBuilder::new(
+                &app,
+                "text-preview",
+                tauri::WebviewUrl::App("/text-preview.html".into()),
+            )
+            .title("")
+            .decorations(false)
+            .transparent(true)
+            .shadow(false)
+            .resizable(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .focused(false)
+            .visible(false)
+            .on_page_load(move |window, payload| {
+                page_load_guard.on_page_load(&window, &payload);
+            })
+            .build();
+            let w = match build_result {
+                Ok(window) => window,
+                Err(error) => {
+                    creation_guard.cancel();
+                    return Err(crate::webview_runtime::window_operation_error(
+                        &app,
+                        "text-preview",
+                        "创建文本预览窗口失败",
+                        error,
+                    ));
                 }
-                let _ = window_clone.emit("text-preview-update", update_payload.clone());
-            }
-        });
-    }
+            };
 
-    Ok(())
+            // 应用窗口特效，与主窗口保持一致
+            apply_preview_window_effect(&w, window_effect.as_deref());
+
+            w
+        };
+
+        if token != 0 && !is_preview_token_current(&TEXT_PREVIEW_TOKEN, token) {
+            return Ok(());
+        }
+
+        let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
+            width: win_width as u32,
+            height: win_height as u32,
+        }));
+        let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
+            x: win_x as i32,
+            y: win_y as i32,
+        }));
+
+        let _ = window.set_always_on_top(true);
+        // 点击穿透，滚动由主窗口 Ctrl+滚轮驱动
+        let _ = window.set_ignore_cursor_events(true);
+
+        let update_payload = serde_json::json!({
+            "text": text,
+            "align": align.as_deref().unwrap_or("left"),
+            "theme": theme.as_deref().unwrap_or("light"),
+            "sharpCorners": sharp_corners.unwrap_or(false),
+            "fontFamily": font_family,
+            "fontSize": font_size,
+        });
+        let _ = window.emit("text-preview-update", update_payload.clone());
+        if token != 0 && !is_preview_token_current(&TEXT_PREVIEW_TOKEN, token) {
+            return Ok(());
+        }
+        let _ = window.show();
+        if token != 0 && !is_preview_token_current(&TEXT_PREVIEW_TOKEN, token) {
+            let _ = window.hide();
+            return Ok(());
+        }
+        crate::positioning::force_topmost(&window);
+        tracing::debug!("text-preview shown at ({}, {}), size {}x{}, created={}", win_x, win_y, win_width, win_height, newly_created);
+
+        if newly_created {
+            let window_clone = window.clone();
+            tauri::async_runtime::spawn(async move {
+                for delay_ms in [120_u64, 260, 420, 680] {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    if TEXT_PREVIEW_UPDATE_SEQ.load(std::sync::atomic::Ordering::Acquire) != seq {
+                        return;
+                    }
+                    let _ = window_clone.emit("text-preview-update", update_payload.clone());
+                }
+            });
+        }
+
+        Ok(())
+    }).await
 }
 
 #[tauri::command]
@@ -387,51 +461,67 @@ pub async fn hide_text_preview(app: tauri::AppHandle, token: Option<u64>) {
         invalidate_preview_token(&TEXT_PREVIEW_TOKEN, t);
     }
     TEXT_PREVIEW_UPDATE_SEQ.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    if let Some(window) = app.get_webview_window("text-preview") {
-        let _ = window.hide();
-        let _ = window.emit("text-preview-clear", ());
-        schedule_preview_destroy(app, "text-preview", &TEXT_PREVIEW_DESTROY_SEQ);
-        tracing::debug!("text-preview hidden");
-    }
+    hide_preview_window(&app, false);
 }
 
 #[tauri::command]
 pub async fn open_text_editor_window(app: tauri::AppHandle, id: i64) -> Result<(), String> {
-    let label = format!("text-editor-{}", id);
+    let _creation = super::WINDOW_CREATION.lock().await;
+    super::run_blocking("open_text_editor_window", move || {
+        let label = format!("text-editor-{}", id);
 
-    if let Some(window) = app.get_webview_window(&label) {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_always_on_top(true);
-        let _ = window.set_focus();
-        return Ok(());
-    }
+        if let Some(window) = app.get_webview_window(&label) {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_always_on_top(true);
+            let _ = window.set_focus();
+            return Ok(());
+        }
 
-    let window = tauri::WebviewWindowBuilder::new(
-        &app,
-        &label,
-        tauri::WebviewUrl::App(format!("/editor?id={}", id).into()),
-    )
-    .title("编辑")
-    .inner_size(600.0, 460.0)
-    .min_inner_size(400.0, 300.0)
-    .decorations(false)
-    .transparent(true)
-    .shadow(true)
-    .visible(false)
-    .resizable(true)
-    .always_on_top(true)
-    .center()
-    .build()
-    .map_err(|e| format!("创建编辑器窗口失败: {}", e))?;
+        crate::webview_runtime::ensure_runtime_current(&app)?;
+        let creation_guard = crate::webview_runtime::WindowCreationGuard::start(&app, label.clone());
+        let page_load_guard = creation_guard.clone();
+        let build_result = tauri::WebviewWindowBuilder::new(
+            &app,
+            &label,
+            tauri::WebviewUrl::App(format!("/editor?id={}", id).into()),
+        )
+        .title("编辑")
+        .inner_size(600.0, 460.0)
+        .min_inner_size(400.0, 300.0)
+        .decorations(false)
+        .transparent(true)
+        .shadow(true)
+        .visible(false)
+        .resizable(true)
+        .always_on_top(true)
+        .center()
+        .on_page_load(move |window, payload| {
+            page_load_guard.on_page_load(&window, &payload);
+        })
+        .build();
+        let window = match build_result {
+            Ok(window) => window,
+            Err(error) => {
+                creation_guard.cancel();
+                return Err(crate::webview_runtime::window_operation_error(
+                    &app,
+                    &label,
+                    "创建编辑器窗口失败",
+                    error,
+                ));
+            }
+        };
 
-    let _ = window;
-    Ok(())
+        let _ = window;
+        Ok(())
+    }).await
 }
 
 #[tauri::command]
 pub async fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> {
-    crate::tray::open_settings_window(&app)
+    let _creation = super::WINDOW_CREATION.lock().await;
+    super::run_blocking("open_settings_window", move || crate::tray::open_settings_window(&app)).await
 }
 
 #[tauri::command]

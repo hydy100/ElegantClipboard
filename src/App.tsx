@@ -34,6 +34,7 @@ import { useInputFocus } from "@/hooks/useInputFocus";
 import { useSearchDebounce } from "@/hooks/useSearchDebounce";
 import { useWindowLifecycle } from "@/hooks/useWindowLifecycle";
 import { LOGICAL_TYPE_BACKEND_MAP, getVisibleCategories } from "@/lib/constants";
+import { syncFilePreviewLimitsFromSettings } from "@/lib/file-preview-limits";
 import { logError } from "@/lib/logger";
 import { initTheme } from "@/lib/theme-applier";
 import { cn } from "@/lib/utils";
@@ -110,6 +111,10 @@ function App() {
   const segmentRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const segmentContainerRef = useRef<HTMLDivElement>(null);
   const [segmentIndicator, setSegmentIndicator] = useState({ left: 0, width: 0 });
+
+  useEffect(() => {
+    void syncFilePreviewLimitsFromSettings();
+  }, []);
 
   const visibleCategories = useMemo(
     () => getVisibleCategories(enabledMonitorTypes),

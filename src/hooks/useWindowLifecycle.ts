@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { focusWindowImmediately } from "@/hooks/useInputFocus";
+import { focusWindowImmediately, releaseWebViewFocus } from "@/hooks/useInputFocus";
 import { logError } from "@/lib/logger";
+import { singleFlight } from "@/lib/single-flight";
 import { useClipboardStore } from "@/stores/clipboard";
 import { useUISettings } from "@/stores/ui-settings";
 
 type FetchItems = (options?: { search?: string }) => Promise<void>;
+
+const refreshFileValidity = singleFlight(() => invoke<number>("refresh_files_validity"));
 
 interface UseWindowLifecycleOptions {
   autoResetState: boolean;
@@ -41,7 +44,6 @@ export function useWindowLifecycle({
   setTagsViewOpen,
   dismissOverlays,
 }: UseWindowLifecycleOptions) {
-  const clipboardDirtyRef = useRef(false);
   const viewSwitchRef = useRef(false);
   const suppressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [isPinned, setIsPinned] = useState(false);
@@ -51,9 +53,9 @@ export function useWindowLifecycle({
 
   useEffect(() => {
     if (!viewSwitchRef.current) { viewSwitchRef.current = true; return; }
-    invoke("refresh_files_validity").then((changed) => {
-      if (changed as number > 0) refresh();
-    });
+    refreshFileValidity().then((changed) => {
+      if (changed > 0) return refresh();
+    }).catch((error) => logError("Failed to refresh file validity:", error));
   }, [tagsViewOpen, selectedCategory, refresh]);
 
   useEffect(() => {
@@ -61,7 +63,8 @@ export function useWindowLifecycle({
   }, [cardDensity]);
 
   useEffect(() => {
-    invoke<boolean>("is_window_pinned").then(setIsPinned);
+    invoke<boolean>("is_window_pinned").then(setIsPinned)
+      .catch((error) => logError("Failed to load window pin state:", error));
     const kbNav = useUISettings.getState().keyboardNavigation;
     invoke("set_keyboard_nav_enabled", { enabled: kbNav }).catch((error) => {
       logError("Failed to sync keyboard navigation setting:", error);
@@ -69,29 +72,23 @@ export function useWindowLifecycle({
   }, []);
 
   useEffect(() => {
-    const unlisten = listen("clipboard-updated", () => {
-      clipboardDirtyRef.current = true;
-    });
-    return () => { unlisten.then((fn) => fn()); };
-  }, []);
-
-  useEffect(() => {
     const unlisten = listen("window-shown", () => {
       setWindowVisible(true);
       useUISettings.persist.rehydrate();
-      invoke("refresh_files_validity").finally(() => {
-        if (searchAutoClear) {
-          setSearchQuery("");
-          fetchItems({ search: "" });
-        } else {
-          refresh();
-        }
-      });
-      clipboardDirtyRef.current = false;
+      // The list must not wait for disconnected disks/network shares to respond.
+      if (searchAutoClear) {
+        setSearchQuery("");
+        void fetchItems({ search: "" });
+      } else {
+        void refresh();
+      }
+      refreshFileValidity().then((changed) => {
+        if (changed > 0) return refresh();
+      }).catch((error) => logError("Failed to refresh file validity:", error));
       if (searchAutoFocus) {
         focusWindowImmediately().then(() => {
           inputRef.current?.focus();
-        });
+        }).catch((error) => logError("Failed to focus search:", error));
       }
       setSuppressTooltips(true);
       if (suppressTimerRef.current) clearTimeout(suppressTimerRef.current);
@@ -105,6 +102,7 @@ export function useWindowLifecycle({
 
   useEffect(() => {
     const unlisten = listen("window-hidden", () => {
+      releaseWebViewFocus();
       setWindowVisible(false);
       dismissOverlays();
       setBatchMode(false);
