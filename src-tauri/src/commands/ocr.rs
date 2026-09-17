@@ -7,6 +7,7 @@ use crate::database;
 /// 暂存待显示的 OCR 文本（供新窗口挂载后主动获取）
 static PENDING_OCR_TEXT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 static OCR_SCREENSHOT_DESTROY_SEQ: AtomicU64 = AtomicU64::new(0);
+static OCR_CAPTURE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const OCR_SCREENSHOT_DESTROY_DELAY: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn cancel_ocr_screenshot_destroy() {
@@ -474,76 +475,99 @@ pub async fn ocr_recognize_custom(
 /// 如果窗口已存在则复用（通过事件通知前端更新），否则首次创建。
 #[tauri::command]
 pub async fn open_ocr_screenshot_window(app: tauri::AppHandle, screenshot_path: String) -> Result<(), String> {
-    cancel_ocr_screenshot_destroy();
+    let _creation = super::WINDOW_CREATION.lock().await;
+    super::run_blocking("open_ocr_screenshot_window", move || {
+        cancel_ocr_screenshot_destroy();
 
-    // 复用已有窗口：先移到屏幕外（防止 WebView2 缓存帧闪烁旧选区），再发事件让前端加载新图片
-    if let Some(w) = app.get_webview_window("ocr-screenshot") {
-        let _ = w.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(-10000, -10000)));
-        let _ = w.emit("ocr-screenshot-update", &screenshot_path);
-        return Ok(());
-    }
+        // 复用已有窗口：先移到屏幕外（防止 WebView2 缓存帧闪烁旧选区），再发事件让前端加载新图片
+        if let Some(w) = app.get_webview_window("ocr-screenshot") {
+            let _ = w.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(-10000, -10000)));
+            let _ = w.emit("ocr-screenshot-update", &screenshot_path);
+            return Ok(());
+        }
 
-    // 首次创建
-    let url = format!("/ocr-screenshot?path={}", urlencoded(&screenshot_path));
-    let _window = tauri::WebviewWindowBuilder::new(
-        &app,
-        "ocr-screenshot",
-        tauri::WebviewUrl::App(url.into()),
-    )
-    .title("")
-    .decorations(false)
-    .transparent(true)
-    .shadow(false)
-    .resizable(false)
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .focused(true)
-    .visible(false)
-    // 初始放到屏幕外，避免 WebView2 初始化时的白屏闪烁
-    .position(-10000.0, -10000.0)
-    .inner_size(1.0, 1.0)
-    .build()
-    .map_err(|e| format!("创建截图窗口失败: {}", e))?;
+        // 首次创建
+        crate::webview_runtime::ensure_runtime_current(&app)?;
+        let creation_guard =
+            crate::webview_runtime::WindowCreationGuard::start(&app, "ocr-screenshot");
+        let page_load_guard = creation_guard.clone();
+        let url = format!("/ocr-screenshot?path={}", urlencoded(&screenshot_path));
+        let build_result = tauri::WebviewWindowBuilder::new(
+            &app,
+            "ocr-screenshot",
+            tauri::WebviewUrl::App(url.into()),
+        )
+        .title("")
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .resizable(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .focused(true)
+        .visible(false)
+        // 初始放到屏幕外，避免 WebView2 初始化时的白屏闪烁
+        .position(-10000.0, -10000.0)
+        .inner_size(1.0, 1.0)
+        .on_page_load(move |window, payload| {
+            page_load_guard.on_page_load(&window, &payload);
+        })
+        .build();
+        match build_result {
+            Ok(_) => {}
+            Err(error) => {
+                creation_guard.cancel();
+                return Err(crate::webview_runtime::window_operation_error(
+                    &app,
+                    "ocr-screenshot",
+                    "创建截图窗口失败",
+                    error,
+                ));
+            }
+        }
 
-    // 前端图片加载完成后会调用 ocr_screenshot_ready 来设置正确位置并显示
+        // 前端图片加载完成后会调用 ocr_screenshot_ready 来设置正确位置并显示
 
-    Ok(())
+        Ok(())
+    }).await
 }
 
 /// 前端截图加载完成后调用，将窗口移到正确位置并显示
 #[tauri::command]
 pub async fn ocr_screenshot_ready(app: tauri::AppHandle) -> Result<(), String> {
-    cancel_ocr_screenshot_destroy();
-    let window = app.get_webview_window("ocr-screenshot")
-        .ok_or("截图窗口不存在")?;
+    super::run_blocking("ocr_screenshot_ready", move || {
+        cancel_ocr_screenshot_destroy();
+        let window = app.get_webview_window("ocr-screenshot")
+            .ok_or("截图窗口不存在")?;
 
-    // 获取虚拟屏幕尺寸和位置
-    #[cfg(target_os = "windows")]
-    let (vx, vy, vw, vh) = unsafe {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-            SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+        // 获取虚拟屏幕尺寸和位置
+        #[cfg(target_os = "windows")]
+        let (vx, vy, vw, vh) = unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+                SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+            };
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            )
         };
-        (
-            GetSystemMetrics(SM_XVIRTUALSCREEN),
-            GetSystemMetrics(SM_YVIRTUALSCREEN),
-            GetSystemMetrics(SM_CXVIRTUALSCREEN),
-            GetSystemMetrics(SM_CYVIRTUALSCREEN),
-        )
-    };
-    #[cfg(not(target_os = "windows"))]
-    let (vx, vy, vw, vh) = (0, 0, 1920, 1080);
+        #[cfg(not(target_os = "windows"))]
+        let (vx, vy, vw, vh) = (0, 0, 1920, 1080);
 
-    let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
-        width: vw as u32,
-        height: vh as u32,
-    }));
-    let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(vx, vy)));
-    let _ = window.set_always_on_top(true);
-    let _ = window.show();
-    let _ = window.set_focus();
+        let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
+            width: vw as u32,
+            height: vh as u32,
+        }));
+        let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(vx, vy)));
+        let _ = window.set_always_on_top(true);
+        let _ = window.show();
+        let _ = window.set_focus();
 
-    Ok(())
+        Ok(())
+    }).await
 }
 
 #[tauri::command]
@@ -558,39 +582,59 @@ pub async fn hide_ocr_screenshot_window(app: tauri::AppHandle) {
 /// 打开 OCR识别结果窗口
 #[tauri::command]
 pub async fn open_ocr_result_window(app: tauri::AppHandle, text: String) -> Result<(), String> {
-    let label = "ocr-result";
+    let _creation = super::WINDOW_CREATION.lock().await;
+    super::run_blocking("open_ocr_result_window", move || {
+        let label = "ocr-result";
 
-    // 始终暂存最新文本，防止窗口刚创建、前端尚未就绪时 emit 的事件丢失
-    *PENDING_OCR_TEXT.lock().unwrap() = text.clone();
+        // 始终暂存最新文本，防止窗口刚创建、前端尚未就绪时 emit 的事件丢失
+        *PENDING_OCR_TEXT.lock().unwrap() = text.clone();
 
-    if let Some(window) = app.get_webview_window(label) {
-        let _ = window.emit("ocr-result-update", &text);
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_always_on_top(true);
-        let _ = window.set_focus();
-        return Ok(());
-    }
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.emit("ocr-result-update", &text);
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_always_on_top(true);
+            let _ = window.set_focus();
+            return Ok(());
+        }
 
-    let _window = tauri::WebviewWindowBuilder::new(
-        &app,
-        label,
-        tauri::WebviewUrl::App("/ocr-result".into()),
-    )
-    .title("OCR识别结果")
-    .inner_size(520.0, 420.0)
-    .min_inner_size(360.0, 300.0)
-    .decorations(false)
-    .transparent(true)
-    .shadow(true)
-    .visible(false)
-    .resizable(true)
-    .always_on_top(true)
-    .center()
-    .build()
-    .map_err(|e| format!("创建 OCR 结果窗口失败: {}", e))?;
+        crate::webview_runtime::ensure_runtime_current(&app)?;
+        let creation_guard = crate::webview_runtime::WindowCreationGuard::start(&app, label);
+        let page_load_guard = creation_guard.clone();
+        let build_result = tauri::WebviewWindowBuilder::new(
+            &app,
+            label,
+            tauri::WebviewUrl::App("/ocr-result".into()),
+        )
+        .title("OCR识别结果")
+        .inner_size(520.0, 420.0)
+        .min_inner_size(360.0, 300.0)
+        .decorations(false)
+        .transparent(true)
+        .shadow(true)
+        .visible(false)
+        .resizable(true)
+        .always_on_top(true)
+        .center()
+        .on_page_load(move |window, payload| {
+            page_load_guard.on_page_load(&window, &payload);
+        })
+        .build();
+        match build_result {
+            Ok(_) => {}
+            Err(error) => {
+                creation_guard.cancel();
+                return Err(crate::webview_runtime::window_operation_error(
+                    &app,
+                    label,
+                    "创建 OCR 结果窗口失败",
+                    error,
+                ));
+            }
+        }
 
-    Ok(())
+        Ok(())
+    }).await
 }
 
 /// 前端挂载后调用，获取暂存的 OCR 文本
@@ -627,9 +671,10 @@ pub fn register_ocr_shortcut(app: &tauri::AppHandle) {
         &shortcut_str,
         std::sync::Arc::new(|app, key_state| {
             if key_state == crate::hotkey::KeyState::Pressed {
+                let Some(guard) = super::activity::ActivityGuard::acquire(&OCR_CAPTURE_ACTIVE) else { return; };
                 let app = app.clone();
                 std::thread::spawn(move || {
-                    trigger_ocr_capture(&app);
+                    trigger_ocr_capture(&app, guard);
                 });
             }
         }),
@@ -658,11 +703,12 @@ pub fn unregister_ocr_shortcut(app: &tauri::AppHandle) {
 }
 
 /// 触发 OCR 截图流程
-fn trigger_ocr_capture(app: &tauri::AppHandle) {
+fn trigger_ocr_capture(app: &tauri::AppHandle, guard: super::activity::ActivityGuard) {
     // 隐藏主窗口并同步状态
     if let Some(main_win) = app.get_webview_window("main") {
         if main_win.is_visible().unwrap_or(false) {
             let _ = main_win.hide();
+            let _ = main_win.emit("window-hidden", ());
             crate::keyboard_hook::set_window_state(crate::keyboard_hook::WindowState::Hidden);
             crate::input_monitor::disable_mouse_monitoring();
         }
@@ -683,6 +729,7 @@ fn trigger_ocr_capture(app: &tauri::AppHandle) {
             let path_str = tmp_path.to_string_lossy().to_string();
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
+                let _guard = guard; // includes window creation, not just capture/file I/O
                 if let Err(e) = open_ocr_screenshot_window(app, path_str).await {
                     tracing::error!("打开截图窗口失败: {}", e);
                 }

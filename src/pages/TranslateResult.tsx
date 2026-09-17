@@ -26,6 +26,7 @@ export function TranslateResult() {
   const [translatedCopied, setTranslatedCopied] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const translationRef = useRef<HTMLDivElement>(null);
+  const translationRequest = useRef(0);
 
   const recordTranslation = useTranslateSettings((s) => s.recordTranslation);
   const translateLoaded = useTranslateSettings((s) => s.loaded);
@@ -46,32 +47,36 @@ export function TranslateResult() {
       document.body.getBoundingClientRect();
       await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
       await new Promise((r) => setTimeout(r, 30));
-      win.show();
-      win.setFocus();
+      await win.show();
+      await win.setFocus();
+      await invoke("managed_window_ready");
       await new Promise((r) => requestAnimationFrame(r));
       setThemeReady(true);
     });
   }, []);
 
-  // 挂载后从 Rust 获取暂存文本
+  // Subscribe before fetching the snapshot so an update during startup is not lost.
   useEffect(() => {
-    invoke<string>("get_pending_translate_text").then((t) => {
-      if (t) {
-        setText(t);
-        doTranslate(t);
-      }
-    }).catch(() => {});
-  }, []);
-
-  // 监听文本更新事件（窗口已存在时复用）
-  useEffect(() => {
+    let disposed = false;
+    let updated = false;
     const unlisten = listen<string>("translate-result-update", (event) => {
+      if (disposed) return;
+      updated = true;
       setText(event.payload);
       setTranslatedText("");
       setTranslateError("");
       doTranslate(event.payload);
     });
+    unlisten.then(async () => {
+      const pending = await invoke<string>("get_pending_translate_text");
+      if (!disposed && !updated && pending) {
+        setText(pending);
+        doTranslate(pending);
+      }
+    }).catch((error) => logError("Failed to initialize selection translation:", error));
     return () => {
+      disposed = true;
+      ++translationRequest.current;
       unlisten.then((fn) => fn());
     };
   }, []);
@@ -89,17 +94,25 @@ export function TranslateResult() {
 
   // 自动翻译
   const doTranslate = useCallback(async (sourceText: string) => {
-    if (!sourceText.trim()) return;
+    const request = ++translationRequest.current;
+    if (!sourceText.trim()) {
+      setTranslating(false);
+      setTranslateError("");
+      setTranslatedText("");
+      return;
+    }
     setTranslating(true);
     setTranslateError("");
     setTranslatedText("");
     try {
       const result = await translateText(sourceText);
+      if (request !== translationRequest.current) return;
       setTranslatedText(result);
     } catch (error) {
+      if (request !== translationRequest.current) return;
       setTranslateError(String(error));
     } finally {
-      setTranslating(false);
+      if (request === translationRequest.current) setTranslating(false);
     }
   }, []);
 

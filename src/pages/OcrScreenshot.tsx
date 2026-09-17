@@ -35,6 +35,9 @@ export function OcrScreenshot() {
       setImagePath(event.payload);
       setLoadKey((k) => k + 1); // 强制触发重新加载（路径可能相同）
     });
+    void unlisten
+      .then(() => invoke("managed_window_ready"))
+      .catch(() => {});
     return () => { unlisten.then((fn) => fn()); };
   }, []);
 

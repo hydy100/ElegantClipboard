@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { Eye16Regular, EyeOff16Regular } from "@fluentui/react-icons";
 import { invoke } from "@tauri-apps/api/core";
 import { Button } from "@/components/ui/button";
@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { useKeyedDebounce } from "@/hooks/useKeyedDebounce";
 import { logError } from "@/lib/logger";
 import { PROVIDER_OPTIONS, LANGUAGES, translateText } from "@/lib/translate";
 import { useTranslateSettings, type TranslateProvider, type LanguageMode } from "@/stores/translate-settings";
@@ -52,11 +53,10 @@ export function TranslateTab() {
   const [tsSaving, setTsSaving] = useState(false);
 
   // debounce helpers for text inputs
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scheduleSave = useKeyedDebounce<(value: string) => void>();
   const debounced = useCallback(<T extends (...args: string[]) => void>(fn: T, value: string) => {
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(() => fn(value), 300);
-  }, []);
+    scheduleSave(fn, () => fn(value));
+  }, [scheduleSave]);
 
   useEffect(() => {
     if (!loaded) loadSettings();

@@ -16,48 +16,89 @@ fn build_client(proxy_mode: &str, proxy_url: &str) -> Result<reqwest::blocking::
     builder.build().map_err(|e| format!("创建 HTTP 客户端失败: {}", e))
 }
 
-/// 微软翻译（通过 Edge 免费接口，无需 API Key）
-fn translate_microsoft(client: &reqwest::blocking::Client, text: &str, from: &str, to: &str) -> Result<String, String> {
-    // 1. 获取临时 auth token
-    let token = client
-        .get("https://edge.microsoft.com/translate/auth")
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0")
-        .send()
-        .map_err(|e| format!("获取微软翻译 token 失败: {}", e))?
-        .text()
-        .map_err(|e| format!("读取 token 失败: {}", e))?;
+const MICROSOFT_TRANSLATE_URL: &str = "https://edge.microsoft.com/translate/translatetext";
+const MICROSOFT_MAX_CHARS_PER_REQUEST: usize = 45_000;
+const MICROSOFT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0";
 
-    if token.is_empty() || token.len() < 20 {
-        return Err(format!("获取微软翻译 token 异常: {}", token));
+fn microsoft_language_code(language: &str) -> &str {
+    match language {
+        "auto" => "",
+        "zh" | "zh-CN" | "zh-CHS" => "zh-Hans",
+        "zh-TW" | "zh-CHT" => "zh-Hant",
+        other => other,
     }
+}
 
-    // 2. 调用翻译接口
-    let from_param = if from == "auto" { "" } else { from };
-    let url = format!(
-        "https://api-edge.cognitive.microsofttranslator.com/translate?api-version=3.0&to={to}{from_part}",
-        to = to,
-        from_part = if from_param.is_empty() { String::new() } else { format!("&from={}", from_param) },
-    );
-    let body = serde_json::json!([{ "Text": text }]);
+fn microsoft_translate_url(from: &str, to: &str) -> String {
+    format!(
+        "{MICROSOFT_TRANSLATE_URL}?from={}&to={}&isEnterpriseClient=false",
+        urlencoded(microsoft_language_code(from)),
+        urlencoded(microsoft_language_code(to)),
+    )
+}
+
+fn parse_microsoft_translation(value: &serde_json::Value) -> Result<String, String> {
+    value
+        .as_array()
+        .and_then(|items| items.first())
+        .and_then(|item| item["translations"].as_array())
+        .and_then(|translations| translations.first())
+        .and_then(|translation| translation["text"].as_str())
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "微软翻译响应格式异常或结果为空".to_string())
+}
+
+fn translate_microsoft_once(
+    client: &reqwest::blocking::Client,
+    text: &str,
+    from: &str,
+    to: &str,
+) -> Result<String, String> {
+    // Edge 在 2026 年 8 月下线了旧的 /translate/auth token 接口，
+    // 当前免费接口直接接受字符串数组，不再需要 Authorization。
+    let body = serde_json::json!([text]);
     let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", token))
+        .post(microsoft_translate_url(from, to))
         .header("Content-Type", "application/json")
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0")
+        .header("Accept", "application/json")
+        .header("User-Agent", MICROSOFT_USER_AGENT)
         .json(&body)
         .send()
         .map_err(|e| format!("微软翻译请求失败: {}", e))?;
     let status = resp.status();
-    let resp_text = resp.text().map_err(|e| format!("读取响应失败: {}", e))?;
+    let resp_text = resp.text().map_err(|e| format!("读取微软翻译响应失败: {}", e))?;
     if !status.is_success() {
         return Err(format!("微软翻译错误 ({}): {}", status, resp_text));
     }
-    let arr: serde_json::Value = serde_json::from_str(&resp_text)
-        .map_err(|e| format!("解析响应失败: {}", e))?;
-    arr[0]["translations"][0]["text"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "翻译结果格式异常".to_string())
+    let value: serde_json::Value = serde_json::from_str(&resp_text)
+        .map_err(|e| format!("解析微软翻译响应失败: {}", e))?;
+    parse_microsoft_translation(&value)
+}
+
+/// 微软翻译（Edge 当前免鉴权接口，无需 API Key）
+fn translate_microsoft(client: &reqwest::blocking::Client, text: &str, from: &str, to: &str) -> Result<String, String> {
+    if text.chars().count() <= MICROSOFT_MAX_CHARS_PER_REQUEST {
+        return translate_microsoft_once(client, text, from, to);
+    }
+
+    // Edge 接口单次约 50,000 字符；按字符边界拆分，避免 UTF-8 字节截断。
+    let mut translated = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_chars = 0;
+    for character in text.chars() {
+        chunk.push(character);
+        chunk_chars += 1;
+        if chunk_chars >= MICROSOFT_MAX_CHARS_PER_REQUEST {
+            translated.push(translate_microsoft_once(client, &chunk, from, to)?);
+            chunk.clear();
+            chunk_chars = 0;
+        }
+    }
+    if !chunk.is_empty() {
+        translated.push(translate_microsoft_once(client, &chunk, from, to)?);
+    }
+    Ok(translated.join(""))
 }
 
 /// DeepLX 翻译（自定义接口地址）
@@ -441,124 +482,43 @@ pub async fn write_text_to_clipboard(
     text: String,
     record: Option<bool>,
 ) -> Result<(), String> {
-    let write_fn = || {
-        let mut clipboard = arboard::Clipboard::new()
-            .map_err(|e| format!("无法访问剪贴板: {}", e))?;
-        clipboard
-            .set_text(&text)
-            .map_err(|e| format!("写入剪贴板失败: {}", e))?;
-        Ok(())
-    };
+    let state = state.inner().clone();
+    super::run_blocking("write_text_to_clipboard", move || {
+        let write_fn = || {
+            let mut clipboard = arboard::Clipboard::new()
+                .map_err(|e| format!("无法访问剪贴板: {}", e))?;
+            clipboard
+                .set_text(&text)
+                .map_err(|e| format!("写入剪贴板失败: {}", e))?;
+            Ok(())
+        };
 
-    if record.unwrap_or(false) {
-        write_fn()
-    } else {
-        super::with_paused_monitor(&state, write_fn)
-    }
+        if record.unwrap_or(false) {
+            write_fn()
+        } else {
+            super::with_paused_monitor(&state, write_fn)
+        }
+    }).await
 }
 
 // ============ 翻译选中文字功能 ============
 
 /// 暂存待翻译的选中文本
+static SELECTION_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 static PENDING_TRANSLATE_TEXT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 /// 获取系统当前选中的文字（通过模拟 Ctrl+C 读取剪贴板）
 fn get_selected_text_from_system(state: &Arc<AppState>) -> Result<String, String> {
-    // 备份当前剪贴板内容
-    let backup = {
-        let mut cb = arboard::Clipboard::new()
-            .map_err(|e| format!("无法访问剪贴板: {}", e))?;
-        cb.get_text().ok()
-    };
-
-    // 暂停剪贴板监控
-    state.monitor.pause();
-
-    // 记录 Ctrl+C 前的剪贴板序列号，用于判断是否真的复制了新内容
-    #[cfg(target_os = "windows")]
-    let seq_before = unsafe {
-        windows::Win32::System::DataExchange::GetClipboardSequenceNumber()
-    };
-
-    // 模拟 Ctrl+C（先释放热键可能残留的修饰键，否则会变成 Ctrl+Alt+C 等）
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{
-            SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT,
-            KEYEVENTF_KEYUP, VIRTUAL_KEY,
-        };
-
-        fn key_up(vk: VIRTUAL_KEY) -> INPUT {
-            INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
-                    ki: KEYBDINPUT { wVk: vk, dwFlags: KEYEVENTF_KEYUP, ..Default::default() },
-                },
-            }
-        }
-        fn key_down(vk: VIRTUAL_KEY) -> INPUT {
-            INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
-                    ki: KEYBDINPUT { wVk: vk, ..Default::default() },
-                },
-            }
-        }
-
-        let vk_ctrl = VIRTUAL_KEY(0x11);
-        let vk_alt = VIRTUAL_KEY(0x12);
-        let vk_shift = VIRTUAL_KEY(0x10);
-        let vk_lwin = VIRTUAL_KEY(0x5B);
-        let vk_c = VIRTUAL_KEY(0x43);
-
-        // 1) 释放所有可能残留的修饰键
-        let release_mods = [key_up(vk_ctrl), key_up(vk_alt), key_up(vk_shift), key_up(vk_lwin)];
-        unsafe { SendInput(&release_mods, std::mem::size_of::<INPUT>() as i32); }
-        std::thread::sleep(std::time::Duration::from_millis(30));
-
-        // 2) 模拟 Ctrl+C
-        let copy_inputs = [key_down(vk_ctrl), key_down(vk_c), key_up(vk_c), key_up(vk_ctrl)];
-        unsafe { SendInput(&copy_inputs, std::mem::size_of::<INPUT>() as i32); }
+        super::selection::selected_text(state)
     }
-
-    // 等待剪贴板更新
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // 检查剪贴板序列号是否变化——未变化说明 Ctrl+C 没有复制到任何内容
-    #[cfg(target_os = "windows")]
-    let seq_after = unsafe {
-        windows::Win32::System::DataExchange::GetClipboardSequenceNumber()
-    };
-    #[cfg(target_os = "windows")]
-    let clipboard_changed = seq_after != seq_before;
-    #[cfg(not(target_os = "windows"))]
-    let clipboard_changed = true;
-
-    let selected = if clipboard_changed {
-        // 剪贴板变化了，读取新内容
-        let text = {
-            let mut cb = arboard::Clipboard::new()
-                .map_err(|e| format!("无法访问剪贴板: {}", e))?;
-            cb.get_text().ok().unwrap_or_default()
-        };
-
-        // 恢复剪贴板原内容
-        if let Some(backup_text) = backup {
-            if let Ok(mut cb) = arboard::Clipboard::new() {
-                let _ = cb.set_text(&backup_text);
-            }
-        }
-
-        text
-    } else {
-        // 剪贴板没变化 = 没选中任何文字，无需恢复
-        String::new()
-    };
-
-    // 恢复监控
-    state.monitor.resume();
-
-    Ok(selected)
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        Err("当前平台未实现系统选中文字读取".into())
+    }
 }
 
 /// 前端挂载后调用，获取暂存的待翻译文本
@@ -571,39 +531,59 @@ pub async fn get_pending_translate_text() -> Result<String, String> {
 /// 打开翻译选中文字结果窗口
 #[tauri::command]
 pub async fn open_translate_result_window(app: tauri::AppHandle, text: String) -> Result<(), String> {
-    let label = "translate-result";
+    let _creation = super::WINDOW_CREATION.lock().await;
+    super::run_blocking("open_translate_result_window", move || {
+        let label = "translate-result";
 
-    if let Some(window) = app.get_webview_window(label) {
-        let _ = window.emit("translate-result-update", &text);
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_always_on_top(true);
-        let _ = window.set_focus();
-        return Ok(());
-    }
+        // Save before checking existence: the webview may exist before its listener.
+        *PENDING_TRANSLATE_TEXT.lock().unwrap() = text.clone();
 
-    // 暂存文本
-    *PENDING_TRANSLATE_TEXT.lock().unwrap() = text;
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.emit("translate-result-update", &text);
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_always_on_top(true);
+            let _ = window.set_focus();
+            return Ok(());
+        }
 
-    let _window = tauri::WebviewWindowBuilder::new(
-        &app,
-        label,
-        tauri::WebviewUrl::App("/translate-result".into()),
-    )
-    .title("翻译选中文字")
-    .inner_size(520.0, 420.0)
-    .min_inner_size(360.0, 300.0)
-    .decorations(false)
-    .transparent(true)
-    .shadow(true)
-    .visible(false)
-    .resizable(true)
-    .always_on_top(true)
-    .center()
-    .build()
-    .map_err(|e| format!("创建翻译结果窗口失败: {}", e))?;
+        crate::webview_runtime::ensure_runtime_current(&app)?;
+        let creation_guard = crate::webview_runtime::WindowCreationGuard::start(&app, label);
+        let page_load_guard = creation_guard.clone();
+        let build_result = tauri::WebviewWindowBuilder::new(
+            &app,
+            label,
+            tauri::WebviewUrl::App("/translate-result".into()),
+        )
+        .title("翻译选中文字")
+        .inner_size(520.0, 420.0)
+        .min_inner_size(360.0, 300.0)
+        .decorations(false)
+        .transparent(true)
+        .shadow(true)
+        .visible(false)
+        .resizable(true)
+        .always_on_top(true)
+        .center()
+        .on_page_load(move |window, payload| {
+            page_load_guard.on_page_load(&window, &payload);
+        })
+        .build();
+        match build_result {
+            Ok(_) => {}
+            Err(error) => {
+                creation_guard.cancel();
+                return Err(crate::webview_runtime::window_operation_error(
+                    &app,
+                    label,
+                    "创建翻译结果窗口失败",
+                    error,
+                ));
+            }
+        }
 
-    Ok(())
+        Ok(())
+    }).await
 }
 
 /// 注册翻译选中文字快捷键
@@ -644,8 +624,10 @@ pub fn register_translate_selection_shortcut(app: &tauri::AppHandle) {
         &shortcut_str,
         std::sync::Arc::new(|app, key_state| {
             if key_state == crate::hotkey::KeyState::Pressed {
+                let Some(guard) = super::activity::ActivityGuard::acquire(&SELECTION_ACTIVE) else { return; };
                 let app = app.clone();
                 std::thread::spawn(move || {
+                    let _guard = guard;
                     trigger_translate_selection(&app);
                 });
             }
@@ -701,6 +683,8 @@ fn trigger_translate_selection(app: &tauri::AppHandle) {
         }
         Err(e) => {
             tracing::error!("获取选中文字失败: {}", e);
+            use tauri_plugin_notification::NotificationExt;
+            let _ = app.notification().builder().title("翻译选中文字").body(&e).show();
         }
     }
 }
@@ -735,4 +719,42 @@ pub async fn update_translate_selection_shortcut(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{microsoft_language_code, microsoft_translate_url, parse_microsoft_translation};
+
+    #[test]
+    fn microsoft_endpoint_uses_current_unauthenticated_route() {
+        assert_eq!(
+            microsoft_translate_url("auto", "zh"),
+            "https://edge.microsoft.com/translate/translatetext?from=&to=zh-Hans&isEnterpriseClient=false"
+        );
+        assert_eq!(microsoft_language_code("zh-CN"), "zh-Hans");
+        assert_eq!(microsoft_language_code("zh-TW"), "zh-Hant");
+    }
+
+    #[test]
+    fn microsoft_response_parser_reads_translation_text() {
+        let response = serde_json::json!([
+            {
+                "translations": [
+                    { "text": "你好，世界！", "to": "zh-Hans" }
+                ]
+            }
+        ]);
+        assert_eq!(
+            parse_microsoft_translation(&response).unwrap(),
+            "你好，世界！"
+        );
+    }
+
+    #[test]
+    fn microsoft_response_parser_rejects_empty_or_invalid_results() {
+        assert!(parse_microsoft_translation(&serde_json::json!([])).is_err());
+        assert!(parse_microsoft_translation(&serde_json::json!([
+            { "translations": [{ "text": "" }] }
+        ])).is_err());
+    }
 }

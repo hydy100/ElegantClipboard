@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { logError } from "@/lib/logger";
+import { singleFlight } from "@/lib/single-flight";
 import { useTranslateSettings, type TranslateProvider } from "@/stores/translate-settings";
+
+const loadTranslationSettings = singleFlight(() => useTranslateSettings.getState().loadSettings());
 
 // 语言列表
 export const LANGUAGES = [
@@ -59,7 +62,10 @@ function getProxyArgs(): { proxyMode: string; proxyUrl: string } {
 
 // 主翻译函数
 export async function translateText(text: string): Promise<string> {
+  // A newly created selection/OCR window can receive text before settings IPC finishes.
+  if (!useTranslateSettings.getState().loaded) await loadTranslationSettings();
   const settings = useTranslateSettings.getState();
+  if (!settings.loaded) throw new Error("翻译设置加载失败，请重试");
   if (!settings.enabled) throw new Error("翻译功能未启用");
 
   const { from, to } = resolveLanguages(text);
