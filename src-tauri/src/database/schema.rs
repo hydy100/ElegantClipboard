@@ -20,7 +20,7 @@ CREATE INDEX IF NOT EXISTS idx_item_tags_tag ON item_tags(tag_id);
 -- Clipboard items table
 CREATE TABLE IF NOT EXISTS clipboard_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    content_type TEXT NOT NULL CHECK(content_type IN ('text', 'image', 'html', 'rtf', 'files', 'video')),
+    content_type TEXT NOT NULL,
     text_content TEXT,
     html_content TEXT,
     rtf_content TEXT,
@@ -100,6 +100,7 @@ pub enum ContentType {
     Rtf,
     Files,
     Video,
+    Url,
 }
 
 impl ContentType {
@@ -111,6 +112,7 @@ impl ContentType {
             ContentType::Rtf => "rtf",
             ContentType::Files => "files",
             ContentType::Video => "video",
+            ContentType::Url => "url",
         }
     }
 

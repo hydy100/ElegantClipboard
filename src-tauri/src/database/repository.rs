@@ -1,5 +1,5 @@
 use super::{ContentType, Database};
-use crate::clipboard::semantic_hash_from_text;
+use crate::clipboard::{canonical_url_text, semantic_hash_from_text};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, Row, Transaction};
 use serde::{Deserialize, Serialize};
@@ -774,21 +774,30 @@ impl ClipboardRepository {
     /// 更新文本内容（编辑功能）
     pub fn update_text_content(&self, id: i64, new_text: &str) -> Result<(), rusqlite::Error> {
         let conn = self.write_conn.lock();
-        let preview: String = new_text.chars().take(200).collect();
-        let byte_size = new_text.len() as i64;
-        let char_count = new_text.chars().count() as i64;
+        let is_url = canonical_url_text(new_text).is_some();
+        let stored_text = canonical_url_text(new_text)
+            .unwrap_or(new_text)
+            .to_string();
+        let preview: String = stored_text.chars().take(200).collect();
+        let byte_size = stored_text.len() as i64;
+        let char_count = stored_text.chars().count() as i64;
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"text:");
-        hasher.update(new_text.as_bytes());
+        hasher.update(if is_url { b"url:" } else { b"text:" });
+        hasher.update(stored_text.as_bytes());
         let content_hash = hasher.finalize().to_hex().to_string();
-        let semantic_hash = semantic_hash_from_text(new_text).unwrap_or_else(|| content_hash.clone());
+        let semantic_hash = if is_url {
+            content_hash.clone()
+        } else {
+            semantic_hash_from_text(&stored_text).unwrap_or_else(|| content_hash.clone())
+        };
+        let content_type = if is_url { "url" } else { "text" };
 
-        // 降级为 text 类型，清除 html/rtf 内容
+        // 编辑后按新的内容重新分类，清除旧的 html/rtf 内容。
         conn.execute(
             "UPDATE clipboard_items SET text_content = ?1, preview = ?2, content_hash = ?3, semantic_hash = ?4, \
-             byte_size = ?5, char_count = ?6, content_type = 'text', \
-             html_content = NULL, rtf_content = NULL WHERE id = ?7",
-            params![new_text, preview, content_hash, semantic_hash, byte_size, char_count, id],
+             byte_size = ?5, char_count = ?6, content_type = ?7, \
+             html_content = NULL, rtf_content = NULL WHERE id = ?8",
+            params![stored_text, preview, content_hash, semantic_hash, byte_size, char_count, content_type, id],
         )?;
         debug!("Updated text content for item {}", id);
         Ok(())
@@ -931,6 +940,43 @@ impl ClipboardRepository {
         Ok(items)
     }
 
+    /// 查询所有包含外部媒体引用的条目，用于同步后的路径修复和下载规划。
+    pub fn query_media_items(&self) -> Result<Vec<ClipboardItem>, rusqlite::Error> {
+        let conn = self.read_conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT * FROM clipboard_items\
+             WHERE content_type IN ('image', 'files', 'video')\
+                OR image_path IS NOT NULL\
+                OR source_app_icon IS NOT NULL\
+                OR file_paths IS NOT NULL\
+             ORDER BY created_at DESC",
+        )?;
+        let items = stmt
+            .query_map([], Self::row_to_item)?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(items)
+    }
+
+    /// 更新同步导入后修复的媒体路径和文件存在状态。
+    pub fn update_item_media_paths(
+        &self,
+        id: i64,
+        image_path: Option<&str>,
+        file_paths: Option<&str>,
+        source_app_icon: Option<&str>,
+        files_valid: Option<bool>,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.write_conn.lock();
+        conn.execute(
+            "UPDATE clipboard_items\
+             SET image_path = ?1, file_paths = ?2, source_app_icon = ?3, files_valid = ?4\
+             WHERE id = ?5",
+            params![image_path, file_paths, source_app_icon, files_valid, id],
+        )?;
+        Ok(())
+    }
+
     /// 查询所有 files 类型条目的 (id, file_paths, current_files_valid)
     pub fn get_file_items_for_validity_check(&self) -> Result<Vec<(i64, String, Option<bool>)>, rusqlite::Error> {
         let conn = self.read_conn.lock();
@@ -946,7 +992,8 @@ impl ClipboardRepository {
     /// 批量更新 files_valid，仅更新实际变化的行，返回变化数
     pub fn batch_update_files_valid(&self, updates: &[(i64, bool)]) -> Result<usize, rusqlite::Error> {
         let conn = self.write_conn.lock();
-        let mut stmt = conn.prepare_cached(
+        let tx = conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare_cached(
             "UPDATE clipboard_items SET files_valid = ?1 WHERE id = ?2 AND (files_valid IS NULL OR files_valid != ?1)"
         )?;
         let mut changed = 0usize;
@@ -955,26 +1002,9 @@ impl ClipboardRepository {
                 changed += 1;
             }
         }
+        drop(stmt);
+        tx.commit()?;
         Ok(changed)
-    }
-
-    /// 获取所有已失效的 files 类型条目的 file_paths（用于同步过滤）
-    pub fn get_invalid_file_paths_set(&self) -> std::collections::HashSet<String> {
-        let conn = self.read_conn.lock();
-        let mut set = std::collections::HashSet::new();
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT file_paths FROM clipboard_items WHERE content_type IN ('files', 'video') AND files_valid = 0 AND file_paths IS NOT NULL"
-        ) {
-            if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
-                for row in rows.flatten() {
-                    let paths: Vec<String> = serde_json::from_str(&row).unwrap_or_default();
-                    for p in paths {
-                        set.insert(p);
-                    }
-                }
-            }
-        }
-        set
     }
 
     /// 查询所有 files 类型条目的 (file_paths, files_valid)，用于数据大小统计（含失效状态）

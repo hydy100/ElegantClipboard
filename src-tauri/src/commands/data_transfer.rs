@@ -3,6 +3,9 @@ use crate::config::{self, AppConfig};
 use crate::database;
 use tauri::Manager;
 
+// Import/export share staging paths and a settings-window file dialog.
+static TRANSFER_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// 将元数据 JSON 中的图标绝对路径修正为当前 icons 目录下的相应文件名
 pub(crate) fn fix_meta_icon_paths_json(json_str: &str, icons_dir: &std::path::Path) -> Option<String> {
     let mut meta: std::collections::HashMap<String, serde_json::Value> =
@@ -114,44 +117,21 @@ pub(crate) fn apply_pending_import(db_path: &std::path::Path) {
     }
 
     tracing::info!("Detected pending import: {:?}", staging);
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    let db_dir = match db_path.parent() {
-        Some(d) => d,
-        None => return,
+    let applied = match super::pending_import::replace_database(&staging, db_path) {
+        Ok(()) => {
+            if let Err(error) = fs::remove_file(&staging) {
+                tracing::warn!("Import applied, staging cleanup failed: {error}");
+            }
+            tracing::info!("Import committed through SQLite backup transaction");
+            true
+        }
+        Err(error) => {
+            tracing::error!("Import failed; original database and staging retained: {error}");
+            false
+        }
     };
 
-    let mut applied = false;
 
-    for attempt in 1..=10 {
-        let deleted = ["", "-wal", "-shm"].iter().all(|ext| {
-            let f = db_dir.join(format!("clipboard.db{ext}"));
-            !f.exists() || fs::remove_file(&f).is_ok()
-        });
-
-        if deleted && fs::rename(&staging, db_path).is_ok() {
-            tracing::info!("Import staging applied (attempt {attempt})");
-            applied = true;
-            break;
-        }
-
-        if attempt < 10 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-    }
-
-    if !applied {
-        tracing::error!("Rename failed after 10 attempts, trying copy fallback");
-        if fs::copy(&staging, db_path).is_ok() {
-            let _ = fs::remove_file(&staging);
-            tracing::info!("Import applied via copy fallback");
-            applied = true;
-        } else {
-            tracing::error!("Import staging completely failed");
-        }
-    }
-
-    // 导入的数据库可能来自其他设备，清除 device_id 并修正元数据中的图标路径
     if applied {
         if let Ok(conn) = rusqlite::Connection::open(db_path) {
             let _ = conn.execute("DELETE FROM settings WHERE key = 'device_id'", []);
@@ -200,58 +180,64 @@ pub fn check_path_has_data(path: String) -> bool {
 }
 
 #[tauri::command]
-pub fn cleanup_data_at_path(path: String) -> Result<(), String> {
-    use std::fs;
-    let p = std::path::PathBuf::from(&path);
+pub async fn cleanup_data_at_path(path: String) -> Result<(), String> {
+    super::run_blocking("cleanup_data_at_path", move || {
+        use std::fs;
+        let p = std::path::PathBuf::from(&path);
 
-    for ext in &["", "-wal", "-shm"] {
-        let db_file = p.join(format!("clipboard.db{}", ext));
-        if db_file.exists() {
-            fs::remove_file(&db_file).map_err(|e| format!("删除 {:?} 失败: {}", db_file, e))?;
+        for ext in &["", "-wal", "-shm"] {
+            let db_file = p.join(format!("clipboard.db{}", ext));
+            if db_file.exists() {
+                fs::remove_file(&db_file).map_err(|e| format!("删除 {:?} 失败: {}", db_file, e))?;
+            }
         }
-    }
 
-    let images_dir = p.join("images");
-    if images_dir.exists() {
-        fs::remove_dir_all(&images_dir)
-            .map_err(|e| format!("删除图片目录失败: {}", e))?;
-    }
+        let images_dir = p.join("images");
+        if images_dir.exists() {
+            fs::remove_dir_all(&images_dir)
+                .map_err(|e| format!("删除图片目录失败: {}", e))?;
+        }
 
-    let icons_dir = p.join("icons");
-    if icons_dir.exists() {
-        fs::remove_dir_all(&icons_dir)
-            .map_err(|e| format!("删除图标目录失败: {}", e))?;
-    }
+        let icons_dir = p.join("icons");
+        if icons_dir.exists() {
+            fs::remove_dir_all(&icons_dir)
+                .map_err(|e| format!("删除图标目录失败: {}", e))?;
+        }
 
-    Ok(())
+        Ok(())
+    }).await
 }
 
 #[tauri::command]
-pub fn set_data_path(path: String) -> Result<(), String> {
-    let mut config = AppConfig::load();
-    config.data_path = if path.is_empty() { None } else { Some(path) };
-    config.save()
+pub async fn set_data_path(path: String) -> Result<(), String> {
+    super::run_blocking("set_data_path", move || {
+        let mut config = AppConfig::load();
+        config.data_path = if path.is_empty() { None } else { Some(path) };
+        config.save()
+    }).await
 }
 
 #[tauri::command]
-pub fn migrate_data_to_path(new_path: String) -> Result<config::MigrationResult, String> {
-    let config = AppConfig::load();
-    let old_path = config.get_data_dir();
-    let new_path = std::path::PathBuf::from(&new_path);
+pub async fn migrate_data_to_path(new_path: String) -> Result<config::MigrationResult, String> {
+    super::run_blocking("migrate_data_to_path", move || {
+        let config = AppConfig::load();
+        let old_path = config.get_data_dir();
+        let new_path = std::path::PathBuf::from(&new_path);
 
-    if old_path == new_path {
-        return Err("Source and destination paths are the same".to_string());
-    }
+        if old_path == new_path {
+            return Err("Source and destination paths are the same".to_string());
+        }
 
-    let result = config::migrate_data(&old_path, &new_path)?;
+        let result = config::migrate_data(&old_path, &new_path)?;
 
-    if result.success() {
-        let mut new_config = AppConfig::load();
-        new_config.data_path = Some(new_path.to_string_lossy().to_string());
-        new_config.save()?;
-    }
+        if result.success() {
+            let mut new_config = AppConfig::load();
+            new_config.data_path = Some(new_path.to_string_lossy().to_string());
+            new_config.save()?;
+        }
 
-    Ok(result)
+        Ok(result)
+    }).await
 }
 
 #[tauri::command]
@@ -259,332 +245,342 @@ pub async fn export_data(
     app: tauri::AppHandle,
     state: tauri::State<'_, std::sync::Arc<AppState>>,
 ) -> Result<String, String> {
-    use std::fs::{self, File};
-    use std::io::Write;
-    use tauri_plugin_dialog::DialogExt;
-    use zip::write::SimpleFileOptions;
-    use zip::ZipWriter;
+    let state = state.inner().clone();
+    super::run_blocking("export_data", move || {
+        let _transfer = super::activity::ActivityGuard::acquire(&TRANSFER_ACTIVE)
+            .ok_or_else(|| "数据导入或导出正在进行，请稍后重试".to_string())?;
+        use std::fs::{self, File};
+        use std::io::Write;
+        use tauri_plugin_dialog::DialogExt;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
 
-    let config = AppConfig::load();
-    let data_dir = config.get_data_dir();
+        let config = AppConfig::load();
+        let data_dir = config.get_data_dir();
 
-    let export_db = data_dir.join("clipboard.db.export");
-    {
-        let src_conn = state.db.write_connection();
-        let src_conn = src_conn.lock();
-        let _ = fs::remove_file(&export_db);
-        let mut dst_conn = rusqlite::Connection::open(&export_db)
-            .map_err(|e| format!("创建备份文件失败: {}", e))?;
-        let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)
-            .map_err(|e| format!("初始化备份失败: {}", e))?;
-        backup
-            .run_to_completion(100, std::time::Duration::from_millis(0), None)
-            .map_err(|e| format!("执行备份失败: {}", e))?;
-    }
-
-    let timestamp = chrono_timestamp();
-    let default_name = format!("ElegantClipboard_backup_{}.zip", timestamp);
-    demote_windows_for_dialog(&app);
-    let dest = app
-        .dialog()
-        .file()
-        .set_title("导出数据")
-        .set_file_name(&default_name)
-        .add_filter("ZIP 压缩文件", &["zip"])
-        .blocking_save_file();
-    restore_windows_after_dialog(&app);
-
-    let dest_path = match dest {
-        Some(p) => p.to_string(),
-        None => {
+        let export_db = data_dir.join("clipboard.db.export");
+        {
+            let src_conn = state.db.write_connection();
+            let src_conn = src_conn.lock();
             let _ = fs::remove_file(&export_db);
-            return Err("用户取消了导出".to_string());
+            let mut dst_conn = rusqlite::Connection::open(&export_db)
+                .map_err(|e| format!("创建备份文件失败: {}", e))?;
+            let backup = rusqlite::backup::Backup::new(&src_conn, &mut dst_conn)
+                .map_err(|e| format!("初始化备份失败: {}", e))?;
+            backup
+                .run_to_completion(100, std::time::Duration::from_millis(0), None)
+                .map_err(|e| format!("执行备份失败: {}", e))?;
         }
-    };
 
-    let file = File::create(&dest_path).map_err(|e| format!("创建文件失败: {}", e))?;
-    let mut zip = ZipWriter::new(file);
-    let options = SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+        let timestamp = chrono_timestamp();
+        let default_name = format!("ElegantClipboard_backup_{}.zip", timestamp);
+        demote_windows_for_dialog(&app);
+        let dest = app
+            .dialog()
+            .file()
+            .set_title("导出数据")
+            .set_file_name(&default_name)
+            .add_filter("ZIP 压缩文件", &["zip"])
+            .blocking_save_file();
+        restore_windows_after_dialog(&app);
 
-    zip.start_file("clipboard.db", options).map_err(|e| e.to_string())?;
-    zip.write_all(&fs::read(&export_db).map_err(|e| format!("读取数据库副本失败: {}", e))?)
-        .map_err(|e| e.to_string())?;
-    let _ = fs::remove_file(&export_db);
+        let dest_path = match dest {
+            Some(p) => p.to_string(),
+            None => {
+                let _ = fs::remove_file(&export_db);
+                return Err("用户取消了导出".to_string());
+            }
+        };
 
-    // 导出数据库引用的图片和图标文件（跳过孤立的磁盘文件）
-    let repo = database::ClipboardRepository::new(&state.db);
-    {
-        let referenced_images = repo.get_all_image_paths().unwrap_or_default();
-        let referenced_icons = repo.get_all_icon_paths().unwrap_or_default();
-        let mut exported_icon_filenames = std::collections::HashSet::new();
-        for image_path in &referenced_images {
-            let p = std::path::Path::new(image_path);
-            if p.is_file() {
-                if let Some(filename) = p.file_name() {
-                    let zip_name = format!("images/{}", filename.to_string_lossy());
-                    zip.start_file(&zip_name, options).map_err(|e| e.to_string())?;
-                    zip.write_all(&fs::read(p).map_err(|e| format!("读取图片失败: {}", e))?)
-                        .map_err(|e| e.to_string())?;
+        let file = File::create(&dest_path).map_err(|e| format!("创建文件失败: {}", e))?;
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        zip.start_file("clipboard.db", options).map_err(|e| e.to_string())?;
+        zip.write_all(&fs::read(&export_db).map_err(|e| format!("读取数据库副本失败: {}", e))?)
+            .map_err(|e| e.to_string())?;
+        let _ = fs::remove_file(&export_db);
+
+        // 导出数据库引用的图片和图标文件（跳过孤立的磁盘文件）
+        let repo = database::ClipboardRepository::new(&state.db);
+        {
+            let referenced_images = repo.get_all_image_paths().unwrap_or_default();
+            let referenced_icons = repo.get_all_icon_paths().unwrap_or_default();
+            let mut exported_icon_filenames = std::collections::HashSet::new();
+            for image_path in &referenced_images {
+                let p = std::path::Path::new(image_path);
+                if p.is_file() {
+                    if let Some(filename) = p.file_name() {
+                        let zip_name = format!("images/{}", filename.to_string_lossy());
+                        zip.start_file(&zip_name, options).map_err(|e| e.to_string())?;
+                        zip.write_all(&fs::read(p).map_err(|e| format!("读取图片失败: {}", e))?)
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
             }
-        }
-        for icon_path in &referenced_icons {
-            let p = std::path::Path::new(icon_path);
-            if p.is_file() {
+            for icon_path in &referenced_icons {
+                let p = std::path::Path::new(icon_path);
+                if p.is_file() {
+                    if let Some(filename) = p.file_name() {
+                        let filename_str = filename.to_string_lossy().to_string();
+                        let zip_name = format!("icons/{}", filename_str);
+                        zip.start_file(&zip_name, options).map_err(|e| e.to_string())?;
+                        zip.write_all(&fs::read(p).map_err(|e| format!("读取图标失败: {}", e))?)
+                            .map_err(|e| e.to_string())?;
+                        exported_icon_filenames.insert(filename_str);
+                    }
+                }
+            }
+            // 补充导出过滤/排除列表元数据引用的图标文件（可能未被剪贴板条目引用）
+            let settings_repo = database::SettingsRepository::new(&state.db);
+            let meta_icon_paths = collect_meta_icon_paths(&settings_repo);
+            for icon_path in &meta_icon_paths {
+                let p = std::path::Path::new(icon_path);
                 if let Some(filename) = p.file_name() {
                     let filename_str = filename.to_string_lossy().to_string();
-                    let zip_name = format!("icons/{}", filename_str);
-                    zip.start_file(&zip_name, options).map_err(|e| e.to_string())?;
-                    zip.write_all(&fs::read(p).map_err(|e| format!("读取图标失败: {}", e))?)
-                        .map_err(|e| e.to_string())?;
-                    exported_icon_filenames.insert(filename_str);
+                    if exported_icon_filenames.contains(&filename_str) {
+                        continue;
+                    }
+                    if p.is_file() {
+                        let zip_name = format!("icons/{}", filename_str);
+                        zip.start_file(&zip_name, options).map_err(|e| e.to_string())?;
+                        zip.write_all(&fs::read(p).map_err(|e| format!("读取图标失败: {}", e))?)
+                            .map_err(|e| e.to_string())?;
+                        exported_icon_filenames.insert(filename_str);
+                    }
                 }
             }
         }
-        // 补充导出过滤/排除列表元数据引用的图标文件（可能未被剪贴板条目引用）
-        let settings_repo = database::SettingsRepository::new(&state.db);
-        let meta_icon_paths = collect_meta_icon_paths(&settings_repo);
-        for icon_path in &meta_icon_paths {
-            let p = std::path::Path::new(icon_path);
-            if let Some(filename) = p.file_name() {
-                let filename_str = filename.to_string_lossy().to_string();
-                if exported_icon_filenames.contains(&filename_str) {
+
+        // 导出剪贴板引用的文件和视频（去重，跳过已失效，按类型分文件夹）
+        // 同一内容（blake3 hash 相同）只保存一份，多个路径共享同一 ZIP 条目
+        let rows = repo.get_file_items_for_export().map_err(|e| e.to_string())?;
+        let mut seen_paths = std::collections::HashSet::<String>::new();
+        let mut seen_zip_paths = std::collections::HashSet::<String>::new();
+        // files_manifest: 原始绝对路径 -> ZIP 内相对路径（多个路径可指向同一 zip_rel）
+        let mut files_manifest = std::collections::HashMap::<String, String>::new();
+        // hash -> 已写入的 zip_rel，用于内容级去重
+        let mut hash_to_zip_rel = std::collections::HashMap::<String, String>::new();
+        let mut files_exported = 0u32;
+        let mut files_deduped = 0u32;
+
+        for (content_type, paths_json, files_valid) in &rows {
+            if *files_valid == Some(false) {
+                continue;
+            }
+            let folder = if content_type == "video" { "videos" } else { "files" };
+            let paths: Vec<String> = serde_json::from_str(paths_json).unwrap_or_default();
+            for abs_path in &paths {
+                if !seen_paths.insert(abs_path.clone()) {
                     continue;
                 }
-                if p.is_file() {
-                    let zip_name = format!("icons/{}", filename_str);
-                    zip.start_file(&zip_name, options).map_err(|e| e.to_string())?;
-                    zip.write_all(&fs::read(p).map_err(|e| format!("读取图标失败: {}", e))?)
-                        .map_err(|e| e.to_string())?;
-                    exported_icon_filenames.insert(filename_str);
+                let p = std::path::Path::new(abs_path);
+                if !p.is_file() {
+                    continue;
                 }
-            }
-        }
-    }
 
-    // 导出剪贴板引用的文件和视频（去重，跳过已失效，按类型分文件夹）
-    // 同一内容（blake3 hash 相同）只保存一份，多个路径共享同一 ZIP 条目
-    let rows = repo.get_file_items_for_export().map_err(|e| e.to_string())?;
-    let mut seen_paths = std::collections::HashSet::<String>::new();
-    let mut seen_zip_paths = std::collections::HashSet::<String>::new();
-    // files_manifest: 原始绝对路径 -> ZIP 内相对路径（多个路径可指向同一 zip_rel）
-    let mut files_manifest = std::collections::HashMap::<String, String>::new();
-    // hash -> 已写入的 zip_rel，用于内容级去重
-    let mut hash_to_zip_rel = std::collections::HashMap::<String, String>::new();
-    let mut files_exported = 0u32;
-    let mut files_deduped = 0u32;
-
-    for (content_type, paths_json, files_valid) in &rows {
-        if *files_valid == Some(false) {
-            continue;
-        }
-        let folder = if content_type == "video" { "videos" } else { "files" };
-        let paths: Vec<String> = serde_json::from_str(paths_json).unwrap_or_default();
-        for abs_path in &paths {
-            if !seen_paths.insert(abs_path.clone()) {
-                continue;
-            }
-            let p = std::path::Path::new(abs_path);
-            if !p.is_file() {
-                continue;
-            }
-
-            // 先流式计算 hash（不读入内存），用于去重判断
-            let hash = {
-                let mut file = match std::fs::File::open(p) {
-                    Ok(f) => f,
-                    Err(_) => continue,
+                // 先流式计算 hash（不读入内存），用于去重判断
+                let hash = {
+                    let mut file = match std::fs::File::open(p) {
+                        Ok(f) => f,
+                        Err(_) => continue,
+                    };
+                    let mut hasher = blake3::Hasher::new();
+                    if std::io::copy(&mut file, &mut hasher).is_err() {
+                        continue;
+                    }
+                    hasher.finalize().to_hex().to_string()
                 };
-                let mut hasher = blake3::Hasher::new();
-                if std::io::copy(&mut file, &mut hasher).is_err() {
+
+                // 相同内容已写入过 ZIP，直接复用其路径（无需读取文件内容）
+                if let Some(existing_zip_rel) = hash_to_zip_rel.get(&hash) {
+                    files_manifest.insert(abs_path.clone(), existing_zip_rel.clone());
+                    files_deduped += 1;
                     continue;
                 }
-                hasher.finalize().to_hex().to_string()
-            };
 
-            // 相同内容已写入过 ZIP，直接复用其路径（无需读取文件内容）
-            if let Some(existing_zip_rel) = hash_to_zip_rel.get(&hash) {
-                files_manifest.insert(abs_path.clone(), existing_zip_rel.clone());
-                files_deduped += 1;
-                continue;
+                let filename = p.file_name().unwrap_or_default().to_string_lossy();
+                // 使用文件内容 hash 作为前缀避免同名冲突
+                let mut zip_rel = format!("{}/{}/{}", folder, &hash[..8], filename);
+                // 防止 hash 前缀+文件名碰撞导致 ZIP 内重复路径
+                let mut counter = 1u32;
+                while !seen_zip_paths.insert(zip_rel.clone()) {
+                    zip_rel = format!("{}/{}_{}/{}", folder, &hash[..8], counter, filename);
+                    counter += 1;
+                }
+                zip.start_file(&zip_rel, options).map_err(|e| e.to_string())?;
+                // 流式写入 ZIP，避免将大文件完整读入内存
+                let mut file = std::fs::File::open(p)
+                    .map_err(|e| format!("打开文件失败 {}: {}", abs_path, e))?;
+                std::io::copy(&mut file, &mut zip).map_err(|e| e.to_string())?;
+                files_manifest.insert(abs_path.clone(), zip_rel.clone());
+                hash_to_zip_rel.insert(hash, zip_rel);
+                files_exported += 1;
             }
+        }
 
-            let filename = p.file_name().unwrap_or_default().to_string_lossy();
-            // 使用文件内容 hash 作为前缀避免同名冲突
-            let mut zip_rel = format!("{}/{}/{}", folder, &hash[..8], filename);
-            // 防止 hash 前缀+文件名碰撞导致 ZIP 内重复路径
-            let mut counter = 1u32;
-            while !seen_zip_paths.insert(zip_rel.clone()) {
-                zip_rel = format!("{}/{}_{}/{}", folder, &hash[..8], counter, filename);
-                counter += 1;
+        // 写入文件映射表
+        if !files_manifest.is_empty() {
+            let manifest_json = serde_json::to_string_pretty(&files_manifest)
+                .map_err(|e| format!("序列化文件映射失败: {}", e))?;
+            zip.start_file("files_manifest.json", options).map_err(|e| e.to_string())?;
+            zip.write_all(manifest_json.as_bytes()).map_err(|e| e.to_string())?;
+        }
+
+        zip.finish().map_err(|e| e.to_string())?;
+
+        let size = fs::metadata(&dest_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let mut msg = format!("导出成功 ({})", format_size(size));
+        if files_exported > 0 {
+            msg.push_str(&format!("，含 {} 个文件", files_exported));
+            if files_deduped > 0 {
+                msg.push_str(&format!("（去重 {} 个）", files_deduped));
             }
-            zip.start_file(&zip_rel, options).map_err(|e| e.to_string())?;
-            // 流式写入 ZIP，避免将大文件完整读入内存
-            let mut file = std::fs::File::open(p)
-                .map_err(|e| format!("打开文件失败 {}: {}", abs_path, e))?;
-            std::io::copy(&mut file, &mut zip).map_err(|e| e.to_string())?;
-            files_manifest.insert(abs_path.clone(), zip_rel.clone());
-            hash_to_zip_rel.insert(hash, zip_rel);
-            files_exported += 1;
         }
-    }
-
-    // 写入文件映射表
-    if !files_manifest.is_empty() {
-        let manifest_json = serde_json::to_string_pretty(&files_manifest)
-            .map_err(|e| format!("序列化文件映射失败: {}", e))?;
-        zip.start_file("files_manifest.json", options).map_err(|e| e.to_string())?;
-        zip.write_all(manifest_json.as_bytes()).map_err(|e| e.to_string())?;
-    }
-
-    zip.finish().map_err(|e| e.to_string())?;
-
-    let size = fs::metadata(&dest_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let mut msg = format!("导出成功 ({})", format_size(size));
-    if files_exported > 0 {
-        msg.push_str(&format!("，含 {} 个文件", files_exported));
-        if files_deduped > 0 {
-            msg.push_str(&format!("（去重 {} 个）", files_deduped));
-        }
-    }
-    Ok(msg)
+        Ok(msg)
+    }).await
 }
 
 #[tauri::command]
 pub async fn import_data(app: tauri::AppHandle) -> Result<String, String> {
-    use std::fs::{self, File};
-    use std::io::Read;
-    use tauri_plugin_dialog::DialogExt;
+    super::run_blocking("import_data", move || {
+        let _transfer = super::activity::ActivityGuard::acquire(&TRANSFER_ACTIVE)
+            .ok_or_else(|| "数据导入或导出正在进行，请稍后重试".to_string())?;
+        use std::fs::{self, File};
+        use std::io::Read;
+        use tauri_plugin_dialog::DialogExt;
 
-    let config = AppConfig::load();
-    let data_dir = config.get_data_dir();
+        let config = AppConfig::load();
+        let data_dir = config.get_data_dir();
 
-    demote_windows_for_dialog(&app);
-    let src = app
-        .dialog()
-        .file()
-        .set_title("导入数据")
-        .add_filter("ZIP 压缩文件", &["zip"])
-        .blocking_pick_file();
-    restore_windows_after_dialog(&app);
+        demote_windows_for_dialog(&app);
+        let src = app
+            .dialog()
+            .file()
+            .set_title("导入数据")
+            .add_filter("ZIP 压缩文件", &["zip"])
+            .blocking_pick_file();
+        restore_windows_after_dialog(&app);
 
-    let src_path = match src {
-        Some(p) => p.to_string(),
-        None => return Err("用户取消了导入".to_string()),
-    };
+        let src_path = match src {
+            Some(p) => p.to_string(),
+            None => return Err("用户取消了导入".to_string()),
+        };
 
-    let file = File::open(&src_path).map_err(|e| format!("打开文件失败: {}", e))?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("无效的 ZIP 文件: {}", e))?;
+        let file = File::open(&src_path).map_err(|e| format!("打开文件失败: {}", e))?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("无效的 ZIP 文件: {}", e))?;
 
-    let has_db = (0..archive.len()).any(|i| {
-        archive
-            .by_index(i)
-            .map(|f| f.name() == "clipboard.db")
-            .unwrap_or(false)
-    });
-    if !has_db {
-        return Err("ZIP 文件中未找到 clipboard.db，不是有效的备份文件".to_string());
-    }
-
-    fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
-
-    // 先提取 files_manifest.json（如果存在）
-    let files_manifest: std::collections::HashMap<String, String> = {
-        match archive.by_name("files_manifest.json") {
-            Ok(mut entry) => {
-                let mut json = String::new();
-                entry.read_to_string(&mut json).unwrap_or_default();
-                serde_json::from_str(&json).unwrap_or_default()
-            }
-            Err(_) => std::collections::HashMap::new(),
+        let has_db = (0..archive.len()).any(|i| {
+            archive
+                .by_index(i)
+                .map(|f| f.name() == "clipboard.db")
+                .unwrap_or(false)
+        });
+        if !has_db {
+            return Err("ZIP 文件中未找到 clipboard.db，不是有效的备份文件".to_string());
         }
-    };
 
-    // 反向映射：ZIP 相对路径 -> 所有原始绝对路径（同一 hash 的文件共享同一条目）
-    let mut reverse_manifest: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    for (abs_path, zip_rel) in &files_manifest {
-        reverse_manifest.entry(zip_rel.clone()).or_default().push(abs_path.clone());
-    }
+        fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
 
-    let mut files_extracted = 0u32;
-    let mut files_restored = 0u32;
+        // 先提取 files_manifest.json（如果存在）
+        let files_manifest: std::collections::HashMap<String, String> = {
+            match archive.by_name("files_manifest.json") {
+                Ok(mut entry) => {
+                    let mut json = String::new();
+                    entry.read_to_string(&mut json).unwrap_or_default();
+                    serde_json::from_str(&json).unwrap_or_default()
+                }
+                Err(_) => std::collections::HashMap::new(),
+            }
+        };
 
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
-        let name = entry.name().to_string();
+        // 反向映射：ZIP 相对路径 -> 所有原始绝对路径（同一 hash 的文件共享同一条目）
+        let mut reverse_manifest: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for (abs_path, zip_rel) in &files_manifest {
+            reverse_manifest.entry(zip_rel.clone()).or_default().push(abs_path.clone());
+        }
 
-        let rel_path = match sanitize_zip_relative_path(&name) {
-            Some(path) => path,
-            None => {
-                tracing::warn!("Skipping unsafe zip entry path: {}", name);
+        let mut files_extracted = 0u32;
+        let mut files_restored = 0u32;
+
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+            let name = entry.name().to_string();
+
+            let rel_path = match sanitize_zip_relative_path(&name) {
+                Some(path) => path,
+                None => {
+                    tracing::warn!("Skipping unsafe zip entry path: {}", name);
+                    continue;
+                }
+            };
+
+            // 跳过 manifest 自身和临时数据库文件
+            if name == "files_manifest.json" {
                 continue;
             }
-        };
+            if rel_path.ends_with("clipboard.db-wal") || rel_path.ends_with("clipboard.db-shm") {
+                continue;
+            }
 
-        // 跳过 manifest 自身和临时数据库文件
-        if name == "files_manifest.json" {
-            continue;
-        }
-        if rel_path.ends_with("clipboard.db-wal") || rel_path.ends_with("clipboard.db-shm") {
-            continue;
-        }
-
-        // 文件/视频：读取一次，释放到所有原始绝对路径
-        if name.starts_with("files/") || name.starts_with("videos/") {
-            if let Some(original_paths) = reverse_manifest.get(&name) {
-                if !entry.is_dir() {
-                    let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-                    for original_path in original_paths {
-                        let out = std::path::PathBuf::from(original_path);
-                        if let Some(parent) = out.parent() {
-                            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            // 文件/视频：读取一次，释放到所有原始绝对路径
+            if name.starts_with("files/") || name.starts_with("videos/") {
+                if let Some(original_paths) = reverse_manifest.get(&name) {
+                    if !entry.is_dir() {
+                        let mut buf = Vec::new();
+                        entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+                        for original_path in original_paths {
+                            let out = std::path::PathBuf::from(original_path);
+                            if let Some(parent) = out.parent() {
+                                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                            }
+                            fs::write(&out, &buf)
+                                .map_err(|e| format!("写入 {} 失败: {}", original_path, e))?;
+                            files_restored += 1;
                         }
-                        fs::write(&out, &buf)
-                            .map_err(|e| format!("写入 {} 失败: {}", original_path, e))?;
-                        files_restored += 1;
+                        files_extracted += 1;
                     }
-                    files_extracted += 1;
                 }
+                continue;
             }
-            continue;
+
+            // 确定输出路径
+            let out_path = if rel_path == std::path::Path::new("clipboard.db") {
+                data_dir.join("clipboard.db.import")
+            } else {
+                // images/, icons/ 等资产目录恢复到 data_dir
+                data_dir.join(&rel_path)
+            };
+
+            if entry.is_dir() {
+                fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+            } else {
+                if let Some(parent) = out_path.parent() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+                fs::write(&out_path, &buf)
+                    .map_err(|e| format!("写入 {} 失败: {}", name, e))?;
+                files_extracted += 1;
+            }
         }
 
-        // 确定输出路径
-        let out_path = if rel_path == std::path::Path::new("clipboard.db") {
-            data_dir.join("clipboard.db.import")
-        } else {
-            // images/, icons/ 等资产目录恢复到 data_dir
-            data_dir.join(&rel_path)
-        };
-
-        if entry.is_dir() {
-            fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
-        } else {
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-            fs::write(&out_path, &buf)
-                .map_err(|e| format!("写入 {} 失败: {}", name, e))?;
-            files_extracted += 1;
+        let mut msg = format!("导入成功，共恢复 {} 个文件", files_extracted);
+        if files_restored > 0 {
+            msg.push_str(&format!("（含 {} 个文件/视频已释放到原始路径）", files_restored));
         }
-    }
-
-    let mut msg = format!("导入成功，共恢复 {} 个文件", files_extracted);
-    if files_restored > 0 {
-        msg.push_str(&format!("（含 {} 个文件/视频已释放到原始路径）", files_restored));
-    }
-    msg.push_str("，应用即将重启");
-    Ok(msg)
+        msg.push_str("，应用即将重启");
+        Ok(msg)
+    }).await
 }
 
 #[tauri::command]
 pub fn restart_app(app: tauri::AppHandle) {
+    crate::webview_runtime::mark_intentional_exit();
     crate::commands::window::save_main_window_placement(&app);
     if crate::admin_launch::restart_app() {
         app.exit(0);

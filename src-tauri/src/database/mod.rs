@@ -6,7 +6,7 @@ pub use repository::*;
 pub use repos::*;
 pub use schema::*;
 
-use crate::clipboard::compute_semantic_hash;
+use crate::clipboard::{compute_semantic_hash, is_url};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OpenFlags};
 use std::path::PathBuf;
@@ -82,6 +82,8 @@ impl Database {
 
     /// 数据库迁移（在 schema 创建前执行）
     fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+        Self::recover_orphan_clipboard_items_table(conn)?;
+
         let table_exists: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='clipboard_items'",
             [],
@@ -189,7 +191,7 @@ impl Database {
             tx.execute_batch(
                 "CREATE TABLE clipboard_items_new (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    content_type TEXT NOT NULL CHECK(content_type IN ('text', 'image', 'html', 'rtf', 'files', 'video')),
+                    content_type TEXT NOT NULL,
                     text_content TEXT,
                     html_content TEXT,
                     rtf_content TEXT,
@@ -381,7 +383,7 @@ impl Database {
             tx.execute_batch(
                 "CREATE TABLE clipboard_items_new (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    content_type TEXT NOT NULL CHECK(content_type IN ('text', 'image', 'html', 'rtf', 'files', 'video')),
+                    content_type TEXT NOT NULL,
                     text_content TEXT,
                     html_content TEXT,
                     rtf_content TEXT,
@@ -421,6 +423,10 @@ impl Database {
             Self::migrate_video_content_type(conn);
         }
 
+        // Migration 14: add URL as a first-class text content type and
+        // classify existing standalone links without changing their payload.
+        Self::migrate_url_content_type(conn)?;
+
         // Drop old group-related indexes (safe even if they don't exist)
         conn.execute_batch(
             "DROP INDEX IF EXISTS idx_clipboard_hash_default;
@@ -429,6 +435,40 @@ impl Database {
              CREATE INDEX IF NOT EXISTS idx_clipboard_hash ON clipboard_items(content_hash);",
         )?;
 
+        Ok(())
+    }
+
+    /// Recover a table left behind when a table-rebuild migration was
+    /// interrupted.  If the live table still exists, discard only the stale
+    /// staging table and let the normal migration sequence retry from the
+    /// intact source table.
+    fn recover_orphan_clipboard_items_table(conn: &Connection) -> Result<(), rusqlite::Error> {
+        let has_new: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='clipboard_items_new'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !has_new {
+            return Ok(());
+        }
+
+        let has_live: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='clipboard_items'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if has_live {
+            tracing::warn!("Dropping stale clipboard_items_new from interrupted migration");
+            conn.execute_batch("DROP TABLE clipboard_items_new;")?;
+        } else {
+            tracing::warn!("Recovering orphaned clipboard_items_new from interrupted migration");
+            conn.execute_batch("ALTER TABLE clipboard_items_new RENAME TO clipboard_items;")?;
+        }
         Ok(())
     }
 
@@ -472,7 +512,196 @@ impl Database {
         }
     }
 
+    fn migrate_url_content_type(conn: &Connection) -> Result<(), rusqlite::Error> {
+        let table_sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='clipboard_items'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        let Some(table_sql) = table_sql else {
+            return Ok(());
+        };
+
+        // New schemas intentionally do not constrain content_type.  Use a
+        // marker so URL backfill is performed once instead of rebuilding the
+        // table on every startup.
+        let migration_done: bool = conn
+            .query_row(
+                "SELECT COALESCE((SELECT value FROM settings WHERE key = '_migration_url_content_type' LIMIT 1), '') = 'done'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        let normalized_table_sql: String = table_sql
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|ch| !ch.is_ascii_whitespace())
+            .collect();
+        let has_content_type_check = normalized_table_sql.contains("check(content_type");
+        if migration_done {
+            return Ok(());
+        }
+
+        info!("Migrating database: adding url content_type");
+        // Older semantic-hash migrations permitted NULL/empty values. Fill
+        // them before copying into the current NOT NULL table.
+        conn.execute_batch(
+            "UPDATE clipboard_items
+             SET semantic_hash = content_hash
+             WHERE semantic_hash IS NULL OR semantic_hash = '';",
+        )?;
+
+        // `item_tags` references the parent table. SQLite cascades those rows
+        // when a referenced table is dropped, so keep foreign-key enforcement
+        // off only for this atomic table rebuild and restore it immediately.
+        if !has_content_type_check {
+            let mut stmt = conn.prepare(
+                "SELECT id, text_content FROM clipboard_items
+                 WHERE content_type = 'text' AND text_content IS NOT NULL",
+            )?;
+            let rows: Vec<(i64, String)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            drop(stmt);
+            let mut update = conn.prepare_cached(
+                "UPDATE clipboard_items SET content_type = 'url', semantic_hash = content_hash WHERE id = ?1",
+            )?;
+            for (id, text) in rows {
+                if is_url(&text) {
+                    update.execute(params![id])?;
+                }
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('_migration_url_content_type', 'done')",
+                [],
+            ).ok();
+            return Ok(());
+        }
+
+        let foreign_keys_enabled: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        if foreign_keys_enabled {
+            conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        }
+        let rebuild_result = (|| -> Result<(), rusqlite::Error> {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+            "CREATE TABLE clipboard_items_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content_type TEXT NOT NULL,
+                text_content TEXT,
+                html_content TEXT,
+                rtf_content TEXT,
+                image_path TEXT,
+                file_paths TEXT,
+                content_hash TEXT NOT NULL,
+                semantic_hash TEXT NOT NULL,
+                preview TEXT,
+                byte_size INTEGER DEFAULT 0,
+                image_width INTEGER,
+                image_height INTEGER,
+                is_pinned INTEGER DEFAULT 0,
+                is_favorite INTEGER DEFAULT 0,
+                sort_order INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now', 'localtime')),
+                updated_at TEXT DEFAULT (datetime('now', 'localtime')),
+                access_count INTEGER DEFAULT 0,
+                last_accessed_at TEXT,
+                char_count INTEGER,
+                source_app_name TEXT,
+                source_app_icon TEXT,
+                files_valid INTEGER DEFAULT 1
+            );
+            INSERT INTO clipboard_items_new (
+                id, content_type, text_content, html_content, rtf_content,
+                image_path, file_paths, content_hash, semantic_hash, preview,
+                byte_size, image_width, image_height, is_pinned, is_favorite,
+                sort_order, created_at, updated_at, access_count, last_accessed_at,
+                char_count, source_app_name, source_app_icon, files_valid
+            )
+            SELECT id, content_type, text_content, html_content, rtf_content,
+                   image_path, file_paths, content_hash,
+                   COALESCE(NULLIF(semantic_hash, ''), content_hash), preview,
+                   byte_size, image_width, image_height, is_pinned, is_favorite,
+                   sort_order, created_at, updated_at, access_count, last_accessed_at,
+                   char_count, source_app_name, source_app_icon, files_valid
+            FROM clipboard_items;
+            DROP TABLE clipboard_items;
+            ALTER TABLE clipboard_items_new RENAME TO clipboard_items;
+            CREATE INDEX IF NOT EXISTS idx_clipboard_created_at ON clipboard_items(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_clipboard_pinned ON clipboard_items(is_pinned) WHERE is_pinned = 1;
+            CREATE INDEX IF NOT EXISTS idx_clipboard_favorite ON clipboard_items(is_favorite) WHERE is_favorite = 1;
+            CREATE INDEX IF NOT EXISTS idx_clipboard_type ON clipboard_items(content_type);
+            CREATE INDEX IF NOT EXISTS idx_clipboard_hash ON clipboard_items(content_hash);
+            CREATE INDEX IF NOT EXISTS idx_clipboard_semantic_hash ON clipboard_items(semantic_hash);
+            CREATE INDEX IF NOT EXISTS idx_clipboard_access ON clipboard_items(access_count DESC, last_accessed_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_clipboard_sort_order ON clipboard_items(sort_order DESC);
+            CREATE INDEX IF NOT EXISTS idx_clipboard_main_order ON clipboard_items(is_pinned DESC, sort_order DESC, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_clipboard_type_order ON clipboard_items(content_type, is_pinned DESC, sort_order DESC, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_clipboard_favorite_order ON clipboard_items(is_favorite, is_pinned DESC, sort_order DESC, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_clipboard_clearable ON clipboard_items(is_pinned, is_favorite, content_type);
+            CREATE TRIGGER IF NOT EXISTS clipboard_items_update_timestamp
+            AFTER UPDATE ON clipboard_items
+            BEGIN
+                UPDATE clipboard_items SET updated_at = datetime('now', 'localtime') WHERE id = new.id;
+            END;",
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if foreign_keys_enabled {
+            let restore_result = conn.execute_batch("PRAGMA foreign_keys = ON;");
+            if rebuild_result.is_ok() {
+                restore_result?;
+            }
+        }
+        rebuild_result?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, text_content FROM clipboard_items
+             WHERE content_type = 'text' AND text_content IS NOT NULL",
+        )?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        drop(stmt);
+
+        let mut update = conn.prepare_cached(
+            "UPDATE clipboard_items SET content_type = 'url', semantic_hash = content_hash WHERE id = ?1",
+        )?;
+        for (id, text) in rows {
+            if is_url(&text) {
+                update.execute(params![id])?;
+            }
+        }
+
+        info!("Migration complete: url content_type added");
+        Ok(())
+    }
+
     fn backfill_semantic_hashes(conn: &Connection) -> Result<(), rusqlite::Error> {
+        // 版本守卫：已完成的迁移不再执行，避免每次启动全表扫描
+        let settings_exist: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='settings'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if settings_exist {
+            let already_done: bool = conn
+                .query_row(
+                    "SELECT COALESCE((SELECT value FROM settings WHERE key = '_migration_backfill_semantic_hash' LIMIT 1), '') = 'done'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if already_done {
+                return Ok(());
+            }
+        }
+
         let mut stmt = conn.prepare(
             "SELECT id, content_type, text_content, content_hash, semantic_hash
              FROM clipboard_items
@@ -503,24 +732,30 @@ impl Database {
         }
         drop(stmt);
 
-        if updates.is_empty() {
-            return Ok(());
+        let tx = conn.unchecked_transaction()?;
+        if !updates.is_empty() {
+            let updated_count = updates.len();
+            {
+                let mut update_stmt =
+                    tx.prepare("UPDATE clipboard_items SET semantic_hash = ?1 WHERE id = ?2")?;
+                for (id, semantic_hash) in updates {
+                    update_stmt.execute(params![semantic_hash, id])?;
+                }
+            }
+            info!(
+                "Migration complete: semantic_hash backfilled for {} rows",
+                updated_count
+            );
         }
 
-        let updated_count = updates.len();
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut update_stmt =
-                tx.prepare("UPDATE clipboard_items SET semantic_hash = ?1 WHERE id = ?2")?;
-            for (id, semantic_hash) in updates {
-                update_stmt.execute(params![semantic_hash, id])?;
-            }
+        // 写入版本标记，后续启动跳过
+        if settings_exist {
+            tx.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('_migration_backfill_semantic_hash', 'done')",
+                [],
+            )?;
         }
         tx.commit()?;
-        info!(
-            "Migration complete: semantic_hash backfilled for {} rows",
-            updated_count
-        );
         Ok(())
     }
 
@@ -571,4 +806,70 @@ pub fn get_default_db_path() -> PathBuf {
 
 pub fn get_default_images_path() -> PathBuf {
     get_app_dir().join("images")
+}
+
+#[cfg(test)]
+mod upstream_regression_tests {
+    use super::*;
+
+    fn fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE clipboard_items(id INTEGER PRIMARY KEY, content_type TEXT, text_content TEXT, content_hash TEXT, semantic_hash TEXT);
+            INSERT INTO clipboard_items VALUES(1, 'text', 'hello', 'raw', '');").unwrap();
+        conn
+    }
+    #[test]
+    fn semantic_backfill_runs_once_and_marks_empty_work() {
+        let conn = fixture();
+        Database::backfill_semantic_hashes(&conn).unwrap();
+        let expected = compute_semantic_hash("text", Some("hello"), "raw");
+        assert_eq!(conn.query_row("SELECT semantic_hash FROM clipboard_items", [], |r| r.get::<_, String>(0)).unwrap(), expected);
+        // A completed migration must not even prepare/read the old table again.
+        conn.execute_batch("DROP TABLE clipboard_items").unwrap();
+        Database::backfill_semantic_hashes(&conn).unwrap();
+        let empty = fixture();
+        empty.execute_batch("DELETE FROM clipboard_items").unwrap();
+        Database::backfill_semantic_hashes(&empty).unwrap();
+        assert_eq!(empty.query_row("SELECT value FROM settings WHERE key='_migration_backfill_semantic_hash'", [], |r| r.get::<_, String>(0)).unwrap(), "done");
+    }
+    #[test]
+    fn failed_semantic_backfill_does_not_mark_done() {
+        let conn = fixture();
+        conn.execute_batch("CREATE TRIGGER reject_backfill BEFORE UPDATE ON clipboard_items BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+        assert!(Database::backfill_semantic_hashes(&conn).is_err());
+        assert_eq!(conn.query_row("SELECT count(*) FROM settings", [], |r| r.get::<_, i32>(0)).unwrap(), 0);
+        conn.execute_batch("DROP TRIGGER reject_backfill").unwrap();
+        Database::backfill_semantic_hashes(&conn).unwrap();
+    }
+
+    #[test]
+    fn url_migration_preserves_items_and_tags() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let legacy_schema = SCHEMA_SQL.replace(", 'url'", "");
+        conn.execute_batch(&legacy_schema).unwrap();
+        conn.execute("INSERT INTO clipboard_items (content_type, text_content, content_hash, semantic_hash, preview) VALUES ('text', 'https://example.com', 'raw-url', 'legacy-semantic', 'https://example.com')", []).unwrap();
+        conn.execute("INSERT INTO tags (name) VALUES ('links')", []).unwrap();
+        conn.execute("INSERT INTO item_tags (item_id, tag_id) VALUES (1, 1)", []).unwrap();
+
+        Database::migrate_url_content_type(&conn).unwrap();
+
+        assert_eq!(conn.query_row("SELECT content_type FROM clipboard_items WHERE id = 1", [], |r| r.get::<_, String>(0)).unwrap(), "url");
+        assert_eq!(conn.query_row("SELECT semantic_hash FROM clipboard_items WHERE id = 1", [], |r| r.get::<_, String>(0)).unwrap(), "raw-url");
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM item_tags", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert!(conn.execute("INSERT INTO clipboard_items (content_type, content_hash, semantic_hash) VALUES ('url', 'new', 'new')", []).is_ok());
+    }
+
+    #[test]
+    fn interrupted_staging_table_is_discarded_when_live_table_exists() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE clipboard_items (id INTEGER PRIMARY KEY); CREATE TABLE clipboard_items_new (id INTEGER PRIMARY KEY);").unwrap();
+
+        Database::recover_orphan_clipboard_items_table(&conn).unwrap();
+
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'clipboard_items'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'clipboard_items_new'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
 }
