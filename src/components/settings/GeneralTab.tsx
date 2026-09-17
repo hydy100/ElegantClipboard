@@ -81,12 +81,14 @@ export function GeneralTab({ settings, onSettingsChange }: GeneralTabProps) {
         setToolbarButtons([...toolbarButtons, "settings"]);
       }
     }
+    const previous = showTrayIcon;
     setShowTrayIcon(visible);
     try {
       await invoke("set_tray_visible", { visible });
       // 通知其他 Tab（如显示设置）托盘图标状态变更
       emit("tray-visibility-changed", String(visible)).catch(() => {});
     } catch (error) {
+      setShowTrayIcon(previous);
       logError("Failed to set tray visibility:", error);
     }
   };
@@ -113,8 +115,6 @@ export function GeneralTab({ settings, onSettingsChange }: GeneralTabProps) {
       logError("Failed to save persist_window_size:", error);
     }
   };
-
-
 
   return (
     <>

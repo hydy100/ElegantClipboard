@@ -5,6 +5,7 @@ import {
   Delete16Regular,
 } from "@fluentui/react-icons";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { PasteKeySetting } from "@/components/settings/PasteKeySetting";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -491,6 +492,7 @@ export function ShortcutsTab({
   return (
     <>
       <div className="space-y-4">
+        <PasteKeySetting />
         {/* Hotkey Mode Card */}
         <div className="rounded-lg border bg-card p-4">
           <h3 className="text-sm font-medium mb-3">热键注册方式</h3>

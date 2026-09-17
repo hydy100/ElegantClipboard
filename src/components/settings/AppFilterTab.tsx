@@ -18,8 +18,9 @@ import { useUISettings } from "@/stores/ui-settings";
 interface AppMeta { name: string; icon: string | null }
 type RunningApp = { name: string; process: string; icon: string | null };
 
-const ALL_MONITOR_TYPES = ["text", "image", "files", "video"] as const;
+const ALL_MONITOR_TYPES = ["text", "url", "image", "files", "video"] as const;
 const TYPE_LABELS: Record<string, string> = {
+  url: "URL",
   text: "文本",
   image: "图片",
   files: "文件",
@@ -30,6 +31,7 @@ const TYPE_LABELS: Record<string, string> = {
 function uiTypesToRaw(uiTypes: Set<string>): string[] {
   const raw: string[] = [];
   if (uiTypes.has("text")) raw.push("text", "html", "rtf");
+  if (uiTypes.has("url")) raw.push("url");
   if (uiTypes.has("image")) raw.push("image");
   if (uiTypes.has("files")) raw.push("files");
   if (uiTypes.has("video")) raw.push("video");
@@ -43,6 +45,7 @@ function rawTypesToUI(rawTypes: Set<string>): Set<string> {
   if (rawTypes.has("image")) ui.add("image");
   if (rawTypes.has("files")) ui.add("files");
   if (rawTypes.has("video")) ui.add("video");
+  if (rawTypes.has("url")) ui.add("url");
   return ui;
 }
 

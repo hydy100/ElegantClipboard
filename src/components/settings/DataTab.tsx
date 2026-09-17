@@ -57,6 +57,14 @@ interface DataSizeInfo {
   total_size: number;
 }
 
+interface CleanupExpiredInvalidResult {
+  expired_count: number;
+  invalid_count: number;
+  deleted_count: number;
+  image_files_deleted: number;
+  retention_days: number;
+}
+
 function formatDataSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -232,7 +240,7 @@ export function DataTab({ settings, onSettingsChange }: DataTabProps) {
   const [dedupStrategy, setDedupStrategy] = useState<DedupStrategy>("move_to_top");
 
   // 数据清理
-  type CleanAction = "clear_history" | "reset_settings" | "reset_all";
+  type CleanAction = "clear_history" | "expired_invalid" | "reset_settings" | "reset_all";
   const [cleanDialogAction, setCleanDialogAction] = useState<CleanAction | null>(null);
   const [cleanLoading, setCleanLoading] = useState(false);
   const [cleanMsg, setCleanMsg] = useState<string | null>(null);
@@ -255,6 +263,14 @@ export function DataTab({ settings, onSettingsChange }: DataTabProps) {
       warning: "此操作将删除包括置顶和收藏在内的所有剪贴板记录，且不可恢复。",
       buttonText: "确认清空",
       command: "clear_all_history",
+      needsRestart: false,
+    },
+    expired_invalid: {
+      title: "清理过期和失效数据",
+      description: "按自动清理天数删除过期记录，并删除关联文件已经失效的记录",
+      warning: "将清理未置顶、未收藏、未加标签的过期或失效记录；置顶、收藏和已加标签的记录会保留。自动清理天数设为 0 时，仅清理失效记录。",
+      buttonText: "确认清理",
+      command: "cleanup_expired_invalid_data",
       needsRestart: false,
     },
     reset_settings: {
@@ -281,7 +297,12 @@ export function DataTab({ settings, onSettingsChange }: DataTabProps) {
     setCleanLoading(true);
     setCleanMsg(null);
     try {
-      await invoke(config.command);
+      let cleanupResult: CleanupExpiredInvalidResult | null = null;
+      if (cleanDialogAction === "expired_invalid") {
+        cleanupResult = await invoke<CleanupExpiredInvalidResult>(config.command);
+      } else {
+        await invoke(config.command);
+      }
       setCleanDialogAction(null);
       if (config.needsRestart) {
         // 清除前端持久化设置以免重启后残留
@@ -289,7 +310,11 @@ export function DataTab({ settings, onSettingsChange }: DataTabProps) {
         sessionStorage.removeItem("data-size-cache");
         await invoke("restart_app");
       } else {
-        setCleanMsg("操作成功。");
+        setCleanMsg(
+          cleanupResult
+            ? `清理完成：过期 ${cleanupResult.expired_count} 条，失效 ${cleanupResult.invalid_count} 条，共删除 ${cleanupResult.deleted_count} 条。`
+            : "操作成功。",
+        );
         await refreshDataSize();
         // 通知主窗口刷新列表
         emit("clipboard-updated").catch(() => {});
@@ -641,6 +666,22 @@ export function DataTab({ settings, onSettingsChange }: DataTabProps) {
                 {vacuumMsg}
               </p>
             )}
+            <div className="h-px bg-border" />
+            <div className="flex items-center justify-between gap-4">
+              <div className="min-w-0">
+                <p className="text-sm">清理过期和失效数据</p>
+                <p className="text-xs text-muted-foreground">按自动清理天数清理过期记录，并移除图片或文件已不存在的记录</p>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="shrink-0"
+                onClick={() => { setCleanMsg(null); setCleanDialogAction("expired_invalid"); }}
+              >
+                <Delete16Regular className="w-4 h-4 mr-1.5" />
+                清理数据
+              </Button>
+            </div>
             <div className="h-px bg-border" />
             <div className="flex items-center justify-between gap-4">
               <div className="min-w-0">

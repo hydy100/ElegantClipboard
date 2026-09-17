@@ -189,7 +189,7 @@ export const useUISettings = create<UISettings>()(
         windowEffect: "none" as WindowEffect,
         hideFavoritedFromMain: false,
         hideTaggedFromMain: false,
-        enabledMonitorTypes: ["text", "image", "files", "video"],
+        enabledMonitorTypes: ["text", "url", "image", "files", "video"],
         toolbarButtons: ["clear", "batch", "pin", "settings"] as ToolbarButton[],
         customFont: "",
         uiFontSize: 14,
@@ -367,6 +367,27 @@ export function cleanupUISettingsListener() {
   }
 }
 
+export async function repairSettingsAccess() {
+  let trayIconVisible = true;
+  try {
+    const value = await invoke<string | null>("get_setting", {
+      key: "show_tray_icon",
+    });
+    trayIconVisible = value !== "false";
+  } catch (error) {
+    logError("Failed to load tray visibility while repairing settings access:", error);
+  }
+
+  const current = useUISettings.getState().toolbarButtons;
+  const repaired =
+    !trayIconVisible && !current.includes("settings")
+      ? [...current, "settings"]
+      : current;
+  if (JSON.stringify(repaired) !== JSON.stringify(current)) {
+    useUISettings.getState().setToolbarButtons(repaired as ToolbarButton[]);
+  }
+}
+
 // 从后端数据库加载需同步的设置（用于启动初始化和云端同步下载后刷新）
 export async function loadSyncedSettings() {
   try {
@@ -392,6 +413,7 @@ export async function loadSyncedSettings() {
       if (rawSet.has("image")) uiTypes.push("image");
       if (rawSet.has("files")) uiTypes.push("files");
       if (rawSet.has("video")) uiTypes.push("video");
+      if (rawSet.has("url")) uiTypes.push("url");
       if (uiTypes.length > 0) patch.enabledMonitorTypes = uiTypes;
     }
 
@@ -427,5 +449,5 @@ export async function loadSyncedSettings() {
 // 浏览器环境自动初始化
 if (typeof window !== "undefined") {
   initUISettingsListener();
-  loadSyncedSettings();
+  void loadSyncedSettings().then(repairSettingsAccess);
 }

@@ -44,8 +44,8 @@ function TagItemRowContent({ item, timeFormat }: TagItemRowContentProps) {
   const filesInvalid = (item.content_type === "files" || item.content_type === "video") && item.files_valid === false;
   const isVideo = item.content_type === "video";
   const logicalLabel = isVideo ? contentTypeConfig.video.label : typeConfig.label;
-  const isTextLike = item.content_type === "text" || item.content_type === "html" || item.content_type === "rtf";
-  const { textPreviewAnchorRef: textRef, handleTextMouseEnter: onTextEnter, handleTextMouseLeave: onTextLeave, handleTextWheel: onTextWheel } = useTextPreview({
+  const isTextLike = item.content_type === "text" || item.content_type === "html" || item.content_type === "rtf" || item.content_type === "url";
+  const { textPreviewAnchorRef: textRef, handleTextMouseEnter: onTextEnter, handleTextMouseLeave: onTextLeave } = useTextPreview({
     itemId: item.id,
     textContent: item.text_content,
     preview: item.preview,
@@ -146,7 +146,6 @@ function TagItemRowContent({ item, timeFormat }: TagItemRowContentProps) {
       ref={textRef}
       onMouseEnter={onTextEnter}
       onMouseLeave={onTextLeave}
-      onWheel={onTextWheel}
     >
       <p className="text-xs leading-relaxed line-clamp-2 break-all text-foreground/90"><HighlightText text={truncated || "(空)"} /></p>
       <div className="flex items-center gap-1.5 mt-1">
@@ -191,7 +190,7 @@ export function SortableTagItemRow({
     opacity: isDragging ? 0.5 : undefined,
   }), [transform, transition, isDragging]);
 
-  const isEditable = item.content_type === "text" || item.content_type === "html" || item.content_type === "rtf";
+  const isEditable = item.content_type === "text" || item.content_type === "html" || item.content_type === "rtf" || item.content_type === "url";
 
   return (
     <div
@@ -226,7 +225,7 @@ export function TagItemRow({
   onRemove,
   isLast,
 }: TagItemRowProps) {
-  const isEditable = item.content_type === "text" || item.content_type === "html" || item.content_type === "rtf";
+  const isEditable = item.content_type === "text" || item.content_type === "html" || item.content_type === "rtf" || item.content_type === "url";
 
   return (
     <div

@@ -163,12 +163,15 @@ impl TagRepository {
     /// 批量更新标签内条目的排序
     pub fn reorder_tag_items(&self, tag_id: i64, item_ids: &[i64]) -> Result<(), rusqlite::Error> {
         let conn = self.write_conn.lock();
-        let mut stmt = conn.prepare(
+        let tx = conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare(
             "UPDATE item_tags SET sort_order = ?1 WHERE tag_id = ?2 AND item_id = ?3",
         )?;
         for (i, item_id) in item_ids.iter().enumerate() {
             stmt.execute(params![i as i64, tag_id, item_id])?;
         }
+        drop(stmt);
+        tx.commit()?;
         debug!("Reordered {} items in tag {}", item_ids.len(), tag_id);
         Ok(())
     }
@@ -176,10 +179,13 @@ impl TagRepository {
     /// 批量更新标签排序
     pub fn reorder_tags(&self, tag_ids: &[i64]) -> Result<(), rusqlite::Error> {
         let conn = self.write_conn.lock();
-        let mut stmt = conn.prepare("UPDATE tags SET sort_order = ?1 WHERE id = ?2")?;
+        let tx = conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare("UPDATE tags SET sort_order = ?1 WHERE id = ?2")?;
         for (i, id) in tag_ids.iter().enumerate() {
             stmt.execute(params![i as i64, id])?;
         }
+        drop(stmt);
+        tx.commit()?;
         debug!("Reordered {} tags", tag_ids.len());
         Ok(())
     }
