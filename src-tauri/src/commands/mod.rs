@@ -9,6 +9,12 @@ pub mod translate;
 pub mod ocr;
 pub mod tts;
 pub mod window;
+pub(crate) mod activity;
+mod selection;
+
+// Serialize webview creation on callers, never by locking the GUI event loop.
+// In particular, concurrent preview/translation/OCR creation must not nest pumps.
+pub(crate) static WINDOW_CREATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 use crate::clipboard::ClipboardMonitor;
 use crate::database::Database;
@@ -18,6 +24,25 @@ use std::sync::Arc;
 pub struct AppState {
     pub db: Database,
     pub monitor: ClipboardMonitor,
+}
+
+/// Keep synchronous database, filesystem and Win32 waits off Tokio's core workers.
+/// Merely marking a command `async` does not make these operations non-blocking.
+pub(crate) async fn run_blocking<T, F>(name: &'static str, work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        let start = std::time::Instant::now();
+        let result = work();
+        if start.elapsed() > std::time::Duration::from_secs(2) {
+            tracing::warn!(command = name, elapsed_ms = start.elapsed().as_millis(), "Slow blocking command");
+        }
+        result
+    })
+    .await
+    .map_err(|error| format!("{name}: {error}"))?
 }
 
 /// 多屏/高 DPI 下隐藏窗口后系统可能不自动还原前台窗口，导致 Ctrl+V 无接收者。
@@ -72,70 +97,13 @@ pub(crate) fn hide_main_window_if_not_pinned(app: &tauri::AppHandle) {
     }
 }
 
-/// 隐藏图片预览窗口（若存在）。
-/// 使用 abort 取消之前的延迟关闭任务，避免频繁触发时累积大量 pending task。
+/// All hide paths share the same destruction epoch with show/reuse.
 pub(crate) fn hide_image_preview_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    use tauri::{Emitter, Manager};
-
-    static IMAGE_CLOSE_HANDLE: std::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>> =
-        std::sync::Mutex::new(None);
-
-    if let Some(preview) = app.get_webview_window("image-preview") {
-        let _ = preview.hide();
-        let _ = preview.emit("image-preview-clear", ());
-
-        // 取消之前的延迟关闭任务
-        if let Ok(mut guard) = IMAGE_CLOSE_HANDLE.lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
-        }
-
-        let preview = preview.clone();
-        let task = tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            if !preview.is_visible().unwrap_or(false) {
-                let _ = preview.close();
-            }
-        });
-
-        if let Ok(mut guard) = IMAGE_CLOSE_HANDLE.lock() {
-            *guard = Some(task);
-        }
-    }
+    preview::hide_preview_window(app, true);
 }
 
-/// 隐藏文本预览窗口（若存在）。
-/// 使用 abort 取消之前的延迟关闭任务，避免频繁触发时累积大量 pending task。
 pub(crate) fn hide_text_preview_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    use tauri::{Emitter, Manager};
-
-    static TEXT_CLOSE_HANDLE: std::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>> =
-        std::sync::Mutex::new(None);
-
-    if let Some(preview) = app.get_webview_window("text-preview") {
-        let _ = preview.hide();
-        let _ = preview.emit("text-preview-clear", ());
-
-        // 取消之前的延迟关闭任务
-        if let Ok(mut guard) = TEXT_CLOSE_HANDLE.lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
-        }
-
-        let preview = preview.clone();
-        let task = tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            if !preview.is_visible().unwrap_or(false) {
-                let _ = preview.close();
-            }
-        });
-
-        if let Ok(mut guard) = TEXT_CLOSE_HANDLE.lock() {
-            *guard = Some(task);
-        }
-    }
+    preview::hide_preview_window(app, false);
 }
 
 /// 隐藏所有悬浮预览窗口（图片 / 文本）。
@@ -144,38 +112,21 @@ pub(crate) fn hide_preview_windows<R: tauri::Runtime>(app: &tauri::AppHandle<R>)
     hide_text_preview_window(app);
 }
 
-/// 延迟恢复监控的发送端（全局单线程处理，避免每次粘贴都 spawn 新线程）
-static RESUME_TX: std::sync::LazyLock<std::sync::mpsc::Sender<crate::clipboard::ClipboardMonitor>> =
+/// Each operation has its own deadline; continuous pastes cannot grow a debounce
+/// batch forever. The pause counter still protects overlapping operations.
+static RESUME_TX: std::sync::LazyLock<std::sync::mpsc::Sender<(std::time::Instant, ClipboardMonitor)>> =
     std::sync::LazyLock::new(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<crate::clipboard::ClipboardMonitor>();
+        let (tx, rx) = std::sync::mpsc::channel::<(std::time::Instant, ClipboardMonitor)>();
         std::thread::Builder::new()
             .name("monitor-resume".into())
             .spawn(move || {
                 loop {
-                    let first = match rx.recv() {
-                        Ok(monitor) => monitor,
+                    let (deadline, monitor) = match rx.recv() {
+                        Ok(request) => request,
                         Err(_) => return,
                     };
-                    let mut pending = vec![first];
-
-                    // 防抖恢复请求：等待 500ms 静默期后批量处理
-                    loop {
-                        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
-                            Ok(monitor) => pending.push(monitor),
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                for monitor in pending.drain(..) {
-                                    monitor.resume();
-                                }
-                                break;
-                            }
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                for monitor in pending.drain(..) {
-                                    monitor.resume();
-                                }
-                                return;
-                            }
-                        }
-                    }
+                    std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+                    monitor.resume();
                 }
             })
             .expect("failed to spawn monitor-resume thread");
@@ -183,16 +134,30 @@ static RESUME_TX: std::sync::LazyLock<std::sync::mpsc::Sender<crate::clipboard::
     });
 
 /// 暂停剪贴板监控并执行闭包，500ms 后恢复监控。
-pub(crate) fn with_paused_monitor<F, R>(state: &Arc<AppState>, f: F) -> R
+pub(crate) fn with_paused_monitor<F, T>(state: &Arc<AppState>, f: F) -> Result<T, String>
 where
-    F: FnOnce() -> R,
+    F: FnOnce() -> Result<T, String>,
 {
+    // Copy/translation/paste are transactions on one system clipboard. Never let
+    // a selection backup restore over a concurrent paste from this application.
+    static OPERATION: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let _operation = OPERATION.try_lock_for(std::time::Duration::from_secs(2))
+        .ok_or_else(|| "剪贴板操作忙，请稍后重试".to_string())?;
     state.monitor.pause();
-    let result = f();
+    let _resume = ResumeOnDrop(state.monitor.clone());
+    f()
+}
 
-    let _ = RESUME_TX.send(state.monitor.clone());
+struct ResumeOnDrop(ClipboardMonitor);
 
-    result
+impl Drop for ResumeOnDrop {
+    fn drop(&mut self) {
+        let request = (std::time::Instant::now() + std::time::Duration::from_millis(500), self.0.clone());
+        if let Err(error) = RESUME_TX.send(request) {
+            // A closed worker must not permanently disable clipboard recording.
+            error.0.1.resume();
+        }
+    }
 }
 
 /// 用系统文件管理器打开指定路径。
@@ -223,3 +188,55 @@ pub(crate) fn open_path_in_explorer(path: &std::path::Path) -> Result<(), String
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn pause_guard_restores_after_error_and_unwind_without_clearing_user_pause() {
+        let path = std::env::temp_dir().join(format!("ec-guard-{}", uuid::Uuid::new_v4()));
+        let state = Arc::new(AppState {
+            db: Database::new(path.join("clipboard.db")).unwrap(),
+            monitor: ClipboardMonitor::new(),
+        });
+        let result: Result<(), String> = with_paused_monitor(&state, || Err("clipboard busy".into()));
+        assert!(result.is_err());
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<(), String> = with_paused_monitor(&state, || panic!("injected unwind"));
+        }));
+        assert!(panicked.is_err());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while state.monitor.is_paused() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!state.monitor.is_paused(), "operation pauses leaked");
+        assert!(state.monitor.toggle_user_pause());
+        let _: Result<(), String> = with_paused_monitor(&state, || Err("busy".into()));
+        std::thread::sleep(Duration::from_millis(650));
+        assert!(state.monitor.is_paused(), "internal resume cleared manual pause");
+        assert!(!state.monitor.toggle_user_pause());
+        assert!(!state.monitor.is_paused());
+        drop(state);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn blocking_work_does_not_starve_async_timers() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel();
+            let task = tokio::spawn(run_blocking("test_blocking", move || {
+                wait.recv_timeout(Duration::from_secs(2)).map_err(|e| e.to_string())
+            }));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            release.send(()).unwrap();
+            assert!(task.await.unwrap().is_ok());
+        });
+    }
+}
+
+mod pending_import;
+
+mod paste_keys;

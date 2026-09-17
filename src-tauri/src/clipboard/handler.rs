@@ -1,5 +1,8 @@
 use super::source_app::{self, SourceAppInfo};
-use super::{compute_semantic_hash, semantic_hash_from_text};
+use super::{
+    canonical_url_text, compute_semantic_hash, is_url, normalize_rtf_for_hash,
+    semantic_hash_from_text,
+};
 use crate::database::{
     ClipboardRepository, ContentType, Database, NewClipboardItem, SettingsRepository,
 };
@@ -264,6 +267,7 @@ impl ClipboardHandler {
         };
 
         let content_type = match content {
+            ClipboardContent::Text(text) if is_url(text) => "url",
             ClipboardContent::Text(_) => "text",
             ClipboardContent::Html { .. } => "html",
             ClipboardContent::Rtf { .. } => "rtf",
@@ -271,6 +275,10 @@ impl ClipboardHandler {
             ClipboardContent::Files(_) => "files",
             ClipboardContent::Video(_) => "video",
         };
+
+        if content_type == "url" {
+            return allowed.split(',').any(|t| t.trim() == "url");
+        }
 
         allowed.split(',').any(|t| t.trim() == content_type)
     }
@@ -574,12 +582,12 @@ impl ClipboardHandler {
     fn get_cached_settings(&self) -> Arc<HashMap<String, String>> {
         let current_version = SETTINGS_VERSION.load(std::sync::atomic::Ordering::Relaxed);
         let mut cache = self.settings_cache.lock();
-        if cache.version == current_version && !cache.values.is_empty() {
+        if cache.version == current_version {
             return cache.values.clone(); // Arc::clone，仅增加引用计数
         }
 
         // 缓存失效，重新从数据库批量读取（包含过滤设置）
-        let values = self.settings_repo
+        let values = match self.settings_repo
             .get_multiple(&[
                 "max_content_size_kb", "max_image_size_kb", "max_file_size_kb",
                 "max_video_size_kb", "dedup_strategy", "text_dedup_mode",
@@ -587,8 +595,13 @@ impl ClipboardHandler {
                 // 过滤相关设置（供 is_source_app_excluded / is_content_type_allowed / is_content_excluded_by_rules 使用）
                 "monitor_types", "app_filter_enabled", "app_filter_mode",
                 "app_filter_list", "content_filter_enabled", "content_filter_rules",
-            ])
-            .unwrap_or_default();
+            ]) {
+                Ok(values) => values,
+                Err(error) => {
+                    warn!("Failed to refresh clipboard settings: {}", error);
+                    return cache.values.clone(); // retry next time, keeping last good settings
+                }
+            };
 
         let arc_values = Arc::new(values);
         cache.values = arc_values.clone();
@@ -617,7 +630,11 @@ impl ClipboardHandler {
         let content_hash = self.calculate_hash(content);
         let semantic_hash = match content {
             ClipboardContent::Text(text) => {
-                semantic_hash_from_text(text).unwrap_or_else(|| content_hash.clone())
+                if is_url(text) {
+                    content_hash.clone()
+                } else {
+                    semantic_hash_from_text(text).unwrap_or_else(|| content_hash.clone())
+                }
             }
             ClipboardContent::Html { text, .. } => {
                 compute_semantic_hash("html", text.as_deref(), &content_hash)
@@ -639,8 +656,13 @@ impl ClipboardHandler {
 
         match content {
             ClipboardContent::Text(text) => {
-                hasher.update(b"text:");
-                hasher.update(text.as_bytes());
+                if let Some(canonical) = canonical_url_text(text) {
+                    hasher.update(b"url:");
+                    hasher.update(canonical.as_bytes());
+                } else {
+                    hasher.update(b"text:");
+                    hasher.update(text.as_bytes());
+                }
             }
             ClipboardContent::Html { html, .. } => {
                 hasher.update(b"html:");
@@ -648,7 +670,8 @@ impl ClipboardHandler {
             }
             ClipboardContent::Rtf { rtf, .. } => {
                 hasher.update(b"rtf:");
-                hasher.update(rtf.as_bytes());
+                let normalized = normalize_rtf_for_hash(rtf.as_bytes());
+                hasher.update(&normalized);
             }
             ClipboardContent::Image(data) => {
                 hasher.update(b"image:");
@@ -679,13 +702,15 @@ impl ClipboardHandler {
         hashes: &ContentHashes,
         max_size: usize,
     ) -> Result<NewClipboardItem, String> {
+        let is_url = canonical_url_text(&text).is_some();
+        let text = if is_url { text.trim().to_string() } else { text };
         let byte_size = text.len() as i64;
         let char_count = Some(text.chars().count() as i64);
         let preview = Self::create_preview(&text);
         let text_content = truncate_content(text, max_size, "Text");
 
         Ok(NewClipboardItem {
-            content_type: ContentType::Text,
+            content_type: if is_url { ContentType::Url } else { ContentType::Text },
             text_content: Some(text_content),
             content_hash: hashes.content_hash.clone(),
             semantic_hash: hashes.semantic_hash.clone(),

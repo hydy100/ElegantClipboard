@@ -3,7 +3,10 @@ mod handler;
 mod monitor;
 pub mod source_app;
 
-pub(crate) use dedup::{compute_semantic_hash, semantic_hash_from_text};
+pub(crate) use dedup::{
+    canonical_url_text, compute_semantic_hash, is_url, normalize_rtf_for_hash,
+    semantic_hash_from_text,
+};
 pub use handler::*;
 pub use monitor::*;
 
@@ -19,6 +22,13 @@ pub fn cleanup_image_files(paths: &[String]) -> usize {
             Err(e) => {
                 tracing::debug!("Failed to delete image file {}: {}", path, e);
             }
+        }
+
+        // 清理旧版本写入的同名 CF_DIB 伴侣文件；当前版本不再生成它。
+        let dib_path = std::path::Path::new(path).with_extension("dib");
+        if std::fs::remove_file(&dib_path).is_ok() {
+            tracing::debug!("Deleted legacy DIB companion: {}", dib_path.display());
+            deleted += 1;
         }
     }
     deleted
@@ -44,6 +54,13 @@ pub fn cleanup_orphan_files(db: &crate::database::Database, data_dir: &std::path
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_file() {
+                    if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dib")) {
+                        if std::fs::remove_file(&path).is_ok() {
+                            orphan_count += 1;
+                            tracing::debug!("Removed legacy DIB companion: {}", path.display());
+                        }
+                        continue;
+                    }
                     let path_str = path.to_string_lossy().to_string();
                     if !referenced.contains(&path_str) {
                         match std::fs::remove_file(&path) {

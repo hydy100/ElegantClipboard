@@ -11,7 +11,7 @@ pub(super) fn set_clipboard_content(
     clipboard: &mut arboard::Clipboard,
 ) -> Result<(), String> {
     match item.content_type.as_str() {
-        "text" | "html" | "rtf" => {
+        "text" | "html" | "rtf" | "url" => {
             if let Some(ref text) = item.text_content {
                 clipboard
                     .set_text(text.clone())
@@ -174,44 +174,48 @@ fn build_context_snippet(
 }
 
 
-/// 使用 Windows SendInput API 模拟 Ctrl+V 粘贴。
-/// 先释放用户可能按住的所有修饰键（Alt/Shift/Win），再发送纯净的 Ctrl+V。
+/// 按设置发送 Ctrl+V 或 Shift+Insert，先释放冲突修饰键。
 #[cfg(target_os = "windows")]
-pub fn simulate_paste() -> Result<(), String> {
+pub fn simulate_paste(state: &AppState) -> Result<(), String> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT,
-        KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_V,
+        KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_EXTENDEDKEY, VK_INSERT, VK_LWIN, VK_RWIN, VK_SHIFT,
+        VK_LMENU, VK_RMENU, VK_LCONTROL, VK_RCONTROL, VK_LSHIFT, VK_RSHIFT,
     };
 
     fn is_key_pressed(vk: u16) -> bool {
         unsafe { GetAsyncKeyState(vk as i32) < 0 }
     }
 
-    fn send_key(vk: u16, up: bool) {
+    fn send_key(vk: u16, up: bool) -> Result<(), String> {
         let input = INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(vk),
                     wScan: 0,
-                    dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
+                    dwFlags: (if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) })
+                        | if vk == VK_INSERT.0 { KEYEVENTF_EXTENDEDKEY } else { KEYBD_EVENT_FLAGS(0) },
                     time: 0,
                     dwExtraInfo: 0,
                 },
             },
         };
-        unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32); }
+        if unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) } == 1 {
+            Ok(())
+        } else { Err("模拟粘贴按键失败，目标应用可能具有更高权限".into()) }
     }
 
     /// 若用户正按住修饰键则释放，最多重试 20 次（间隔 5ms）。
-    fn release_if_held(vk: u16) {
+    fn release_if_held(vk: u16) -> Result<(), String> {
         for _ in 0..20 {
             if !is_key_pressed(vk) {
-                return;
+                return Ok(());
             }
-            send_key(vk, true);
+            send_key(vk, true)?;
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        Err("修饰键仍被按住，请松开后重试".into())
     }
 
     {
@@ -223,27 +227,21 @@ pub fn simulate_paste() -> Result<(), String> {
         info!("simulate_paste: foreground hwnd={:?} title=\"{}\"", fg.0, title);
     }
 
-    release_if_held(VK_MENU.0);
-    release_if_held(VK_SHIFT.0);
-    release_if_held(VK_LWIN.0);
-    release_if_held(VK_RWIN.0);
+    let setting = crate::database::SettingsRepository::new(&state.db).get_or("paste_key", "ctrl_v");
+    let (modifier, _) = super::paste_keys::combo(&setting);
+    release_if_held(VK_LMENU.0)?;
+    release_if_held(VK_RMENU.0)?;
+    let conflicting = if modifier == VK_SHIFT.0 { [VK_LCONTROL, VK_RCONTROL] } else { [VK_LSHIFT, VK_RSHIFT] };
+    for key in conflicting { release_if_held(key.0)?; }
+    release_if_held(VK_LWIN.0)?;
+    release_if_held(VK_RWIN.0)?;
+    super::paste_keys::send_combo(&setting, is_key_pressed(modifier), send_key,
+        || std::thread::sleep(std::time::Duration::from_millis(8)))
 
-    let user_ctrl = is_key_pressed(VK_CONTROL.0);
-    if !user_ctrl {
-        send_key(VK_CONTROL.0, false);
-    }
-    send_key(VK_V.0, false);
-    std::thread::sleep(std::time::Duration::from_millis(8));
-    send_key(VK_V.0, true);
-    if !user_ctrl {
-        send_key(VK_CONTROL.0, true);
-    }
-
-    Ok(())
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn simulate_paste() -> Result<(), String> {
+pub fn simulate_paste(state: &AppState) -> Result<(), String> {
     use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 
     let mut enigo = Enigo::new(&Settings::default())
@@ -258,12 +256,14 @@ pub fn simulate_paste() -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
     let modifier = Key::Control;
 
+    let setting = crate::database::SettingsRepository::new(&state.db).get_or("paste_key", "ctrl_v");
+    let (modifier, key) = if setting == "shift_insert" { (Key::Shift, Key::Insert) } else { (modifier, Key::Unicode('v')) };
     enigo
         .key(modifier, Direction::Press)
         .map_err(|e| format!("Failed to press modifier: {}", e))?;
 
     let click_result = enigo
-        .key(Key::Unicode('v'), Direction::Click)
+        .key(key, Direction::Click)
         .map_err(|e| format!("Failed to press V: {}", e));
 
     let release_result = enigo
@@ -300,39 +300,42 @@ pub async fn get_clipboard_items(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<Vec<ClipboardItem>, String> {
-    use crate::database::QueryOptions;
+    let state = state.inner().clone();
+    super::run_blocking("get_clipboard_items", move || {
+        use crate::database::QueryOptions;
 
-    let repo = ClipboardRepository::new(&state.db);
-    let search_keyword = search.clone();
-    let options = QueryOptions {
-        search,
-        content_type,
-        pinned_only: pinned_only.unwrap_or(false),
-        favorite_only: favorite_only.unwrap_or(false),
-        tag_id,
-        exclude_favorited: exclude_favorited.unwrap_or(false),
-        exclude_tagged: exclude_tagged.unwrap_or(false),
-        limit,
-        offset,
-    };
-    let mut items = repo.list(options).map_err(|e| e.to_string())?;
-    if let Some(ref keyword) = search_keyword {
-        let keyword_lower = keyword.to_lowercase();
-        for item in &mut items {
-            if let Some(ref text) = item.text_content {
-                let preview_has_match = item
-                    .preview
-                    .as_ref()
-                    .map(|p| p.to_lowercase().contains(&keyword_lower))
-                    .unwrap_or(false);
-                if !preview_has_match {
-                    item.preview = Some(extract_keyword_context(text, keyword, 200));
+        let repo = ClipboardRepository::new(&state.db);
+        let search_keyword = search.clone();
+        let options = QueryOptions {
+            search,
+            content_type,
+            pinned_only: pinned_only.unwrap_or(false),
+            favorite_only: favorite_only.unwrap_or(false),
+            tag_id,
+            exclude_favorited: exclude_favorited.unwrap_or(false),
+            exclude_tagged: exclude_tagged.unwrap_or(false),
+            limit,
+            offset,
+        };
+        let mut items = repo.list(options).map_err(|e| e.to_string())?;
+        if let Some(ref keyword) = search_keyword {
+            let keyword_lower = keyword.to_lowercase();
+            for item in &mut items {
+                if let Some(ref text) = item.text_content {
+                    let preview_has_match = item
+                        .preview
+                        .as_ref()
+                        .map(|p| p.to_lowercase().contains(&keyword_lower))
+                        .unwrap_or(false);
+                    if !preview_has_match {
+                        item.preview = Some(extract_keyword_context(text, keyword, 200));
+                    }
                 }
+                item.text_content = None;
             }
-            item.text_content = None;
         }
-    }
-    Ok(items)
+        Ok(items)
+    }).await
 }
 
 /// 按 ID 获取剪贴板条目
@@ -341,8 +344,11 @@ pub async fn get_clipboard_item(
     state: State<'_, Arc<AppState>>,
     id: i64,
 ) -> Result<Option<ClipboardItem>, String> {
-    let repo = ClipboardRepository::new(&state.db);
-    repo.get_by_id(id).map_err(|e| e.to_string())
+    let state = state.inner().clone();
+    super::run_blocking("get_clipboard_item", move || {
+        let repo = ClipboardRepository::new(&state.db);
+        repo.get_by_id(id).map_err(|e| e.to_string())
+    }).await
 }
 
 /// 获取条目总数
@@ -354,35 +360,44 @@ pub async fn get_clipboard_count(
     favorite_only: Option<bool>,
     tag_id: Option<i64>,
 ) -> Result<i64, String> {
-    use crate::database::QueryOptions;
+    let state = state.inner().clone();
+    super::run_blocking("get_clipboard_count", move || {
+        use crate::database::QueryOptions;
 
-    let repo = ClipboardRepository::new(&state.db);
-    let options = QueryOptions {
-        content_type,
-        pinned_only: pinned_only.unwrap_or(false),
-        favorite_only: favorite_only.unwrap_or(false),
-        tag_id,
-        ..Default::default()
-    };
-    repo.count(options).map_err(|e| e.to_string())
+        let repo = ClipboardRepository::new(&state.db);
+        let options = QueryOptions {
+            content_type,
+            pinned_only: pinned_only.unwrap_or(false),
+            favorite_only: favorite_only.unwrap_or(false),
+            tag_id,
+            ..Default::default()
+        };
+        repo.count(options).map_err(|e| e.to_string())
+    }).await
 }
 
 /// 切换固定状态
 #[tauri::command]
 pub async fn toggle_pin(state: State<'_, Arc<AppState>>, id: i64) -> Result<bool, String> {
-    let repo = ClipboardRepository::new(&state.db);
-    let new_state = repo.toggle_pin(id).map_err(|e| e.to_string())?;
-    debug!("Toggle pin: id={}, pinned={}", id, new_state);
-    Ok(new_state)
+    let state = state.inner().clone();
+    super::run_blocking("toggle_pin", move || {
+        let repo = ClipboardRepository::new(&state.db);
+        let new_state = repo.toggle_pin(id).map_err(|e| e.to_string())?;
+        debug!("Toggle pin: id={}, pinned={}", id, new_state);
+        Ok(new_state)
+    }).await
 }
 
 /// 切换收藏状态
 #[tauri::command]
 pub async fn toggle_favorite(state: State<'_, Arc<AppState>>, id: i64) -> Result<bool, String> {
-    let repo = ClipboardRepository::new(&state.db);
-    let new_state = repo.toggle_favorite(id).map_err(|e| e.to_string())?;
-    debug!("Toggle favorite: id={}, favorite={}", id, new_state);
-    Ok(new_state)
+    let state = state.inner().clone();
+    super::run_blocking("toggle_favorite", move || {
+        let repo = ClipboardRepository::new(&state.db);
+        let new_state = repo.toggle_favorite(id).map_err(|e| e.to_string())?;
+        debug!("Toggle favorite: id={}, favorite={}", id, new_state);
+        Ok(new_state)
+    }).await
 }
 
 /// 与目标条目交换排序位置
@@ -392,11 +407,14 @@ pub async fn move_clipboard_item(
     from_id: i64,
     to_id: i64,
 ) -> Result<(), String> {
-    let repo = ClipboardRepository::new(&state.db);
-    repo.move_item_by_id(from_id, to_id)
-        .map_err(|e| e.to_string())?;
-    debug!("Moved clipboard item {} to position of {}", from_id, to_id);
-    Ok(())
+    let state = state.inner().clone();
+    super::run_blocking("move_clipboard_item", move || {
+        let repo = ClipboardRepository::new(&state.db);
+        repo.move_item_by_id(from_id, to_id)
+            .map_err(|e| e.to_string())?;
+        debug!("Moved clipboard item {} to position of {}", from_id, to_id);
+        Ok(())
+    }).await
 }
 
 /// 粘贴后置顶：将条目移到非置顶区最前面（sort_order 设为全表最大值 + 1）
@@ -405,35 +423,41 @@ pub async fn bump_item_to_top(
     state: State<'_, Arc<AppState>>,
     id: i64,
 ) -> Result<(), String> {
-    let repo = ClipboardRepository::new(&state.db);
-    repo.bump_to_top(id).map_err(|e| e.to_string())?;
-    debug!("Bumped clipboard item {} to top", id);
-    Ok(())
+    let state = state.inner().clone();
+    super::run_blocking("bump_item_to_top", move || {
+        let repo = ClipboardRepository::new(&state.db);
+        repo.bump_to_top(id).map_err(|e| e.to_string())?;
+        debug!("Bumped clipboard item {} to top", id);
+        Ok(())
+    }).await
 }
 
 /// 删除剪贴板条目
 #[tauri::command]
 pub async fn delete_clipboard_item(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
-    let repo = ClipboardRepository::new(&state.db);
+    let state = state.inner().clone();
+    super::run_blocking("delete_clipboard_item", move || {
+        let repo = ClipboardRepository::new(&state.db);
 
-    if let Ok(Some(item)) = repo.get_by_id(id) {
-        repo.delete(id).map_err(|e| e.to_string())?;
+        if let Ok(Some(item)) = repo.get_by_id(id) {
+            repo.delete(id).map_err(|e| e.to_string())?;
 
-        // 删除本地图片文件
-        if let Some(ref image_path) = item.image_path {
-            let refs = repo.count_image_path_refs(image_path, id).unwrap_or(1);
-            if refs == 0 {
-                crate::clipboard::cleanup_image_files(std::slice::from_ref(image_path));
+            // 删除本地图片文件
+            if let Some(ref image_path) = item.image_path {
+                let refs = repo.count_image_path_refs(image_path, id).unwrap_or(1);
+                if refs == 0 {
+                    crate::clipboard::cleanup_image_files(std::slice::from_ref(image_path));
+                }
             }
+
+            debug!("Deleted clipboard item: id={}, type={}", id, item.content_type);
+        } else {
+            repo.delete(id).map_err(|e| e.to_string())?;
+            debug!("Deleted clipboard item: id={}", id);
         }
 
-        debug!("Deleted clipboard item: id={}, type={}", id, item.content_type);
-    } else {
-        repo.delete(id).map_err(|e| e.to_string())?;
-        debug!("Deleted clipboard item: id={}", id);
-    }
-
-    Ok(())
+        Ok(())
+    }).await
 }
 
 /// 批量删除剪贴板条目
@@ -442,34 +466,40 @@ pub async fn batch_delete_clipboard_items(
     state: State<'_, Arc<AppState>>,
     ids: Vec<i64>,
 ) -> Result<i64, String> {
-    let repo = ClipboardRepository::new(&state.db);
+    let state = state.inner().clone();
+    super::run_blocking("batch_delete_clipboard_items", move || {
+        let repo = ClipboardRepository::new(&state.db);
 
-    let (deleted, image_paths) = repo.batch_delete(&ids).map_err(|e| e.to_string())?;
-    if !image_paths.is_empty() {
-        crate::clipboard::cleanup_image_files(&image_paths);
-    }
+        let (deleted, image_paths) = repo.batch_delete(&ids).map_err(|e| e.to_string())?;
+        if !image_paths.is_empty() {
+            crate::clipboard::cleanup_image_files(&image_paths);
+        }
 
-    debug!("Batch deleted {} clipboard items", deleted);
-    Ok(deleted)
+        debug!("Batch deleted {} clipboard items", deleted);
+        Ok(deleted)
+    }).await
 }
 
 
 /// 清空所有历史（包括置顶/收藏，同时删除图片文件）
 #[tauri::command]
 pub async fn clear_all_history(state: State<'_, Arc<AppState>>) -> Result<i64, String> {
-    use tracing::info;
+    let state = state.inner().clone();
+    super::run_blocking("clear_all_history", move || {
+        use tracing::info;
 
-    let repo = ClipboardRepository::new(&state.db);
-    let image_paths = repo.get_all_image_paths().unwrap_or_default();
-    let deleted = repo.clear_all().map_err(|e| e.to_string())?;
-    let deleted_files = crate::clipboard::cleanup_image_files(&image_paths);
-    state.db.vacuum().ok();
+        let repo = ClipboardRepository::new(&state.db);
+        let image_paths = repo.get_all_image_paths().unwrap_or_default();
+        let deleted = repo.clear_all().map_err(|e| e.to_string())?;
+        let deleted_files = crate::clipboard::cleanup_image_files(&image_paths);
+        state.db.vacuum().ok();
 
-    info!(
-        "Cleared all {} clipboard items and {} image files",
-        deleted, deleted_files
-    );
-    Ok(deleted)
+        info!(
+            "Cleared all {} clipboard items and {} image files",
+            deleted, deleted_files
+        );
+        Ok(deleted)
+    }).await
 }
 
 /// 清空所有非固定/非收藏历史（同时删除图片文件）
@@ -478,22 +508,25 @@ pub async fn clear_history(
     state: State<'_, Arc<AppState>>,
     content_type: Option<String>,
 ) -> Result<i64, String> {
-    use tracing::info;
+    let state = state.inner().clone();
+    super::run_blocking("clear_history", move || {
+        use tracing::info;
 
-    let repo = ClipboardRepository::new(&state.db);
-    let image_paths = repo
-        .get_clearable_image_paths(content_type.as_deref())
-        .unwrap_or_default();
-    let deleted = repo
-        .clear_history(content_type.as_deref())
-        .map_err(|e| e.to_string())?;
-    let deleted_files = crate::clipboard::cleanup_image_files(&image_paths);
+        let repo = ClipboardRepository::new(&state.db);
+        let image_paths = repo
+            .get_clearable_image_paths(content_type.as_deref())
+            .unwrap_or_default();
+        let deleted = repo
+            .clear_history(content_type.as_deref())
+            .map_err(|e| e.to_string())?;
+        let deleted_files = crate::clipboard::cleanup_image_files(&image_paths);
 
-    info!(
-        "Cleared {} clipboard items and {} image files (content_type: {:?})",
-        deleted, deleted_files, content_type
-    );
-    Ok(deleted)
+        info!(
+            "Cleared {} clipboard items and {} image files (content_type: {:?})",
+            deleted, deleted_files, content_type
+        );
+        Ok(deleted)
+    }).await
 }
 
 /// 更新剪贴板条目的文本内容，内容为空时删除并返回 true
@@ -503,17 +536,20 @@ pub async fn update_text_content(
     id: i64,
     new_text: String,
 ) -> Result<bool, String> {
-    let repo = ClipboardRepository::new(&state.db);
-    if new_text.trim().is_empty() {
-        repo.delete(id).map_err(|e| e.to_string())?;
-        debug!("Deleted empty item {}", id);
-        Ok(true)
-    } else {
-        repo.update_text_content(id, &new_text)
-            .map_err(|e| e.to_string())?;
-        debug!("Updated text content for item {}", id);
-        Ok(false)
-    }
+    let state = state.inner().clone();
+    super::run_blocking("update_text_content", move || {
+        let repo = ClipboardRepository::new(&state.db);
+        if new_text.trim().is_empty() {
+            repo.delete(id).map_err(|e| e.to_string())?;
+            debug!("Deleted empty item {}", id);
+            Ok(true)
+        } else {
+            repo.update_text_content(id, &new_text)
+                .map_err(|e| e.to_string())?;
+            debug!("Updated text content for item {}", id);
+            Ok(false)
+        }
+    }).await
 }
 
 /// 编辑器保存后通知所有窗口刷新指定条目（通过后端 emit 确保跨窗口送达）
@@ -526,19 +562,22 @@ pub async fn emit_clipboard_edited(app: tauri::AppHandle, id: i64) {
 /// 将条目复制到系统剪贴板
 #[tauri::command]
 pub async fn copy_to_clipboard(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
-    let repo = ClipboardRepository::new(&state.db);
-    let item = repo
-        .get_by_id(id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Item not found".to_string())?;
+    let state = state.inner().clone();
+    super::run_blocking("copy_to_clipboard", move || {
+        let repo = ClipboardRepository::new(&state.db);
+        let item = repo
+            .get_by_id(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Item not found".to_string())?;
 
-    with_paused_monitor(&state, || {
-        let mut clipboard =
-            arboard::Clipboard::new().map_err(|e| format!("Failed to access clipboard: {}", e))?;
-        set_clipboard_content(&item, &mut clipboard)?;
-        debug!("Copied item {} to clipboard", id);
-        Ok(())
-    })
+        with_paused_monitor(&state, || {
+            let mut clipboard =
+                arboard::Clipboard::new().map_err(|e| format!("Failed to access clipboard: {}", e))?;
+            set_clipboard_content(&item, &mut clipboard)?;
+            debug!("Copied item {} to clipboard", id);
+            Ok(())
+        })
+    }).await
 }
 
 /// 直接粘贴剪贴板条目（写入系统剪贴板 → 隐藏窗口 → 模拟 Ctrl+V）
@@ -549,15 +588,18 @@ pub async fn paste_content(
     id: i64,
     close_window: Option<bool>,
 ) -> Result<(), String> {
-    let repo = ClipboardRepository::new(&state.db);
-    let item = repo
-        .get_by_id(id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Item not found".to_string())?;
+    let state = state.inner().clone();
+    super::run_blocking("paste_content", move || {
+        let repo = ClipboardRepository::new(&state.db);
+        let item = repo
+            .get_by_id(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Item not found".to_string())?;
 
-    paste_item_to_active_window(&state, &app, &item, close_window.unwrap_or(true))?;
-    debug!("Pasted item {} to active window", id);
-    Ok(())
+        paste_item_to_active_window(&state, &app, &item, close_window.unwrap_or(true))?;
+        debug!("Pasted item {} to active window", id);
+        Ok(())
+    }).await
 }
 
 /// 以纯文本粘贴条目内容（去除 html/rtf 格式）
@@ -568,20 +610,23 @@ pub async fn paste_content_as_plain(
     id: i64,
     close_window: Option<bool>,
 ) -> Result<(), String> {
-    let repo = ClipboardRepository::new(&state.db);
-    let item = repo
-        .get_by_id(id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Item not found".to_string())?;
+    let state = state.inner().clone();
+    super::run_blocking("paste_content_as_plain", move || {
+        let repo = ClipboardRepository::new(&state.db);
+        let item = repo
+            .get_by_id(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Item not found".to_string())?;
 
-    let text = item
-        .text_content
-        .as_deref()
-        .ok_or_else(|| "Item has no text content".to_string())?;
+        let text = item
+            .text_content
+            .as_deref()
+            .ok_or_else(|| "Item has no text content".to_string())?;
 
-    paste_plain_text_to_active_window(&state, &app, text, close_window.unwrap_or(true))?;
-    debug!("Pasted item {} as plain text", id);
-    Ok(())
+        paste_plain_text_to_active_window(&state, &app, text, close_window.unwrap_or(true))?;
+        debug!("Pasted item {} as plain text", id);
+        Ok(())
+    }).await
 }
 
 /// 将任意文本直接粘贴到当前活动窗口（用于表情、片段等功能）
@@ -591,9 +636,12 @@ pub async fn paste_text_direct(
     app: tauri::AppHandle,
     text: String,
 ) -> Result<(), String> {
-    paste_plain_text_to_active_window(&state, &app, &text, true)?;
-    debug!("Pasted direct text ({} chars)", text.len());
-    Ok(())
+    let state = state.inner().clone();
+    super::run_blocking("paste_text_direct", move || {
+        paste_plain_text_to_active_window(&state, &app, &text, true)?;
+        debug!("Pasted direct text ({} chars)", text.len());
+        Ok(())
+    }).await
 }
 
 /// 合并粘贴：将多条记录的文本内容合并后粘贴
@@ -604,36 +652,39 @@ pub async fn merge_paste_content(
     ids: Vec<i64>,
     separator: Option<String>,
 ) -> Result<(), String> {
-    if ids.is_empty() {
-        return Err("No items selected".to_string());
-    }
-
-    let repo = ClipboardRepository::new(&state.db);
-    let sep = separator.as_deref().unwrap_or("\n");
-
-    let mut texts: Vec<String> = Vec::new();
-    for id in &ids {
-        let item = repo
-            .get_by_id(*id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("Item {} not found", id))?;
-
-        // 提取文本内容：text_content > preview > file_paths
-        if let Some(text) = item.text_content.filter(|t| !t.is_empty()) {
-            texts.push(text);
-        } else if let Some(preview) = item.preview.filter(|p| !p.is_empty()) {
-            texts.push(preview);
+    let state = state.inner().clone();
+    super::run_blocking("merge_paste_content", move || {
+        if ids.is_empty() {
+            return Err("No items selected".to_string());
         }
-    }
 
-    if texts.is_empty() {
-        return Err("选中的项目没有可合并的文本内容".to_string());
-    }
+        let repo = ClipboardRepository::new(&state.db);
+        let sep = separator.as_deref().unwrap_or("\n");
 
-    let merged = texts.join(sep);
-    paste_plain_text_to_active_window(&state, &app, &merged, true)?;
-    debug!("Merge pasted {} items ({} chars)", ids.len(), merged.len());
-    Ok(())
+        let mut texts: Vec<String> = Vec::new();
+        for id in &ids {
+            let item = repo
+                .get_by_id(*id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("Item {} not found", id))?;
+
+            // 提取文本内容：text_content > preview > file_paths
+            if let Some(text) = item.text_content.filter(|t| !t.is_empty()) {
+                texts.push(text);
+            } else if let Some(preview) = item.preview.filter(|p| !p.is_empty()) {
+                texts.push(preview);
+            }
+        }
+
+        if texts.is_empty() {
+            return Err("选中的项目没有可合并的文本内容".to_string());
+        }
+
+        let merged = texts.join(sep);
+        paste_plain_text_to_active_window(&state, &app, &merged, true)?;
+        debug!("Merge pasted {} items ({} chars)", ids.len(), merged.len());
+        Ok(())
+    }).await
 }
 
 /// 粘贴快速槽位（1-9）对应条目到活动窗口。
@@ -700,7 +751,7 @@ fn paste_item_to_active_window(
         }
 
         std::thread::sleep(std::time::Duration::from_millis(50));
-        simulate_paste()?;
+        simulate_paste(state)?;
 
         // 粘贴后再次隐藏预览窗口（防止竞态）
         super::hide_preview_windows(app);
@@ -734,7 +785,7 @@ fn paste_plain_text_to_active_window(
         }
 
         std::thread::sleep(std::time::Duration::from_millis(50));
-        simulate_paste()?;
+        simulate_paste(state)?;
 
         // 粘贴后再次隐藏预览窗口（防止竞态）
         super::hide_preview_windows(app);

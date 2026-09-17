@@ -161,6 +161,19 @@ pub fn restart_app() -> bool {
     launch_via_explorer()
 }
 
+/// Restart through the same elevation-aware path used by the tray and
+/// settings commands.  WebView recovery uses this entry point so an elevated
+/// installation does not silently downgrade on recovery.
+pub fn perform_restart<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    crate::webview_runtime::mark_intentional_exit();
+    crate::commands::window::save_main_window_placement(app);
+    if restart_app() {
+        app.exit(0);
+    } else {
+        app.restart();
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 pub fn restart_app() -> bool {
     false

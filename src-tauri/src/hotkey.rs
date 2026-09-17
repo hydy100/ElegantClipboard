@@ -53,7 +53,7 @@ pub fn start(app: tauri::AppHandle, mode: HotkeyMode) {
 
 /// 注册快捷键
 pub fn register(shortcut_str: &str, callback: ShortcutCallback) -> bool {
-    match *MODE.read() {
+    match get_mode() {
         HotkeyMode::Register => register_via_plugin(shortcut_str, callback),
         HotkeyMode::LowLevel => crate::low_level_shortcut::register(shortcut_str, callback),
     }
@@ -61,7 +61,7 @@ pub fn register(shortcut_str: &str, callback: ShortcutCallback) -> bool {
 
 /// 注销快捷键
 pub fn unregister(shortcut_str: &str) {
-    match *MODE.read() {
+    match get_mode() {
         HotkeyMode::Register => unregister_via_plugin(shortcut_str),
         HotkeyMode::LowLevel => crate::low_level_shortcut::unregister(shortcut_str),
     }
@@ -69,7 +69,7 @@ pub fn unregister(shortcut_str: &str) {
 
 /// 临时禁用所有快捷键（游戏模式用）
 pub fn disable_all() {
-    match *MODE.read() {
+    match get_mode() {
         HotkeyMode::LowLevel => crate::low_level_shortcut::disable_all(),
         HotkeyMode::Register => {
             if let Some(app) = APP_HANDLE.get() {
@@ -85,7 +85,7 @@ pub fn disable_all() {
 
 /// 重新启用所有快捷键
 pub fn enable_all() {
-    match *MODE.read() {
+    match get_mode() {
         HotkeyMode::LowLevel => crate::low_level_shortcut::enable_all(),
         HotkeyMode::Register => {
             if let Some(app) = APP_HANDLE.get() {

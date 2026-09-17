@@ -416,13 +416,19 @@ unsafe extern "system" fn keyboard_hook_proc(
 
 #[cfg(windows)]
 fn handle_nav_key(key: &str) {
-    if let Some(window) = MAIN_WINDOW.lock().as_ref()
-        && window.is_visible().unwrap_or(false) {
+    let window = MAIN_WINDOW.lock().clone();
+    if let Some(window) = window {
             let shift = unsafe { GetAsyncKeyState(VK_SHIFT.0 as i32) < 0 };
-            let _ = window.emit("keyboard-nav", serde_json::json!({
+            let payload = serde_json::json!({
                 "key": key,
                 "shift": shift,
-            }));
+            });
+            let app = window.app_handle().clone();
+            let _ = app.run_on_main_thread(move || {
+                if window.is_visible().unwrap_or(false) {
+                    let _ = window.emit("keyboard-nav", payload);
+                }
+            });
         }
 }
 
@@ -493,10 +499,15 @@ fn handle_escape_key() {
     if !is_monitoring_active() {
         return;
     }
-    if let Some(window) = MAIN_WINDOW.lock().as_ref()
-        && window.is_visible().unwrap_or(false) {
-            let _ = window.emit("escape-pressed", ());
-        }
+    let window = MAIN_WINDOW.lock().clone();
+    if let Some(window) = window {
+        let app = window.app_handle().clone();
+        let _ = app.run_on_main_thread(move || {
+            if window.is_visible().unwrap_or(false) {
+                let _ = window.emit("escape-pressed", ());
+            }
+        });
+    }
 }
 
 fn handle_click_outside() {
@@ -509,10 +520,22 @@ fn handle_click_outside() {
         );
         return;
     }
-    if let Some(window) = MAIN_WINDOW.lock().as_ref()
-        && window.is_visible().unwrap_or(false) && is_mouse_outside_window(window) {
+    let window = MAIN_WINDOW.lock().clone();
+    if let Some(window) = window
+        && is_mouse_outside_window(&window) {
+        // A low-level hook has a strict timeout. Do not wait for database/window
+        // round-trips here or Windows may silently remove the hook.
+        static HIDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if HIDING.swap(true, Ordering::AcqRel) { return; }
+        tauri::async_runtime::spawn_blocking(move || {
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) { HIDING.store(false, Ordering::Release); }
+            }
+            let _reset = Reset;
+            if !is_monitoring_active() || !window.is_visible().unwrap_or(false) { return; }
             info!("handle_click_outside: 窗口可见且点击在外部，执行隐藏");
-            crate::commands::window::save_window_size_if_enabled(window.app_handle(), window);
+            crate::commands::window::save_window_size_if_enabled(window.app_handle(), &window);
             let _ = window.set_focusable(false);
             let _ = window.hide();
             crate::keyboard_hook::set_window_state(crate::keyboard_hook::WindowState::Hidden);
@@ -525,5 +548,6 @@ fn handle_click_outside() {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 crate::commands::window::trim_working_set();
             });
+        });
         }
 }

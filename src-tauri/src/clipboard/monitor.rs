@@ -1,9 +1,28 @@
 use super::{ClipboardContent, ClipboardHandler, handler::is_video_files};
 use crate::database::Database;
-use clipboard_master::{CallbackResult, ClipboardHandler as CMHandler, Master};
+#[cfg(not(windows))]
+use clipboard_master::Master;
+use clipboard_master::{CallbackResult, ClipboardHandler as CMHandler};
+#[cfg(all(test, windows, feature = "native-smoke"))]
+#[path = "monitor_smoke.rs"]
+mod smoke;
+#[cfg(windows)]
+#[path = "windows_monitor.rs"]
+mod windows_monitor;
+
+fn clipboard_sequence() -> u32 {
+    #[cfg(windows)]
+    {
+        unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() }
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::JoinHandle;
 use tauri::{AppHandle, Emitter};
 use tracing::{debug, error, info, warn};
@@ -12,6 +31,7 @@ use tracing::{debug, error, info, warn};
 #[derive(Clone)]
 pub struct ClipboardMonitor {
     running: Arc<AtomicBool>,
+    baseline_sequence: Arc<AtomicU32>,
     /// 暂停计数器：> 0 时忽略剪贴板变化，防止并发复制操作竞态
     pause_count: Arc<AtomicU32>,
     /// 用户手动暂停（托盘菜单），独立于内部 pause_count
@@ -24,6 +44,7 @@ impl ClipboardMonitor {
     pub fn new() -> Self {
         Self {
             running: Arc::new(AtomicBool::new(false)),
+            baseline_sequence: Arc::new(AtomicU32::new(clipboard_sequence())),
             pause_count: Arc::new(AtomicU32::new(0)),
             user_paused: Arc::new(AtomicBool::new(false)),
             handler: Arc::new(Mutex::new(None)),
@@ -38,63 +59,101 @@ impl ClipboardMonitor {
         info!("Clipboard monitor initialized");
     }
 
-    /// 启动剪贴板监听
+    /// Start once; even a missing native listener keeps sequence reconciliation alive.
     pub fn start(&self, app_handle: AppHandle) {
-        // 用 compare_exchange 避免竞态
-        if self
-            .running
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            warn!("Clipboard monitor already running");
+        let mut slot = self.thread_handle.lock();
+        if slot.as_ref().is_some_and(|thread| !thread.is_finished()) {
+            warn!("Clipboard monitor is already running or still stopping");
             return;
         }
-
+        if let Some(old) = slot.take() {
+            let _ = old.join();
+        }
+        self.running.store(true, Ordering::Release);
         let running = self.running.clone();
+        let baseline_sequence = self.baseline_sequence.clone();
         let pause_count = self.pause_count.clone();
         let user_paused = self.user_paused.clone();
         let handler = self.handler.clone();
-
-        let handle = std::thread::spawn(move || {
-            info!("Clipboard monitor thread started");
-
-            let clipboard_handler = MonitorHandler {
-                running: running.clone(),
-                pause_count,
-                user_paused,
-                handler,
-                app_handle,
-            };
-
-            // 启动剪贴板监听
-            match Master::new(clipboard_handler) {
-                Ok(mut master) => {
-                    if let Err(e) = master.run() {
-                        error!("Clipboard monitor error: {}", e);
+        let result = std::thread::Builder::new()
+            .name("clipboard-monitor".into())
+            .spawn(move || {
+                struct Finished(Arc<AtomicBool>);
+                impl Drop for Finished {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Release);
                     }
                 }
-                Err(e) => {
-                    error!("Failed to create clipboard master: {}", e);
+                let _finished = Finished(running.clone());
+                info!("Clipboard monitor worker started (main window may remain hidden)");
+                let mut clipboard_handler = MonitorHandler {
+                    running: running.clone(),
+                    pause_count: pause_count.clone(),
+                    user_paused: user_paused.clone(),
+                    handler,
+                    app_handle,
+                    retry_pending: false,
+                };
+                #[cfg(windows)]
+                windows_monitor::run(
+                    &running,
+                    baseline_sequence.load(Ordering::Acquire),
+                    clipboard_sequence,
+                    || {
+                        pause_count.load(Ordering::Acquire) > 0
+                            || user_paused.load(Ordering::Acquire)
+                    },
+                    || {
+                        let _ = clipboard_handler.on_clipboard_change();
+                        !clipboard_handler.retry_pending
+                    },
+                );
+                #[cfg(not(windows))]
+                while running.load(Ordering::Acquire) {
+                    match Master::new(clipboard_handler.clone()) {
+                        Ok(mut master) => {
+                            if let Err(error) = master.run() {
+                                error!(%error, "Clipboard monitor failed; retrying");
+                            }
+                        }
+                        Err(error) => {
+                            error!(%error, "Clipboard monitor initialization failed; retrying")
+                        }
+                    }
+                    if running.load(Ordering::Acquire) {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
                 }
+                baseline_sequence.store(clipboard_sequence(), Ordering::Release);
+                info!("Clipboard monitor worker stopped");
+            });
+        match result {
+            Ok(thread) => *slot = Some(thread),
+            Err(error) => {
+                self.running.store(false, Ordering::Release);
+                error!(%error, "Failed to spawn clipboard monitor worker");
             }
-
-            running.store(false, Ordering::SeqCst);
-            info!("Clipboard monitor thread stopped");
-        });
-
-        // 保存线程句柄以便清理
-        *self.thread_handle.lock() = Some(handle);
+        }
     }
 
-    /// 停止监控并等待线程退出
+    /// Stop without an unbounded join on an external delayed-rendering provider.
     #[allow(dead_code)]
     pub fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
-        info!("Clipboard monitor stopping");
-
-        // 等待线程退出
-        if let Some(handle) = self.thread_handle.lock().take() {
-            let _ = handle.join();
+        let mut slot = self.thread_handle.lock();
+        self.running.store(false, Ordering::Release);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while slot.as_ref().is_some_and(|thread| !thread.is_finished())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if slot.as_ref().is_some_and(|thread| thread.is_finished()) {
+            if let Some(thread) = slot.take() {
+                let _ = thread.join();
+            }
+        } else if slot.is_some() {
+            // Retain the handle: start() must not create a duplicate reader.
+            warn!("Clipboard provider still returning; worker will stop when the call finishes");
         }
     }
 
@@ -110,11 +169,7 @@ impl ClipboardMonitor {
         match self
             .pause_count
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-                if current > 0 {
-                    Some(current - 1)
-                } else {
-                    None
-                }
+                if current > 0 { Some(current - 1) } else { None }
             }) {
             Ok(prev) => debug!("Clipboard monitor resume (count: {})", prev - 1),
             Err(_) => warn!("Resume called when not paused"),
@@ -123,7 +178,7 @@ impl ClipboardMonitor {
 
     /// 是否已暂停（计数 > 0）
     pub fn is_paused(&self) -> bool {
-        self.pause_count.load(Ordering::SeqCst) > 0
+        self.pause_count.load(Ordering::SeqCst) > 0 || self.user_paused.load(Ordering::SeqCst)
     }
 
     /// 是否运行中
@@ -138,7 +193,6 @@ impl ClipboardMonitor {
         info!("Clipboard monitor user pause toggled: {}", now);
         now
     }
-
 }
 
 impl Default for ClipboardMonitor {
@@ -148,16 +202,23 @@ impl Default for ClipboardMonitor {
 }
 
 /// clipboard-master 事件处理器
+#[derive(Clone)]
 struct MonitorHandler {
     running: Arc<AtomicBool>,
     pause_count: Arc<AtomicU32>,
     user_paused: Arc<AtomicBool>,
     handler: Arc<Mutex<Option<ClipboardHandler>>>,
     app_handle: AppHandle,
+    retry_pending: bool,
 }
 
-impl CMHandler for MonitorHandler {
-    fn on_clipboard_change(&mut self) -> CallbackResult {
+impl MonitorHandler {
+    fn process_change(
+        &mut self,
+        source: impl FnOnce() -> Option<super::source_app::SourceAppInfo>,
+        read: impl FnOnce() -> Option<ClipboardContent>,
+    ) -> CallbackResult {
+        self.retry_pending = false;
         // 检查是否应停止
         if !self.running.load(Ordering::SeqCst) {
             return CallbackResult::Stop;
@@ -170,21 +231,27 @@ impl CMHandler for MonitorHandler {
         }
 
         // 先获取来源应用（在读取内容之前）
-        let source = super::source_app::get_clipboard_source_app();
+        let source = source();
 
         // 检查来源应用是否在排除列表中（使用缓存设置，避免数据库查询）
         if let Some(ref handler) = *self.handler.lock() {
             let settings = handler.get_filter_settings();
             if handler.is_source_app_excluded_cached(&source, &settings) {
-                debug!("Clipboard change ignored (source app excluded: {:?})", source.as_ref().map(|s| &s.app_name));
+                debug!(
+                    "Clipboard change ignored (source app excluded: {:?})",
+                    source.as_ref().map(|s| &s.app_name)
+                );
                 return CallbackResult::Next;
             }
         }
 
         // 读取剪贴板内容（带重试，应对剪贴板锁竞争）
-        let content = match read_clipboard_content_with_retry() {
+        let content = match read() {
             Some(c) => c,
-            None => return CallbackResult::Next,
+            None => {
+                self.retry_pending = true;
+                return CallbackResult::Next;
+            }
         };
 
         // 检查内容类型 + 处理内容（单次加锁，使用缓存设置）
@@ -201,18 +268,35 @@ impl CMHandler for MonitorHandler {
             match handler.process(content, source) {
                 Ok(Some(id)) => {
                     debug!("Processed clipboard item: {}", id);
-                    let _ = self.app_handle.emit("clipboard-updated", id);
+                    // emit may wait for the GUI runtime. Clipboard recording must
+                    // not stop inside WM_CLIPBOARDUPDATE while a webview is created.
+                    let app = self.app_handle.clone();
+                    if let Err(error) = self.app_handle.run_on_main_thread(move || {
+                        let _ = app.emit("clipboard-updated", id);
+                    }) {
+                        warn!("Failed to dispatch clipboard update: {}", error);
+                    }
                 }
                 Ok(None) => {
                     debug!("Clipboard content already exists");
                 }
                 Err(e) => {
                     error!("Failed to process clipboard: {}", e);
+                    self.retry_pending = true;
                 }
             }
         }
 
         CallbackResult::Next
+    }
+}
+
+impl CMHandler for MonitorHandler {
+    fn on_clipboard_change(&mut self) -> CallbackResult {
+        self.process_change(
+            super::source_app::get_clipboard_source_app,
+            read_clipboard_content_with_retry,
+        )
     }
 
     fn on_clipboard_error(&mut self, error: std::io::Error) -> CallbackResult {
@@ -228,7 +312,9 @@ fn read_clipboard_content_with_retry() -> Option<ClipboardContent> {
 
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS * attempt as u64));
+            std::thread::sleep(std::time::Duration::from_millis(
+                RETRY_DELAY_MS * attempt as u64,
+            ));
             debug!("Clipboard read retry {}/{}", attempt + 1, MAX_RETRIES);
         }
 
@@ -255,7 +341,10 @@ fn read_clipboard_content() -> Option<ClipboardContent> {
     let ctx = match ClipboardContext::new() {
         Ok(c) => c,
         Err(e) => {
-            warn!("Failed to create clipboard context: {} (clipboard may be locked by another app)", e);
+            warn!(
+                "Failed to create clipboard context: {} (clipboard may be locked by another app)",
+                e
+            );
             return None;
         }
     };
@@ -289,7 +378,10 @@ fn read_clipboard_content() -> Option<ClipboardContent> {
                 Err(e) => warn!("Failed to convert clipboard image to PNG: {}", e),
             }
         }
-        Err(e) => debug!("Clipboard get_image failed: {} (may not contain image data or format unsupported)", e),
+        Err(e) => debug!(
+            "Clipboard get_image failed: {} (may not contain image data or format unsupported)",
+            e
+        ),
     }
 
     // 尝试获取 HTML

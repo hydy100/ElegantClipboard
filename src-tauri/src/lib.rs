@@ -3,6 +3,7 @@ mod clipboard;
 mod commands;
 mod config;
 mod database;
+mod file_preview_limits;
 mod game_mode;
 mod input_monitor;
 mod keyboard_hook;
@@ -14,6 +15,7 @@ mod task_scheduler;
 mod tray;
 pub(crate) mod proxy;
 mod webdav;
+mod webview_runtime;
 mod win_v_registry;
 
 use clipboard::ClipboardMonitor;
@@ -266,7 +268,7 @@ fn make_paste_handler(slot: u8, kind: PasteKind) -> hotkey::ShortcutCallback {
                     .values()
                     .any(|w| w.is_focused().unwrap_or(false));
                 if any_focused { return; }
-                if PASTE_IN_PROGRESS.load(std::sync::atomic::Ordering::Acquire) { return; }
+                let Some(paste_guard) = commands::activity::ActivityGuard::acquire(&PASTE_IN_PROGRESS) else { return; };
                 let active_slots = match kind {
                     PasteKind::Quick => &*ACTIVE_QUICK_PASTE_SLOTS,
                     PasteKind::Favorite => &*ACTIVE_FAVORITE_PASTE_SLOTS,
@@ -274,9 +276,10 @@ fn make_paste_handler(slot: u8, kind: PasteKind) -> hotkey::ShortcutCallback {
                 let is_first = active_slots.lock().insert(slot);
                 let state = app.state::<Arc<AppState>>().inner().clone();
                 let app_handle = app.clone();
-                std::thread::spawn(move || {
+                if let Err(error) = std::thread::Builder::new().name("quick-paste".into()).spawn(move || {
+                    let _paste_guard = paste_guard;
                     let _guard = QUICK_PASTE_LOCK.lock();
-                    PASTE_IN_PROGRESS.store(true, std::sync::atomic::Ordering::Release);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if is_first {
                         let result = match kind {
                             PasteKind::Quick => commands::clipboard::quick_paste_by_slot(&state, &app_handle, slot),
@@ -288,12 +291,19 @@ fn make_paste_handler(slot: u8, kind: PasteKind) -> hotkey::ShortcutCallback {
                         }
                     } else {
                         std::thread::sleep(std::time::Duration::from_millis(50));
-                        if let Err(err) = commands::clipboard::simulate_paste() {
+                        if let Err(err) = commands::clipboard::simulate_paste(&state) {
                             tracing::warn!("{} {} 重复粘贴失败: {}", kind.label(), slot, err);
                         }
                     }
-                    PASTE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
-                });
+                    }));
+                    if result.is_err() {
+                        active_slots.lock().remove(&slot);
+                        tracing::error!("Quick paste worker panicked; activity guard released");
+                    }
+                }) {
+                    active_slots.lock().remove(&slot);
+                    tracing::error!("Quick paste worker spawn failed: {error}");
+                }
             }
             hotkey::KeyState::Released => {
                 match kind {
@@ -705,6 +715,8 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(move |app| {
+            // Snapshot before startup maintenance so its final clipboard change is reconciled.
+            let monitor = ClipboardMonitor::new();
             let db_path = config.get_db_path();
             let images_path = config.get_images_path();
 
@@ -715,10 +727,11 @@ pub fn run() {
             // 清理孤立的图片/图标文件（磁盘有文件但数据库无引用）
             clipboard::cleanup_orphan_files(&db, &config.get_data_dir());
 
-            let monitor = ClipboardMonitor::new();
             monitor.init(&db, images_path);
 
             let state = Arc::new(AppState { db, monitor });
+            app.manage(state.clone());
+            state.monitor.start(app.handle().clone());
 
             let settings_repo = database::SettingsRepository::new(&state.db);
 
@@ -749,8 +762,6 @@ pub fn run() {
                 input_monitor::set_window_pinned(true);
             }
 
-            state.monitor.start(app.handle().clone());
-            app.manage(state);
 
             // 托盘图标始终创建（仅一次），通过 set_visible 控制显隐，
             // 避免反复创建/销毁导致 Explorer 重启时出现重复图标。
@@ -874,6 +885,7 @@ pub fn run() {
                     }
                 }
 
+                webview_runtime::initialize(app.handle(), &window);
                 input_monitor::init(window);
                 input_monitor::start_monitoring();
             }
@@ -887,6 +899,7 @@ pub fn run() {
                 webdav::start_auto_sync_task(
                     app_state.db.clone(),
                     config.get_data_dir(),
+                    app.handle().clone(),
                 );
             }
 
@@ -934,6 +947,7 @@ pub fn run() {
             commands::preview::show_text_preview,
             commands::preview::hide_text_preview,
             commands::preview::open_text_editor_window,
+            webview_runtime::managed_window_ready,
             commands::window::set_window_pinned,
             commands::window::is_window_pinned,
             commands::window::set_window_effect,
@@ -993,6 +1007,7 @@ pub fn run() {
             commands::settings::get_monitor_status,
             commands::settings::optimize_database,
             commands::settings::vacuum_database,
+            commands::settings::cleanup_expired_invalid_data,
             commands::settings::reset_settings,
             commands::settings::reset_all_data,
             commands::settings::select_folder_for_settings,
@@ -1005,6 +1020,8 @@ pub fn run() {
             commands::settings::get_system_fonts,
             commands::settings::set_tray_visible,
             commands::file_ops::check_files_exist,
+            commands::file_ops::get_item_file_status,
+            commands::file_ops::batch_get_item_file_status,
             commands::file_ops::refresh_files_validity,
             commands::file_ops::show_in_explorer,
             commands::file_ops::paste_as_path,

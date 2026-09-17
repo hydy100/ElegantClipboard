@@ -8,6 +8,9 @@ use tauri::{
 };
 use tracing::info;
 
+#[cfg(all(test, windows, feature = "native-smoke"))]
+mod tests;
+
 /// 初始化系统托盘图标和菜单（仅在启动时调用一次，终身不销毁）
 pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let icon_data = include_bytes!("../../icons/icon.png");
@@ -77,11 +80,19 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
         "settings" => {
-            let _ = open_settings_window(app);
+            // WebView2 forbids a nested creation/message pump in a menu callback.
+            // Return to the event loop before creating the settings webview.
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = crate::commands::preview::open_settings_window(app).await {
+                    tracing::error!("打开设置窗口失败: {}", error);
+                }
+            });
         }
         "restart" => {
             // 使用支持 UAC 提权的重启逻辑
             // app.restart() 不触发提权，用自定义重启
+            crate::webview_runtime::mark_intentional_exit();
             crate::commands::window::save_main_window_placement(app);
             if crate::admin_launch::restart_app() {
                 app.exit(0);
@@ -90,6 +101,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             }
         }
         "quit" => {
+            crate::webview_runtime::mark_intentional_exit();
             crate::commands::window::save_main_window_placement(app);
             app.exit(0);
         }
@@ -99,6 +111,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
 
 /// 打开或聚焦设置窗口，居中于主窗口所在的显示器
 pub(crate) fn open_settings_window(app: &AppHandle) -> Result<(), String> {
+    // Called only from the serialized creation worker, never the event loop.
     // 设置窗口已存在则聚焦
     if let Some(window) = app.get_webview_window("settings") {
         let _ = window.unminimize();
@@ -108,6 +121,9 @@ pub(crate) fn open_settings_window(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
+    crate::webview_runtime::ensure_runtime_current(app)?;
+    let creation_guard = crate::webview_runtime::WindowCreationGuard::start(app, "settings");
+    let page_load_guard = creation_guard.clone();
     let mut builder = tauri::WebviewWindowBuilder::new(
         app,
         "settings",
@@ -157,9 +173,23 @@ pub(crate) fn open_settings_window(app: &AppHandle) -> Result<(), String> {
         builder = builder.center();
     }
 
-    let window = builder
-        .build()
-        .map_err(|e| format!("创建设置窗口失败: {}", e))?;
+    let build_result = builder
+        .on_page_load(move |window, payload| {
+            page_load_guard.on_page_load(&window, &payload);
+        })
+        .build();
+    let window = match build_result {
+        Ok(window) => window,
+        Err(error) => {
+            creation_guard.cancel();
+            return Err(crate::webview_runtime::window_operation_error(
+                app,
+                "settings",
+                "创建设置窗口失败",
+                error,
+            ));
+        }
+    };
 
     // 构建后设置物理位置，绕过逻辑→物理坐标换算歧义
     if let Some(pos) = phys_pos {
