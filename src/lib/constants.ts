@@ -14,7 +14,7 @@ export const TOOLBAR_BUTTON_REGISTRY: Record<
 /** 逻辑类型 → 后端 contentType 映射（需要前端二次过滤的类型） */
 export const LOGICAL_TYPE_BACKEND_MAP: Record<string, { backendType: string; logicalType: string }> = {
   text:  { backendType: "text,html,rtf",  logicalType: "text" },
-  url:   { backendType: "text,html,rtf",  logicalType: "url" },
+  url:   { backendType: "url",  logicalType: "url" },
   code:  { backendType: "text,html,rtf",  logicalType: "code" },
   files: { backendType: "files", logicalType: "files" },
   video: { backendType: "video", logicalType: "video" },
@@ -35,10 +35,11 @@ export type CategoryValue = (typeof CATEGORIES)[number]["value"];
 
 /** 监听类型 → 对应的底部分类标签值（不勾选某监听类型时隐藏对应分类） */
 export const MONITOR_TYPE_TO_CATEGORIES: Record<string, string[]> = {
-  text: ["text", "url", "code"],
+  text: ["text", "code"],
   image: ["image"],
   files: ["files"],
   video: ["video"],
+  url: ["url"],
 };
 
 /** 根据启用的监听类型，计算应该显示的分类标签列表 */

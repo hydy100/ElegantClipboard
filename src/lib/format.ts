@@ -32,15 +32,30 @@ export interface LogicalContentTypeSource {
 }
 
 export function isUrlText(text: string): boolean {
-  const value = text.trim().toLowerCase();
-  return (
-    (value.startsWith("http://") ||
-      value.startsWith("https://") ||
-      value.startsWith("ftp://") ||
-      value.startsWith("file://") ||
-      value.startsWith("www.")) &&
-    !/\s/.test(value)
-  );
+  const value = text.trim();
+  if (!value || /\s/.test(value)) return false;
+  const lower = value.toLowerCase();
+  const prefix = ["http://", "https://", "ftp://", "www."].find((p) => lower.startsWith(p));
+  if (!prefix) return false;
+  const authority = value.slice(prefix.length).split(/[/?#]/, 1)[0];
+  if (!authority) return false;
+  if (authority.startsWith("[")) {
+    const end = authority.indexOf("]");
+    if (end <= 1) return false;
+    const ipv6 = authority.slice(1, end);
+    return /^[0-9a-f:.]+$/i.test(ipv6) && ipv6.includes(":");
+  }
+  const host = authority.split(":", 1)[0];
+  if (host.toLowerCase() === "localhost") return true;
+  if (/^\d+(\.\d+){3}$/.test(host)) {
+    return host.split(".").every((part) => Number(part) >= 0 && Number(part) <= 255);
+  }
+  const labels = host.split(".");
+  return labels.length >= 2 && labels.every((label) =>
+    label.length > 0 && label.length <= 63 &&
+    !label.startsWith("-") && !label.endsWith("-") &&
+    /^[a-z\d-]+$/i.test(label)
+  ) && labels[labels.length - 1].length >= 2;
 }
 
 export function isCodeText(text: string): boolean {
@@ -182,6 +197,10 @@ export function getLogicalContentType(item: LogicalContentTypeSource): keyof typ
 
   if (item.content_type === "files") {
     return "files";
+  }
+
+  if (item.content_type === "url") {
+    return "url";
   }
 
   // text_content 在列表模式下为 NULL（性能优化），使用 preview 作为 fallback
