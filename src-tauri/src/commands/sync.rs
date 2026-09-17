@@ -101,20 +101,27 @@ pub async fn webdav_upload(
         let size = zip_data.len();
         webdav::upload_sync(&config, &zip_data, "clipboard_sync.zip")?;
 
-        // 构建本地媒体映射并合并上传到独立 media_map.json
-        let device_id = webdav::get_or_create_device_id(&db);
-        let local_map = build_local_media_map(&db, &data_dir, &options, &device_id);
-        let merged_map = if !local_map.is_empty() {
-            webdav::upload_media_map(&config, &local_map, &device_id).unwrap_or_default()
-        } else {
-            webdav::download_media_map(&config).unwrap_or_default()
-        };
+        // 没有启用任何媒体同步时，不读取、创建或清理 media_map。
+        if options.sync_image || options.sync_files || options.sync_video {
+            let device_id = webdav::get_or_create_device_id(&db);
+            let local_map = build_local_media_map(&db, &data_dir, &options, &device_id);
+            let merged_map = if !local_map.is_empty() {
+                match webdav::upload_media_map(&config, &local_map, &device_id) {
+                    Ok(map) => Some(map),
+                    Err(error) => {
+                        tracing::warn!("上传 media_map 失败，跳过云端孤儿清理: {}", error);
+                        None
+                    }
+                }
+            } else {
+                Some(webdav::download_media_map(&config).unwrap_or_default())
+            };
 
-        // 清理云端不再被任何设备引用的媒体文件
-        let _ = webdav::cleanup_orphaned_remote_media(&config, &merged_map);
-
-        // 后台异步上传实际媒体文件
-        spawn_media_upload_files(&app, &config, &data_dir, &local_map);
+            if let Some(ref merged_map) = merged_map {
+                let _ = webdav::cleanup_orphaned_remote_media(&config, merged_map);
+                spawn_media_upload_files(&app, &config, &data_dir, &local_map);
+            }
+        }
 
         Ok(format!("上传成功 ({})", format_size(size as u64)))
     })
@@ -138,7 +145,7 @@ pub async fn webdav_download(
         let zip_data = webdav::download_sync(&config, "clipboard_sync.zip")?;
         let msg = match zip_data {
             Some(data) => {
-                let result = webdav::import_sync_data(&db, &data, &options)?;
+                let result = webdav::import_sync_data(&db, &data, &options, &data_dir)?;
                 let mut parts = Vec::new();
                 if result.items_imported > 0 {
                     parts.push(format!("导入 {} 条记录", result.items_imported));
@@ -156,21 +163,19 @@ pub async fn webdav_download(
             None => "远端无同步数据".to_string(),
         };
 
-        // 从独立 media_map.json 获取完整媒体映射（权威来源）
-        let media_map = webdav::download_media_map(&config).unwrap_or_default();
-        if !media_map.is_empty() {
-            // 过滤掉本地已标记为失效的文件条目，避免重复下载已删除的文件
-            let invalid_paths = crate::database::ClipboardRepository::new(&db)
-                .get_invalid_file_paths_set();
-            let filtered: Vec<_> = media_map.into_iter().filter(|e| {
-                // 对 file 和 video 类型过滤掉本地已失效的路径
-                if (e.media_type == "file" || e.media_type == "video") && invalid_paths.contains(&e.local_path) {
-                    return false;
+        // 关闭媒体同步时不下载媒体映射，也不触碰本地媒体文件。
+        if options.sync_image || options.sync_files || options.sync_video {
+            let media_map = webdav::download_media_map(&config).unwrap_or_default();
+            if !media_map.is_empty() {
+                let fixed = webdav::reconcile_local_media(&db, &media_map, &data_dir);
+                let needed = webdav::plan_media_downloads(&db, &media_map, &data_dir);
+                if needed.is_empty() {
+                    if fixed > 0 {
+                        webdav::emit_webdav_media_ready(&app);
+                    }
+                } else {
+                    spawn_media_download(&app, &config, &data_dir, &db, &media_map, needed);
                 }
-                true
-            }).collect();
-            if !filtered.is_empty() {
-                spawn_media_download(&app, &config, &data_dir, filtered);
             }
         }
 
@@ -232,6 +237,8 @@ fn spawn_media_download_worker(
     app: &tauri::AppHandle,
     config: &webdav::WebDavConfig,
     data_dir: &std::path::Path,
+    db: &crate::database::Database,
+    full_media_map: &[webdav::MediaEntry],
     entries: Vec<webdav::MediaEntry>,
     thread_name: &'static str,
     label: &'static str,
@@ -243,6 +250,8 @@ fn spawn_media_download_worker(
     let cfg = config.clone();
     let dir = data_dir.to_path_buf();
     let handle = app.clone();
+    let database = db.clone();
+    let media_map = full_media_map.to_vec();
     std::thread::Builder::new()
         .name(thread_name.into())
         .spawn(move || {
@@ -251,6 +260,7 @@ fn spawn_media_download_worker(
                 Ok(_) => format!("{}已是最新", label),
                 Err(e) => format!("{}下载失败: {}", label, e),
             };
+            let _ = webdav::reconcile_local_media(&database, &media_map, &dir);
             emit_media_sync_done(&handle, &msg);
         })
         .ok();
@@ -283,21 +293,26 @@ fn spawn_media_download(
     app: &tauri::AppHandle,
     config: &webdav::WebDavConfig,
     data_dir: &std::path::Path,
+    db: &crate::database::Database,
+    full_media_map: &[webdav::MediaEntry],
     media_map: Vec<webdav::MediaEntry>,
 ) {
     let images: Vec<_> = media_map.iter().filter(|e| e.media_type == "image").cloned().collect();
     let files: Vec<_> = media_map.iter().filter(|e| e.media_type == "file").cloned().collect();
     let videos: Vec<_> = media_map.iter().filter(|e| e.media_type == "video").cloned().collect();
+    let icons: Vec<_> = media_map.iter().filter(|e| e.media_type == "icon").cloned().collect();
 
-    spawn_media_download_worker(app, config, data_dir, images, "webdav-download-images", "图片");
-    spawn_media_download_worker(app, config, data_dir, files, "webdav-download-files", "文件");
-    spawn_media_download_worker(app, config, data_dir, videos, "webdav-download-videos", "视频");
+    spawn_media_download_worker(app, config, data_dir, db, full_media_map, images, "webdav-download-images", "图片");
+    spawn_media_download_worker(app, config, data_dir, db, full_media_map, files, "webdav-download-files", "文件");
+    spawn_media_download_worker(app, config, data_dir, db, full_media_map, videos, "webdav-download-videos", "视频");
+    spawn_media_download_worker(app, config, data_dir, db, full_media_map, icons, "webdav-download-icons", "图标");
 }
 
 /// 向前端发送媒体同步完成事件
 fn emit_media_sync_done(app: &tauri::AppHandle, message: &str) {
     use tauri::Emitter;
     let _ = app.emit("media-sync-done", message.to_string());
+    let _ = app.emit("clipboard-updated", Option::<i64>::None);
 }
 
 fn format_size(bytes: u64) -> String {

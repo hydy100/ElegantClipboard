@@ -76,6 +76,90 @@ pub struct MediaEntry {
     /// 来源设备标识（多设备安全清理用）
     #[serde(default)]
     pub device_id: String,
+    /// 原始文件名，用于跨设备安全落地文件/视频
+    #[serde(default)]
+    pub file_name: String,
+    /// 上传端文件大小（兼容旧版映射时默认为 0）
+    #[serde(default)]
+    pub size: u64,
+    /// 上传端实际可读路径，仅保留在进程内，不写入远端映射
+    #[serde(skip)]
+    pub source_path: Option<String>,
+}
+
+fn safe_media_file_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn file_name_from_any_path(path: &str) -> Option<String> {
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .and_then(safe_media_file_name)
+}
+
+fn safe_hash_component(hash: &str) -> Option<&str> {
+    (!hash.is_empty()
+        && hash.len() <= 128
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+        .then_some(hash)
+}
+
+fn safe_media_extension(ext: &str, fallback: &str) -> String {
+    let ext = ext.trim().trim_start_matches('.');
+    if !ext.is_empty()
+        && ext.len() <= 16
+        && ext.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        ext.to_string()
+    } else {
+        fallback.to_string()
+    }
+}
+
+fn remote_media_name(entry: &MediaEntry) -> Option<String> {
+    let hash = safe_hash_component(&entry.hash)?;
+    Some(format!(
+        "{hash}.{}",
+        safe_media_extension(&entry.ext, "bin")
+    ))
+}
+
+/// 为远端媒体计算本机安全落地路径，避免把来源设备路径直接当作写入目标。
+pub fn local_media_target(entry: &MediaEntry, data_dir: &Path) -> Option<PathBuf> {
+    let hash = safe_hash_component(&entry.hash)?;
+    match entry.media_type.as_str() {
+        "image" => Some(data_dir.join("images").join(format!(
+            "{}.{}",
+            hash,
+            safe_media_extension(&entry.ext, "png")
+        ))),
+        "icon" => {
+            let name = file_name_from_any_path(&entry.local_path)
+                .or_else(|| file_name_from_any_path(&entry.file_name))
+                .unwrap_or_else(|| format!("{}.{}", hash, safe_media_extension(&entry.ext, "png")));
+            Some(data_dir.join("icons").join(name))
+        }
+        "file" | "video" => {
+            let name = if !entry.file_name.is_empty() {
+                safe_media_file_name(&entry.file_name)
+            } else {
+                file_name_from_any_path(&entry.local_path)
+            }?;
+            let prefix = &hash[..hash.len().min(16)];
+            Some(data_dir.join("staged").join("webdav").join(format!("{prefix}_{name}")))
+        }
+        _ => None,
+    }
 }
 
 /// 获取或创建设备唯一标识（存储在 settings 表中）
@@ -218,7 +302,9 @@ fn ensure_remote_dir(
 /// 计算 max_byte_size
 pub fn calc_max_byte_size(max_size_kb: u64) -> i64 {
     if max_size_kb > 0 {
-        (max_size_kb * 1024) as i64
+        max_size_kb
+            .saturating_mul(1024)
+            .min(i64::MAX as u64) as i64
     } else {
         i64::MAX
     }
@@ -244,6 +330,7 @@ pub fn build_type_filter(options: &SyncOptions) -> Vec<&'static str> {
         types.push("'text'");
         types.push("'html'");
         types.push("'rtf'");
+        types.push("'url'");
     }
     if options.sync_image {
         types.push("'image'");
@@ -318,9 +405,32 @@ pub fn export_sync_data(
         }
     }
 
-    // 构建媒体映射表（hash → 本地路径），用于下载时定位文件
+    // 构建媒体映射表（来源路径 → hash），用于跨设备安全落地媒体。
     let device_id = get_or_create_device_id(db);
-    let media_map = build_media_map(&items, data_dir, options, &device_id);
+    let mut media_map = build_media_map(&items, data_dir, options, &device_id);
+    let before_items = items.len();
+    let items: Vec<_> = items
+        .into_iter()
+        .filter(|item| item_media_is_exportable(item, &media_map))
+        .collect();
+    if before_items != items.len() {
+        info!("同步导出过滤 {} 条缺失或超限媒体记录", before_items - items.len());
+    }
+    let mut referenced_paths = std::collections::HashSet::<String>::new();
+    for item in &items {
+        if let Some(path) = item.image_path.as_ref() {
+            referenced_paths.insert(path.clone());
+        }
+        if let Some(path) = item.source_app_icon.as_ref() {
+            referenced_paths.insert(path.clone());
+        }
+        if let Some(paths_json) = item.file_paths.as_ref()
+            && let Ok(paths) = serde_json::from_str::<Vec<String>>(paths_json)
+        {
+            referenced_paths.extend(paths);
+        }
+    }
+    media_map.retain(|entry| referenced_paths.contains(&entry.local_path));
     if !media_map.is_empty() {
         let map_json = serde_json::to_string_pretty(&media_map)
             .map_err(|e| format!("序列化媒体映射失败: {}", e))?;
@@ -343,7 +453,8 @@ pub fn build_media_map(
 ) -> Vec<MediaEntry> {
     let images_dir = data_dir.join("images");
     let icons_dir = data_dir.join("icons");
-    let mut seen_hashes = std::collections::HashSet::new();
+    // 同一 hash 的不同来源路径必须各自保留映射，上传端仍通过 hash 去重 blob。
+    let mut seen_local_paths = std::collections::HashSet::new();
     let mut map = Vec::new();
 
     let max_image_bytes = calc_max_byte_size(options.max_image_size_kb);
@@ -360,9 +471,9 @@ pub fn build_media_map(
                     } else {
                         images_dir.join(img_path)
                     };
-                    if file_len_if_within_limit(&full_path, max_image_bytes).is_some()
+                    if let Some(size) = file_len_if_within_limit(&full_path, max_image_bytes)
                         && let Ok((hash, _)) = file_hash_from_path(&full_path) {
-                            if seen_hashes.insert(hash.clone()) {
+                            if seen_local_paths.insert(img_path.clone()) {
                                 let ext = full_path.extension()
                                     .unwrap_or_default().to_string_lossy().to_string();
                                 map.push(MediaEntry {
@@ -371,6 +482,13 @@ pub fn build_media_map(
                                     media_type: "image".to_string(),
                                     local_path: img_path.clone(),
                                     device_id: device_id.to_string(),
+                                    file_name: full_path
+                                        .file_name()
+                                        .and_then(|name| name.to_str())
+                                        .unwrap_or("image.png")
+                                        .to_string(),
+                                    size,
+                                    source_path: Some(full_path.to_string_lossy().to_string()),
                                 });
                             }
                     }
@@ -379,8 +497,8 @@ pub fn build_media_map(
         }
     }
 
-    // 应用图标（始终同步，体积极小）
-    {
+    // 应用图标只随媒体同步传输；纯文本同步不应创建/上传 media_map。
+    if options.sync_image || options.sync_files || options.sync_video {
         let mut seen_icon_paths = std::collections::HashSet::new();
         for item in items {
             if let Some(ref icon_path) = item.source_app_icon {
@@ -394,7 +512,7 @@ pub fn build_media_map(
                 };
                 if full_path.is_file() {
                     if let Ok((hash, _)) = file_hash_from_path(&full_path) {
-                        if seen_hashes.insert(hash.clone()) {
+                        if seen_local_paths.insert(icon_path.clone()) {
                             let ext = full_path.extension()
                                 .unwrap_or_default().to_string_lossy().to_string();
                             map.push(MediaEntry {
@@ -403,6 +521,15 @@ pub fn build_media_map(
                                 media_type: "icon".to_string(),
                                 local_path: icon_path.clone(),
                                 device_id: device_id.to_string(),
+                                file_name: full_path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("icon.png")
+                                    .to_string(),
+                                size: std::fs::metadata(&full_path)
+                                    .map(|metadata| metadata.len())
+                                    .unwrap_or(0),
+                                source_path: Some(full_path.to_string_lossy().to_string()),
                             });
                         }
                     }
@@ -432,9 +559,9 @@ pub fn build_media_map(
 
                 for file_path in &paths {
                     let p = Path::new(file_path);
-                    if file_len_if_within_limit(p, limit).is_some()
+                    if let Some(size) = file_len_if_within_limit(p, limit)
                         && let Ok((hash, _)) = file_hash_from_path(p) {
-                            if seen_hashes.insert(hash.clone()) {
+                            if seen_local_paths.insert(file_path.clone()) {
                                 let ext = p.extension()
                                     .unwrap_or_default().to_string_lossy().to_string();
                                 map.push(MediaEntry {
@@ -443,6 +570,13 @@ pub fn build_media_map(
                                     media_type: if is_video { "video" } else { "file" }.to_string(),
                                     local_path: file_path.clone(),
                                     device_id: device_id.to_string(),
+                                    file_name: p
+                                        .file_name()
+                                        .and_then(|name| name.to_str())
+                                        .unwrap_or("file")
+                                        .to_string(),
+                                    size,
+                                    source_path: Some(p.to_string_lossy().to_string()),
                                 });
                             }
                     }
@@ -452,6 +586,39 @@ pub fn build_media_map(
     }
 
     map
+}
+
+fn item_media_is_exportable(
+    item: &crate::database::ClipboardItem,
+    media_map: &[MediaEntry],
+) -> bool {
+    match item.content_type.as_str() {
+        "image" => item.image_path.as_ref().is_some_and(|path| {
+            media_map
+                .iter()
+                .any(|entry| entry.media_type == "image" && entry.local_path == *path)
+        }),
+        "files" | "video" => {
+            if item.files_valid == Some(false) {
+                return false;
+            }
+            let Some(paths_json) = item.file_paths.as_ref() else {
+                return false;
+            };
+            let Ok(paths) = serde_json::from_str::<Vec<String>>(paths_json) else {
+                return false;
+            };
+            !paths.is_empty()
+                && paths.iter().all(|path| {
+                    media_map.iter().any(|entry| {
+                        entry.local_path == *path
+                            && ((item.content_type == "video" && entry.media_type == "video")
+                                || (item.content_type == "files" && entry.media_type == "file"))
+                    })
+                })
+        }
+        _ => true,
+    }
 }
 
 /// 上传媒体文件到 WebDAV（逐个上传，hash 去重）
@@ -476,7 +643,11 @@ pub fn upload_media_files(
     ensure_remote_dir(&client, &config.url, &media_dir, &auth)?;
 
     for entry in entries {
-        let remote_path = format!("media/{}.{}", entry.hash, entry.ext);
+        let Some(remote_name) = remote_media_name(entry) else {
+            debug!("媒体上传跳过：hash/ext 无效 {}", entry.hash);
+            continue;
+        };
+        let remote_path = format!("media/{remote_name}");
         let remote_url = format!("{}{}", base_url, remote_path);
 
         // HEAD 检查远端是否已存在（hash 相同则内容相同，跳过）
@@ -491,23 +662,27 @@ pub fn upload_media_files(
             continue;
         }
 
-        let local_path = match entry.media_type.as_str() {
-            "image" => {
-                if Path::new(&entry.local_path).is_absolute() {
-                    PathBuf::from(&entry.local_path)
-                } else {
-                    images_dir.join(&entry.local_path)
+        let local_path = entry
+            .source_path
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| match entry.media_type.as_str() {
+                "image" => {
+                    if Path::new(&entry.local_path).is_absolute() {
+                        PathBuf::from(&entry.local_path)
+                    } else {
+                        images_dir.join(&entry.local_path)
+                    }
                 }
-            }
-            "icon" => {
-                if Path::new(&entry.local_path).is_absolute() {
-                    PathBuf::from(&entry.local_path)
-                } else {
-                    icons_dir.join(&entry.local_path)
+                "icon" => {
+                    if Path::new(&entry.local_path).is_absolute() {
+                        PathBuf::from(&entry.local_path)
+                    } else {
+                        icons_dir.join(&entry.local_path)
+                    }
                 }
-            }
-            _ => PathBuf::from(&entry.local_path),
-        };
+                _ => PathBuf::from(&entry.local_path),
+            });
 
         let file = match std::fs::File::open(&local_path) {
             Ok(file) => file,
@@ -551,40 +726,30 @@ pub fn download_missing_media(
     let client = build_client(config)?;
     let auth = basic_auth(&config.username, &config.password);
     let base_url = normalize_url(&config.url, &config.remote_dir);
-    let images_dir = data_dir.join("images");
-    let icons_dir = data_dir.join("icons");
-    let _ = std::fs::create_dir_all(&images_dir);
-    let _ = std::fs::create_dir_all(&icons_dir);
-
     let mut downloaded = 0usize;
 
     for entry in entries {
-        // 确定本地目标路径
-        let local_path = match entry.media_type.as_str() {
-            "image" => {
-                if Path::new(&entry.local_path).is_absolute() {
-                    PathBuf::from(&entry.local_path)
-                } else {
-                    images_dir.join(&entry.local_path)
-                }
-            }
-            "icon" => {
-                if Path::new(&entry.local_path).is_absolute() {
-                    PathBuf::from(&entry.local_path)
-                } else {
-                    icons_dir.join(&entry.local_path)
-                }
-            }
-            _ => PathBuf::from(&entry.local_path),
+        // 目标路径只由本机数据目录和远端媒体元数据决定，不能直接使用来源设备路径。
+        let Some(local_path) = local_media_target(entry, data_dir) else {
+            debug!("媒体下载跳过：无法安全定位 {}", entry.local_path);
+            continue;
         };
 
-        // 如果本地已存在则跳过
-        if local_path.exists() {
+        // 只有本地文件内容校验通过时才跳过；路径相同但内容损坏则重新下载。
+        if local_path.is_file()
+            && file_hash_from_path(&local_path)
+                .map(|(hash, _)| hash == entry.hash)
+                .unwrap_or(false)
+        {
             continue;
         }
 
         // 从 WebDAV 下载
-        let remote_path = format!("media/{}.{}", entry.hash, entry.ext);
+        let Some(remote_name) = remote_media_name(entry) else {
+            debug!("媒体下载跳过：hash/ext 无效 {}", entry.hash);
+            continue;
+        };
+        let remote_path = format!("media/{remote_name}");
         let remote_url = format!("{}{}", base_url, remote_path);
 
         let resp = client.get(&remote_url)
@@ -607,11 +772,23 @@ pub fn download_missing_media(
             let mut body = resp;
             match std::fs::File::create(&tmp_path)
                 .and_then(|mut file| std::io::copy(&mut body, &mut file).map(|_| ()))
-                .and_then(|_| std::fs::rename(&tmp_path, &local_path))
+                .and_then(|_| {
+                    // 覆盖同名但 hash 不一致的残留文件，保证下载可修复损坏缓存。
+                    let _ = std::fs::remove_file(&local_path);
+                    std::fs::rename(&tmp_path, &local_path)
+                })
             {
                 Ok(()) => {
-                    downloaded += 1;
-                    info!("媒体下载: {} -> {}", remote_path, local_path.display());
+                    let valid = file_hash_from_path(&local_path)
+                        .map(|(hash, _)| hash == entry.hash)
+                        .unwrap_or(false);
+                    if valid {
+                        downloaded += 1;
+                        info!("媒体下载: {} -> {}", remote_path, local_path.display());
+                    } else {
+                        let _ = std::fs::remove_file(&local_path);
+                        debug!("媒体 hash 校验失败，已丢弃 {}", local_path.display());
+                    }
                 }
                 Err(e) => {
                     let _ = std::fs::remove_file(&tmp_path);
@@ -630,6 +807,7 @@ pub fn import_sync_data(
     db: &crate::database::Database,
     zip_data: &[u8],
     options: &SyncOptions,
+    data_dir: &Path,
 ) -> Result<ImportResult, String> {
     use std::io::Cursor;
 
@@ -637,6 +815,15 @@ pub fn import_sync_data(
     let mut archive = zip::ZipArchive::new(reader).map_err(|e| format!("读取 ZIP 失败: {}", e))?;
 
     let mut result = ImportResult::default();
+
+    // 先读媒体映射表，导入条目时即可把跨设备路径改写为本机安全路径。
+    if let Ok(mut entry) = archive.by_name("media_map.json") {
+        let mut json = String::new();
+        entry.read_to_string(&mut json).map_err(|e| e.to_string())?;
+        if let Ok(map) = serde_json::from_str::<Vec<MediaEntry>>(&json) {
+            result.media_map = map;
+        }
+    }
 
     // 导入设置
     if options.sync_settings {
@@ -681,8 +868,33 @@ pub fn import_sync_data(
     if let Ok(mut entry) = archive.by_name("items.json") {
         let mut json = String::new();
         entry.read_to_string(&mut json).map_err(|e| e.to_string())?;
-        let items: Vec<crate::database::ClipboardItem> =
+        let mut items: Vec<crate::database::ClipboardItem> =
             serde_json::from_str(&json).map_err(|e| format!("解析条目失败: {}", e))?;
+
+        let media_index = build_media_index(&result.media_map);
+        let max_image_bytes = calc_max_byte_size(options.max_image_size_kb);
+        let max_file_bytes = calc_max_byte_size(options.max_file_size_kb);
+        let max_video_bytes = calc_max_byte_size(options.max_video_size_kb);
+        let before_count = items.len();
+        items.retain(|item| {
+            let allowed = item_importable_for_sync(
+                item,
+                &media_index,
+                max_image_bytes,
+                max_file_bytes,
+                max_video_bytes,
+            );
+            if !allowed {
+                debug!("同步导入跳过条目 {}：媒体不存在或超过限制", item.id);
+            }
+            allowed
+        });
+        if before_count != items.len() {
+            info!("同步导入过滤 {} 条无效媒体记录", before_count - items.len());
+        }
+        for item in &mut items {
+            rewrite_item_media_paths(item, &media_index, data_dir);
+        }
 
         let repo = crate::database::ClipboardRepository::new(db);
         let imported = repo
@@ -705,15 +917,6 @@ pub fn import_sync_data(
         }
     }
 
-    // 提取媒体映射表
-    if let Ok(mut entry) = archive.by_name("media_map.json") {
-        let mut json = String::new();
-        entry.read_to_string(&mut json).map_err(|e| e.to_string())?;
-        if let Ok(map) = serde_json::from_str::<Vec<MediaEntry>>(&json) {
-            result.media_map = map;
-        }
-    }
-
     Ok(result)
 }
 
@@ -723,6 +926,255 @@ pub struct ImportResult {
     pub items_imported: usize,
     #[serde(skip)]
     pub media_map: Vec<MediaEntry>,
+}
+
+/// 按来源设备路径索引媒体映射。旧映射缺少新字段时仍可正常读取。
+pub fn build_media_index(map: &[MediaEntry]) -> std::collections::HashMap<&str, &MediaEntry> {
+    let mut index = std::collections::HashMap::new();
+    for entry in map {
+        index.entry(entry.local_path.as_str()).or_insert(entry);
+    }
+    index
+}
+
+/// 导入前检查媒体映射与大小限制，避免把无法落地的 ghost 条目写入数据库。
+pub fn item_importable_for_sync(
+    item: &crate::database::ClipboardItem,
+    media_index: &std::collections::HashMap<&str, &MediaEntry>,
+    max_image_bytes: i64,
+    max_file_bytes: i64,
+    max_video_bytes: i64,
+) -> bool {
+    match item.content_type.as_str() {
+        "image" => {
+            if item.byte_size > max_image_bytes {
+                return false;
+            }
+            item.image_path.as_ref().is_some_and(|path| {
+                Path::new(path).is_file() || media_index.contains_key(path.as_str())
+            })
+        }
+        "files" | "video" => {
+            let max_bytes = if item.content_type == "video" {
+                max_video_bytes
+            } else {
+                max_file_bytes
+            };
+            if item.byte_size > max_bytes {
+                return false;
+            }
+            let Some(paths_json) = item.file_paths.as_ref() else {
+                return false;
+            };
+            let Ok(paths) = serde_json::from_str::<Vec<String>>(paths_json) else {
+                return false;
+            };
+            !paths.is_empty()
+                && paths.iter().all(|path| {
+                    Path::new(path).is_file() || media_index.contains_key(path.as_str())
+                })
+        }
+        _ => true,
+    }
+}
+
+fn media_entry_for_path<'a>(
+    path: &str,
+    media_index: &'a std::collections::HashMap<&'a str, &'a MediaEntry>,
+    data_dir: &Path,
+) -> Option<&'a MediaEntry> {
+    if let Some(entry) = media_index.get(path) {
+        return Some(*entry);
+    }
+    media_index.values().copied().find(|entry| {
+        local_media_target(entry, data_dir)
+            .map(|target| target.to_string_lossy() == path)
+            .unwrap_or(false)
+    })
+}
+
+fn local_path_matches_entry(path: &str, entry: &MediaEntry) -> bool {
+    Path::new(path).is_file()
+        && file_hash_from_path(Path::new(path))
+            .map(|(hash, _)| hash == entry.hash)
+            .unwrap_or(false)
+}
+
+/// 将同步条目的图片、图标和文件路径改写为本机落地路径。
+/// 这样跨设备同步不会尝试向来源设备的绝对路径写文件。
+pub fn rewrite_item_media_paths(
+    item: &mut crate::database::ClipboardItem,
+    media_index: &std::collections::HashMap<&str, &MediaEntry>,
+    data_dir: &Path,
+) -> bool {
+    let mut changed = false;
+
+    if item.content_type == "image"
+        && let Some(path) = item.image_path.as_ref()
+        && let Some(entry) = media_entry_for_path(path, media_index, data_dir)
+        && !local_path_matches_entry(path, entry)
+        && let Some(target) = local_media_target(entry, data_dir)
+    {
+        let target = target.to_string_lossy().to_string();
+        if item.image_path.as_deref() != Some(target.as_str()) {
+            item.image_path = Some(target);
+            changed = true;
+        }
+    }
+
+    if let Some(path) = item.source_app_icon.as_ref()
+        && let Some(entry) = media_entry_for_path(path, media_index, data_dir)
+        && !local_path_matches_entry(path, entry)
+        && let Some(target) = local_media_target(entry, data_dir)
+    {
+        let target = target.to_string_lossy().to_string();
+        if item.source_app_icon.as_deref() != Some(target.as_str()) {
+            item.source_app_icon = Some(target);
+            changed = true;
+        }
+    }
+
+    if (item.content_type == "files" || item.content_type == "video")
+        && let Some(paths_json) = item.file_paths.as_ref()
+        && let Ok(mut paths) = serde_json::from_str::<Vec<String>>(paths_json)
+    {
+        for path in &mut paths {
+            let Some(entry) = media_entry_for_path(path, media_index, data_dir) else {
+                continue;
+            };
+            if local_path_matches_entry(path, entry) {
+                continue;
+            }
+            if let Some(target) = local_media_target(entry, data_dir) {
+                let target = target.to_string_lossy().to_string();
+                if *path != target {
+                    *path = target;
+                    changed = true;
+                }
+            }
+        }
+        let all_valid = !paths.is_empty()
+            && paths.iter().all(|path| {
+                let entry = media_entry_for_path(path, media_index, data_dir);
+                entry
+                    .map(|entry| local_path_matches_entry(path, entry))
+                    .unwrap_or_else(|| Path::new(path).is_file())
+            });
+        if item.files_valid != Some(all_valid) {
+            item.files_valid = Some(all_valid);
+            changed = true;
+        }
+        if let Ok(updated) = serde_json::to_string(&paths)
+            && item.file_paths.as_deref() != Some(updated.as_str())
+        {
+            item.file_paths = Some(updated);
+        }
+    }
+
+    changed
+}
+
+/// 修复库中跨设备同步遗留的媒体路径，并重新计算 files/video 的有效状态。
+/// 返回被更新的条目数。
+pub fn reconcile_local_media(
+    db: &crate::database::Database,
+    media_map: &[MediaEntry],
+    data_dir: &Path,
+) -> usize {
+    if media_map.is_empty() {
+        return 0;
+    }
+    let repo = crate::database::ClipboardRepository::new(db);
+    let Ok(items) = repo.query_media_items() else {
+        return 0;
+    };
+    let media_index = build_media_index(media_map);
+    let mut fixed = 0usize;
+
+    for mut item in items {
+        let changed = rewrite_item_media_paths(&mut item, &media_index, data_dir);
+        if !changed {
+            continue;
+        }
+        match repo.update_item_media_paths(
+            item.id,
+            item.image_path.as_deref(),
+            item.file_paths.as_deref(),
+            item.source_app_icon.as_deref(),
+            item.files_valid,
+        ) {
+            Ok(()) => fixed += 1,
+            Err(e) => debug!("媒体路径修复失败 {}: {}", item.id, e),
+        }
+    }
+
+    if fixed > 0 {
+        info!("媒体路径自愈: 修复 {} 条记录", fixed);
+    }
+    fixed
+}
+
+/// 只计划下载当前数据库条目引用、且本机目标缺失或校验不通过的媒体。
+pub fn plan_media_downloads(
+    db: &crate::database::Database,
+    media_map: &[MediaEntry],
+    data_dir: &Path,
+) -> Vec<MediaEntry> {
+    if media_map.is_empty() {
+        return Vec::new();
+    }
+    let repo = crate::database::ClipboardRepository::new(db);
+    let Ok(items) = repo.query_media_items() else {
+        return Vec::new();
+    };
+    let mut referenced = std::collections::HashSet::new();
+    for item in items {
+        if let Some(path) = item.image_path {
+            referenced.insert(path);
+        }
+        if let Some(path) = item.source_app_icon {
+            referenced.insert(path);
+        }
+        if let Some(paths_json) = item.file_paths
+            && let Ok(paths) = serde_json::from_str::<Vec<String>>(&paths_json)
+        {
+            referenced.extend(paths);
+        }
+    }
+
+    media_map
+        .iter()
+        .filter(|entry| {
+            let Some(target) = local_media_target(entry, data_dir) else {
+                return false;
+            };
+            let target_string = target.to_string_lossy().to_string();
+            let referenced_locally = referenced.contains(&entry.local_path)
+                || referenced.contains(&target_string);
+            let target_valid = target.is_file()
+                && file_hash_from_path(&target)
+                    .map(|(hash, _)| hash == entry.hash)
+                    .unwrap_or(false);
+            referenced_locally && !target_valid
+        })
+        .cloned()
+        .collect()
+}
+
+/// 媒体落地完成后通知前端重新读取条目和文件状态。
+pub fn emit_webdav_media_ready(app: &tauri::AppHandle) {
+    use tauri::Emitter;
+    let _ = app.emit("webdav-media-ready", ());
+}
+
+fn finish_auto_media_worker(
+    pending: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    app: &tauri::AppHandle,
+) {
+    if pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+        MEDIA_SYNC_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    emit_webdav_media_ready(app);
 }
 
 /// 从 WebDAV 下载独立的 media_map.json（权威媒体映射表）
@@ -753,13 +1205,15 @@ pub fn upload_media_map(config: &WebDavConfig, local_entries: &[MediaEntry], dev
     let mut map = download_media_map(config).unwrap_or_default();
 
     // 移除当前设备的旧条目（含 device_id 匹配的，以及无 device_id 的旧数据）
-    let local_hashes: std::collections::HashSet<&str> =
-        local_entries.iter().map(|e| e.hash.as_str()).collect();
+    let local_keys: std::collections::HashSet<(&str, &str)> = local_entries
+        .iter()
+        .map(|e| (e.hash.as_str(), e.local_path.as_str()))
+        .collect();
     let before = map.len();
     map.retain(|e| {
         if e.device_id == device_id || e.device_id.is_empty() {
             // 当前设备（或旧格式无标识）的条目：仅保留仍在本地引用的
-            local_hashes.contains(e.hash.as_str())
+            local_keys.contains(&(e.hash.as_str(), e.local_path.as_str()))
         } else {
             // 其他设备的条目：始终保留
             true
@@ -767,12 +1221,18 @@ pub fn upload_media_map(config: &WebDavConfig, local_entries: &[MediaEntry], dev
     });
     let removed = before - map.len();
 
-    // 添加当前设备的新条目（按 hash+device_id 去重）
-    let existing: std::collections::HashSet<(String, String)> =
-        map.iter().map(|e| (e.hash.clone(), e.device_id.clone())).collect();
+    // 添加当前设备的新条目（同内容但不同来源路径也必须保留映射）
+    let existing: std::collections::HashSet<(String, String, String)> = map
+        .iter()
+        .map(|e| (e.hash.clone(), e.device_id.clone(), e.local_path.clone()))
+        .collect();
     let mut added = 0usize;
     for entry in local_entries {
-        if !existing.contains(&(entry.hash.clone(), entry.device_id.clone())) {
+        if !existing.contains(&(
+            entry.hash.clone(),
+            entry.device_id.clone(),
+            entry.local_path.clone(),
+        )) {
             map.push(entry.clone());
             added += 1;
         }
@@ -1004,7 +1464,11 @@ static MEDIA_SYNC_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::At
 
 /// 启动后台自动同步任务（在 app setup 中调用一次）
 /// 轻量同步（元数据）按设定间隔频繁同步；媒体同步（图片/文件）在独立线程异步执行
-pub fn start_auto_sync_task(db: crate::database::Database, data_dir: std::path::PathBuf) {
+pub fn start_auto_sync_task(
+    db: crate::database::Database,
+    data_dir: std::path::PathBuf,
+    app: tauri::AppHandle,
+) {
     std::thread::Builder::new()
         .name("webdav-auto-sync".into())
         .spawn(move || {
@@ -1076,7 +1540,16 @@ pub fn start_auto_sync_task(db: crate::database::Database, data_dir: std::path::
 
                             // 合并本地映射到远端 media_map.json（返回所有设备的完整映射）
                             let merged_map = if !local_map.is_empty() {
-                                upload_media_map(&config, &local_map, &device_id).unwrap_or_default()
+                                match upload_media_map(&config, &local_map, &device_id) {
+                                    Ok(map) => map,
+                                    Err(error) => {
+                                        info!("上传 media_map 失败，跳过本轮媒体同步: {}", error);
+                                        MEDIA_SYNC_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
+                                        cycle_count = cycle_count.wrapping_add(1);
+                                        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+                                        continue;
+                                    }
+                                }
                             } else {
                                 download_media_map(&config).unwrap_or_default()
                             };
@@ -1090,44 +1563,28 @@ pub fn start_auto_sync_task(db: crate::database::Database, data_dir: std::path::
                             let local_videos: Vec<MediaEntry> = local_map.iter().filter(|e| e.media_type == "video").cloned().collect();
                             let local_icons: Vec<MediaEntry> = local_map.iter().filter(|e| e.media_type == "icon").cloned().collect();
 
-                            // 仅下载本地数据库已有条目引用的媒体（避免下载未导入元数据的其他设备文件成为孤立文件）
-                            let mut local_referenced_paths = std::collections::HashSet::new();
-                            for item in &local_items {
-                                if item.content_type == "image" {
-                                    if let Some(ref p) = item.image_path {
-                                        local_referenced_paths.insert(p.clone());
-                                    }
-                                }
-                                if let Some(ref p) = item.source_app_icon {
-                                    local_referenced_paths.insert(p.clone());
-                                }
-                                if item.content_type == "files" || item.content_type == "video" {
-                                    if let Some(ref paths_json) = item.file_paths {
-                                        if let Ok(paths) = serde_json::from_str::<Vec<String>>(paths_json) {
-                                            for p in paths {
-                                                local_referenced_paths.insert(p);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            let invalid_paths = crate::database::ClipboardRepository::new(&db)
-                                .get_invalid_file_paths_set();
-                            let dl_images: Vec<MediaEntry> = merged_map.iter()
-                                .filter(|e| e.media_type == "image" && local_referenced_paths.contains(&e.local_path))
-                                .cloned().collect();
-                            let dl_icons: Vec<MediaEntry> = merged_map.iter()
-                                .filter(|e| e.media_type == "icon" && local_referenced_paths.contains(&e.local_path))
-                                .cloned().collect();
-                            let dl_files: Vec<MediaEntry> = merged_map.iter()
-                                .filter(|e| e.media_type == "file"
-                                    && local_referenced_paths.contains(&e.local_path)
-                                    && !invalid_paths.contains(&e.local_path))
-                                .cloned().collect();
-                            let dl_videos: Vec<MediaEntry> = merged_map.into_iter()
-                                .filter(|e| e.media_type == "video"
-                                    && local_referenced_paths.contains(&e.local_path)
-                                    && !invalid_paths.contains(&e.local_path))
+                            // 先修复跨设备遗留路径，再仅下载当前条目实际引用的缺失媒体。
+                            let fixed = reconcile_local_media(&db, &merged_map, &data_dir);
+                            let needed = plan_media_downloads(&db, &merged_map, &data_dir);
+                            let dl_images: Vec<MediaEntry> = needed
+                                .iter()
+                                .filter(|e| e.media_type == "image")
+                                .cloned()
+                                .collect();
+                            let dl_icons: Vec<MediaEntry> = needed
+                                .iter()
+                                .filter(|e| e.media_type == "icon")
+                                .cloned()
+                                .collect();
+                            let dl_files: Vec<MediaEntry> = needed
+                                .iter()
+                                .filter(|e| e.media_type == "file")
+                                .cloned()
+                                .collect();
+                            let dl_videos: Vec<MediaEntry> = needed
+                                .iter()
+                                .filter(|e| e.media_type == "video")
+                                .cloned()
                                 .collect();
 
                             // 用计数器追踪活跃线程数，全部完成后清除标志
@@ -1139,6 +1596,7 @@ pub fn start_auto_sync_task(db: crate::database::Database, data_dir: std::path::
                                 let cfg = config.clone();
                                 let dir = data_dir.clone();
                                 let cnt = pending.clone();
+                                let app_handle = app.clone();
                                 std::thread::Builder::new()
                                     .name("webdav-sync-images".into())
                                     .spawn(move || {
@@ -1154,9 +1612,11 @@ pub fn start_auto_sync_task(db: crate::database::Database, data_dir: std::path::
                                                 Err(e) => info!("图片下载失败: {}", e),
                                             }
                                         }
-                                        if cnt.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) == 1 {
-                                            MEDIA_SYNC_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
-                                        }
+                                        finish_auto_media_worker(&cnt, &app_handle);
+                                    })
+                                    .map_err(|error| {
+                                        info!("图片同步线程启动失败: {}", error);
+                                        finish_auto_media_worker(&pending, &app);
                                     })
                                     .ok();
                             }
@@ -1167,6 +1627,7 @@ pub fn start_auto_sync_task(db: crate::database::Database, data_dir: std::path::
                                 let cfg = config.clone();
                                 let dir = data_dir.clone();
                                 let cnt = pending.clone();
+                                let app_handle = app.clone();
                                 std::thread::Builder::new()
                                     .name("webdav-sync-files".into())
                                     .spawn(move || {
@@ -1182,9 +1643,11 @@ pub fn start_auto_sync_task(db: crate::database::Database, data_dir: std::path::
                                                 Err(e) => info!("文件下载失败: {}", e),
                                             }
                                         }
-                                        if cnt.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) == 1 {
-                                            MEDIA_SYNC_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
-                                        }
+                                        finish_auto_media_worker(&cnt, &app_handle);
+                                    })
+                                    .map_err(|error| {
+                                        info!("文件同步线程启动失败: {}", error);
+                                        finish_auto_media_worker(&pending, &app);
                                     })
                                     .ok();
                             }
@@ -1195,6 +1658,7 @@ pub fn start_auto_sync_task(db: crate::database::Database, data_dir: std::path::
                                 let cfg = config.clone();
                                 let dir = data_dir.clone();
                                 let cnt = pending.clone();
+                                let app_handle = app.clone();
                                 std::thread::Builder::new()
                                     .name("webdav-sync-videos".into())
                                     .spawn(move || {
@@ -1210,9 +1674,11 @@ pub fn start_auto_sync_task(db: crate::database::Database, data_dir: std::path::
                                                 Err(e) => info!("视频下载失败: {}", e),
                                             }
                                         }
-                                        if cnt.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) == 1 {
-                                            MEDIA_SYNC_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
-                                        }
+                                        finish_auto_media_worker(&cnt, &app_handle);
+                                    })
+                                    .map_err(|error| {
+                                        info!("视频同步线程启动失败: {}", error);
+                                        finish_auto_media_worker(&pending, &app);
                                     })
                                     .ok();
                             }
@@ -1223,6 +1689,7 @@ pub fn start_auto_sync_task(db: crate::database::Database, data_dir: std::path::
                                 let cfg = config.clone();
                                 let dir = data_dir.clone();
                                 let cnt = pending.clone();
+                                let app_handle = app.clone();
                                 std::thread::Builder::new()
                                     .name("webdav-sync-icons".into())
                                     .spawn(move || {
@@ -1238,9 +1705,11 @@ pub fn start_auto_sync_task(db: crate::database::Database, data_dir: std::path::
                                                 Err(e) => info!("图标下载失败: {}", e),
                                             }
                                         }
-                                        if cnt.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) == 1 {
-                                            MEDIA_SYNC_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
-                                        }
+                                        finish_auto_media_worker(&cnt, &app_handle);
+                                    })
+                                    .map_err(|error| {
+                                        info!("图标同步线程启动失败: {}", error);
+                                        finish_auto_media_worker(&pending, &app);
                                     })
                                     .ok();
                             }
@@ -1248,6 +1717,9 @@ pub fn start_auto_sync_task(db: crate::database::Database, data_dir: std::path::
                             // 如果没有启动任何线程，立即清除标志
                             if pending.load(std::sync::atomic::Ordering::Relaxed) == 0 {
                                 MEDIA_SYNC_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
+                                if fixed > 0 {
+                                    emit_webdav_media_ready(&app);
+                                }
                             }
                         }
                     }
@@ -1309,5 +1781,119 @@ pub fn download_sync(config: &WebDavConfig, filename: &str) -> Result<Option<Vec
             Ok(None)
         }
         _ => Err(format!("下载失败: HTTP {}", status)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn media_entry(media_type: &str, local_path: &str, hash: &str) -> MediaEntry {
+        MediaEntry {
+            hash: hash.to_string(),
+            ext: "png".to_string(),
+            media_type: media_type.to_string(),
+            local_path: local_path.to_string(),
+            device_id: "device".to_string(),
+            file_name: String::new(),
+            size: 0,
+            source_path: None,
+        }
+    }
+
+    fn file_item(id: i64, paths: Vec<String>) -> crate::database::ClipboardItem {
+        crate::database::ClipboardItem {
+            id,
+            content_type: "files".to_string(),
+            text_content: None,
+            html_content: None,
+            rtf_content: None,
+            image_path: None,
+            file_paths: Some(serde_json::to_string(&paths).unwrap()),
+            content_hash: format!("content-{id}"),
+            semantic_hash: format!("semantic-{id}"),
+            preview: None,
+            byte_size: 1,
+            image_width: None,
+            image_height: None,
+            is_pinned: false,
+            is_favorite: false,
+            sort_order: id,
+            created_at: String::new(),
+            updated_at: String::new(),
+            access_count: 0,
+            last_accessed_at: None,
+            char_count: None,
+            source_app_name: None,
+            source_app_icon: None,
+            files_valid: Some(true),
+        }
+    }
+
+    #[test]
+    fn local_media_target_rejects_untrusted_path_components() {
+        let mut entry = media_entry("image", "C:\\source\\x.png", "../../escape");
+        assert!(local_media_target(&entry, Path::new("D:\\data")).is_none());
+        entry.hash = "abc123".to_string();
+        entry.file_name = "..\\..\\escape.exe".to_string();
+        entry.media_type = "file".to_string();
+        assert!(local_media_target(&entry, Path::new("D:\\data")).is_none());
+    }
+
+    #[test]
+    fn rewrite_maps_remote_file_to_staged_target_and_marks_it_missing() {
+        let source = r"C:\\Users\\other\\report.txt";
+        let mut item = file_item(1, vec![source.to_string()]);
+        item.files_valid = Some(false);
+        let mut entry = media_entry("file", source, "abc123");
+        entry.file_name = "report.txt".to_string();
+        let map = vec![entry];
+        let index = build_media_index(&map);
+        let data_dir = Path::new(r"D:\\ElegantClipboard");
+
+        assert!(rewrite_item_media_paths(&mut item, &index, data_dir));
+        let paths: Vec<String> = serde_json::from_str(item.file_paths.as_deref().unwrap()).unwrap();
+        assert_eq!(paths[0], r"D:\\ElegantClipboard\staged\webdav\abc123_report.txt");
+        assert_eq!(item.files_valid, Some(false));
+    }
+
+    #[test]
+    fn importability_requires_media_mapping_for_missing_files() {
+        let source = r"C:\\Users\\other\\report.txt";
+        let item = file_item(2, vec![source.to_string()]);
+        let empty = std::collections::HashMap::new();
+        assert!(!item_importable_for_sync(&item, &empty, i64::MAX, i64::MAX, i64::MAX));
+    }
+
+    #[test]
+    fn build_media_map_keeps_same_content_at_distinct_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "elegant-clipboard-webdav-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.txt");
+        let second = root.join("second.txt");
+        std::fs::write(&first, b"same content").unwrap();
+        std::fs::write(&second, b"same content").unwrap();
+        let items = vec![
+            file_item(3, vec![first.to_string_lossy().to_string()]),
+            file_item(4, vec![second.to_string_lossy().to_string()]),
+        ];
+        let options = SyncOptions {
+            sync_text: false,
+            sync_image: false,
+            sync_files: true,
+            sync_video: false,
+            sync_settings: false,
+            max_image_size_kb: 0,
+            max_file_size_kb: 0,
+            max_video_size_kb: 0,
+        };
+
+        let map = build_media_map(&items, &root, &options, "device");
+        assert_eq!(map.len(), 2);
+        assert_ne!(map[0].local_path, map[1].local_path);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

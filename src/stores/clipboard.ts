@@ -9,7 +9,7 @@ import { useUISettings } from "@/stores/ui-settings";
 
 export interface ClipboardItem {
   id: number;
-  content_type: "text" | "image" | "html" | "rtf" | "files" | "video";
+  content_type: "text" | "image" | "html" | "rtf" | "files" | "video" | "url";
   text_content: string | null;
   html_content: string | null;
   rtf_content: string | null;
@@ -406,6 +406,10 @@ export const useClipboardStore = create<ClipboardState>((set, get) => ({
       }
     });
 
+    const unlistenMedia = await listen<void>("webdav-media-ready", async () => {
+      await get().refresh();
+    });
+
     // 编辑器保存后的原地更新（不改变条目位置）
     const unlistenEdit = await listen<number>("clipboard-item-edited", async (event) => {
       const id = event.payload;
@@ -424,7 +428,7 @@ export const useClipboardStore = create<ClipboardState>((set, get) => ({
       }
     });
 
-    return () => { unlisten(); unlistenEdit(); };
+    return () => { unlisten(); unlistenEdit(); unlistenMedia(); };
   },
 
   // 批量选择

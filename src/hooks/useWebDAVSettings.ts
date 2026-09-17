@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useKeyedDebounce } from "@/hooks/useKeyedDebounce";
 import { logError } from "@/lib/logger";
 
 export type ProxyMode = "system" | "none" | "custom";
@@ -30,7 +31,7 @@ export function useWebDAVSettings() {
   const [maxVideoSizeKb, setMaxVideoSizeKb] = useState("5120");
   const [lastSyncTime, setLastSyncTime] = useState("");
   const [loaded, setLoaded] = useState(false);
-  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scheduleSave = useKeyedDebounce<string>();
 
   const loadSettings = useCallback(async () => {
     try {
@@ -78,9 +79,8 @@ export function useWebDAVSettings() {
   }, []);
 
   const debouncedSave = useCallback((key: string, value: string) => {
-    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(() => saveSetting(key, value), 300);
-  }, [saveSetting]);
+    scheduleSave(key, () => { void saveSetting(key, value); });
+  }, [saveSetting, scheduleSave]);
 
   useEffect(() => {
     if (!loaded) return;
