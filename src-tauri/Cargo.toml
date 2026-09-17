@@ -8,6 +8,9 @@ edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+native-smoke = []
+
 [lib]
 name = "elegant_clipboard_lib"
 crate-type = ["cdylib", "rlib"]
@@ -17,7 +20,8 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
-panic = "abort"
+# Monitor/clipboard workers use catch_unwind and RAII recovery in release too.
+panic = "unwind"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -40,7 +44,7 @@ serde_json = "1"
 rusqlite = { version = "0.38", features = ["bundled", "backup"] }
 
 # Async runtime (only the features Tauri commands actually need)
-tokio = { version = "1", features = ["rt", "time"] }
+tokio = { version = "1", features = ["rt", "time", "sync"] }
 
 # Logging
 tracing = "0.1"
@@ -97,6 +101,7 @@ windows = { version = "0.61", features = [
     "Win32_UI_Accessibility",
     "Win32_Security",
     "Win32_System_Threading",
+    "Win32_System_Com",
     "Win32_System_ProcessStatus",
     "Win32_UI_Shell",
     "Win32_Graphics_Dwm",
@@ -109,3 +114,4 @@ windows = { version = "0.61", features = [
 # Windows registry for disabling system Win+V and admin launch
 winreg = "0.55"
 windows-core = "0.61"
+webview2-com = "0.38"
