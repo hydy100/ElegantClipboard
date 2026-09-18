@@ -13,8 +13,56 @@ import { getFileNameFromPath } from "@/lib/format";
 
 // ============ 视频缩略图 LRU 缓存 ============
 
-const THUMB_CACHE_MAX = 50;
+const THUMB_CACHE_MAX = 32;
+const THUMB_MAX_EDGE = 320;
 const thumbCache = new Map<string, string>();
+type ThumbnailTask = {
+  cancelled: boolean;
+  finished: boolean;
+  done?: () => void;
+  start: (done: () => void) => void;
+};
+const thumbnailQueue: ThumbnailTask[] = [];
+let activeThumbnailTasks = 0;
+
+function pumpThumbnailQueue(): void {
+  if (activeThumbnailTasks > 0) return;
+  const task = thumbnailQueue.shift();
+  if (!task) return;
+  if (task.cancelled) {
+    pumpThumbnailQueue();
+    return;
+  }
+
+  activeThumbnailTasks = 1;
+  const done = () => {
+    if (task.finished) return;
+    task.finished = true;
+    task.done = undefined;
+    activeThumbnailTasks = 0;
+    pumpThumbnailQueue();
+  };
+  task.done = done;
+  try {
+    task.start(done);
+  } catch {
+    done();
+  }
+}
+
+function enqueueThumbnail(start: ThumbnailTask["start"]): () => void {
+  const task: ThumbnailTask = {
+    cancelled: false,
+    finished: false,
+    start,
+  };
+  thumbnailQueue.push(task);
+  pumpThumbnailQueue();
+  return () => {
+    task.cancelled = true;
+    task.done?.();
+  };
+}
 
 function getThumbFromCache(path: string): string | null {
   const url = thumbCache.get(path);
@@ -29,7 +77,15 @@ function getThumbFromCache(path: string): string | null {
 function setThumbToCache(path: string, url: string): void {
   if (thumbCache.size >= THUMB_CACHE_MAX) {
     const oldest = thumbCache.keys().next().value;
-    if (oldest !== undefined) thumbCache.delete(oldest);
+    if (oldest !== undefined) {
+      const oldUrl = thumbCache.get(oldest);
+      thumbCache.delete(oldest);
+      if (oldUrl?.startsWith("blob:")) URL.revokeObjectURL(oldUrl);
+    }
+  }
+  const previous = thumbCache.get(path);
+  if (previous && previous !== url && previous.startsWith("blob:")) {
+    URL.revokeObjectURL(previous);
   }
   thumbCache.set(path, url);
 }
@@ -81,45 +137,76 @@ export const VideoContent = memo(function VideoContent({
     }
 
     let cancelled = false;
-    const video = document.createElement("video");
-    video.preload = "metadata";
-    video.muted = true;
-    video.playsInline = true;
-    video.src = convertFileSrc(firstPath);
-
-    video.addEventListener("loadeddata", () => {
-      if (cancelled) return;
-      video.currentTime = Math.min(1, video.duration * 0.1);
-    });
-
-    video.addEventListener("seeked", () => {
-      if (cancelled) return;
-      try {
-        const canvas = document.createElement("canvas");
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        const ctx = canvas.getContext("2d");
-        if (ctx) {
-          ctx.drawImage(video, 0, 0);
-          const dataUrl = canvas.toDataURL("image/jpeg", 0.7);
-          setThumbToCache(firstPath, dataUrl);
-          setThumbUrl(dataUrl);
-        } else {
-          setThumbError(true);
-        }
-      } catch {
-        setThumbError(true);
+    let video: HTMLVideoElement | null = null;
+    const cancelTask = enqueueThumbnail((done) => {
+      if (cancelled) {
+        done();
+        return;
       }
-    });
 
-    video.addEventListener("error", () => {
-      if (!cancelled) setThumbError(true);
+      video = document.createElement("video");
+      video.preload = "metadata";
+      video.muted = true;
+      video.playsInline = true;
+      video.src = convertFileSrc(firstPath);
+
+      video.addEventListener("loadeddata", () => {
+        if (!cancelled && video) {
+          video.currentTime = Math.min(1, video.duration * 0.1);
+        }
+      });
+
+      video.addEventListener("seeked", () => {
+        if (cancelled || !video) {
+          done();
+          return;
+        }
+        try {
+          const sourceWidth = Math.max(1, video.videoWidth);
+          const sourceHeight = Math.max(1, video.videoHeight);
+          const scale = Math.min(1, THUMB_MAX_EDGE / Math.max(sourceWidth, sourceHeight));
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.max(1, Math.round(sourceWidth * scale));
+          canvas.height = Math.max(1, Math.round(sourceHeight * scale));
+          const ctx = canvas.getContext("2d");
+          if (!ctx) {
+            setThumbError(true);
+            done();
+            return;
+          }
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          canvas.toBlob((blob) => {
+            if (!blob || cancelled) {
+              if (!cancelled) setThumbError(true);
+              done();
+              return;
+            }
+            const objectUrl = URL.createObjectURL(blob);
+            setThumbToCache(firstPath, objectUrl);
+            setThumbUrl(objectUrl);
+            canvas.width = 1;
+            canvas.height = 1;
+            done();
+          }, "image/jpeg", 0.7);
+        } catch {
+          if (!cancelled) setThumbError(true);
+          done();
+        }
+      });
+
+      video.addEventListener("error", () => {
+        if (!cancelled) setThumbError(true);
+        done();
+      });
     });
 
     return () => {
       cancelled = true;
-      video.src = "";
-      video.load();
+      cancelTask();
+      if (video) {
+        video.src = "";
+        video.load();
+      }
     };
   }, [firstPath, filesInvalid, isMultiple]);
 

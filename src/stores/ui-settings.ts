@@ -135,6 +135,38 @@ const SYNCED_UI_KEYS: (keyof UISettings)[] = [
 ];
 
 const syncedKeySet = new Set<string>(SYNCED_UI_KEYS);
+const SETTING_WRITE_DEBOUNCE_MS = 250;
+const pendingSettingWrites = new Map<string, {
+  value: string;
+  timer: ReturnType<typeof setTimeout>;
+}>();
+
+function scheduleSettingWrite(key: string, value: string): void {
+  const pending = pendingSettingWrites.get(key);
+  if (pending) clearTimeout(pending.timer);
+
+  const timer = setTimeout(() => {
+    pendingSettingWrites.delete(key);
+    invoke("set_setting", { key, value }).catch((error) =>
+      logError(`Failed to persist ${key}:`, error),
+    );
+  }, SETTING_WRITE_DEBOUNCE_MS);
+  pendingSettingWrites.set(key, { value, timer });
+}
+
+function flushSettingWrites(): void {
+  for (const [key, pending] of pendingSettingWrites) {
+    clearTimeout(pending.timer);
+    pendingSettingWrites.delete(key);
+    invoke("set_setting", { key, value: pending.value }).catch((error) =>
+      logError(`Failed to persist ${key}:`, error),
+    );
+  }
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", flushSettingWrites);
+}
 
 export const useUISettings = create<UISettings>()(
   persist(
@@ -148,9 +180,7 @@ export const useUISettings = create<UISettings>()(
           if (syncedKeySet.has(key)) {
             const dbKey = `ui_${toSnakeCase(key)}`;
             const dbVal = typeof value === "object" ? JSON.stringify(value) : String(value);
-            invoke("set_setting", { key: dbKey, value: dbVal }).catch((e) =>
-              logError(`Failed to persist ${dbKey}:`, e),
-            );
+            scheduleSettingWrite(dbKey, dbVal);
           }
         };
 

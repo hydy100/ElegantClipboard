@@ -41,6 +41,7 @@ import {
   isKnownTooLargeForPreview,
   shouldSkipFileImagePreview,
 } from "@/lib/file-preview-limits";
+import { getItemFileStatus } from "@/lib/file-status-cache";
 import {
   contentTypeConfig,
   formatTime,
@@ -201,7 +202,7 @@ export const ClipboardItemCard = memo(function ClipboardItemCard({
     }
 
     let cancelled = false;
-    invoke<{ too_large?: boolean }>("get_item_file_status", { id: item.id })
+    getItemFileStatus(item.id)
       .then((status) => {
         if (!cancelled) setBackendTooLarge(status.too_large === true);
       })

@@ -9,15 +9,31 @@ use tauri::State;
 fn load_webdav_config(state: &Arc<AppState>) -> Result<WebDavConfig, String> {
     let repo = SettingsRepository::new(&state.db);
     let url = repo.get("webdav_url").ok().flatten().unwrap_or_default();
-    let username = repo.get("webdav_username").ok().flatten().unwrap_or_default();
-    let password = repo.get("webdav_password").ok().flatten().unwrap_or_default();
+    let username = repo
+        .get("webdav_username")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let password = repo
+        .get("webdav_password")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let remote_dir = repo
         .get("webdav_remote_dir")
         .ok()
         .flatten()
         .unwrap_or_else(|| "/elegant-clipboard".to_string());
-    let proxy_mode = repo.get("webdav_proxy_mode").ok().flatten().unwrap_or_else(|| "system".to_string());
-    let proxy_url = repo.get("webdav_proxy_url").ok().flatten().unwrap_or_default();
+    let proxy_mode = repo
+        .get("webdav_proxy_mode")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "system".to_string());
+    let proxy_url = repo
+        .get("webdav_proxy_url")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     let accept_invalid_certs = repo
         .get("webdav_accept_invalid_certs")
         .ok()
@@ -94,12 +110,16 @@ pub async fn webdav_upload(
     let options = load_sync_options(&state);
     let data_dir = get_data_dir();
     let db = state.db.clone();
+    let sync_guard =
+        webdav::try_begin_sync_operation().ok_or_else(|| "WebDAV 同步任务正在运行".to_string())?;
 
     tokio::task::spawn_blocking(move || {
+        let _sync_guard = sync_guard;
         // 上传元数据
-        let zip_data = webdav::export_sync_data(&db, &data_dir, &options)?;
-        let size = zip_data.len();
-        webdav::upload_sync(&config, &zip_data, "clipboard_sync.zip")?;
+        let (zip_path, size) = webdav::export_sync_data_to_file(&db, &data_dir, &options)?;
+        let upload_result = webdav::upload_sync_file(&config, &zip_path, "clipboard_sync.zip");
+        let _ = std::fs::remove_file(&zip_path);
+        upload_result?;
 
         // 没有启用任何媒体同步时，不读取、创建或清理 media_map。
         if options.sync_image || options.sync_files || options.sync_video {
@@ -140,8 +160,11 @@ pub async fn webdav_download(
     let options = load_sync_options(&state);
     let data_dir = get_data_dir();
     let db = state.db.clone();
+    let sync_guard =
+        webdav::try_begin_sync_operation().ok_or_else(|| "WebDAV 同步任务正在运行".to_string())?;
 
     tokio::task::spawn_blocking(move || {
+        let _sync_guard = sync_guard;
         let zip_data = webdav::download_sync(&config, "clipboard_sync.zip")?;
         let msg = match zip_data {
             Some(data) => {
@@ -205,68 +228,7 @@ fn build_local_media_map(
 }
 
 /// 启动单类媒体上传线程
-fn spawn_media_upload_worker(
-    app: &tauri::AppHandle,
-    config: &webdav::WebDavConfig,
-    data_dir: &std::path::Path,
-    entries: Vec<webdav::MediaEntry>,
-    thread_name: &'static str,
-    label: &'static str,
-) {
-    if entries.is_empty() {
-        return;
-    }
-
-    let cfg = config.clone();
-    let dir = data_dir.to_path_buf();
-    let handle = app.clone();
-    std::thread::Builder::new()
-        .name(thread_name.into())
-        .spawn(move || {
-            let msg = match webdav::upload_media_files(&cfg, &entries, &dir) {
-                Ok((u, s, bytes)) => format!("{}上传完成：{} 新 ({})，{} 已存在跳过", label, u, format_size(bytes), s),
-                Err(e) => format!("{}上传失败: {}", label, e),
-            };
-            emit_media_sync_done(&handle, &msg);
-        })
-        .ok();
-}
-
-/// 启动单类媒体下载线程
-fn spawn_media_download_worker(
-    app: &tauri::AppHandle,
-    config: &webdav::WebDavConfig,
-    data_dir: &std::path::Path,
-    db: &crate::database::Database,
-    full_media_map: &[webdav::MediaEntry],
-    entries: Vec<webdav::MediaEntry>,
-    thread_name: &'static str,
-    label: &'static str,
-) {
-    if entries.is_empty() {
-        return;
-    }
-
-    let cfg = config.clone();
-    let dir = data_dir.to_path_buf();
-    let handle = app.clone();
-    let database = db.clone();
-    let media_map = full_media_map.to_vec();
-    std::thread::Builder::new()
-        .name(thread_name.into())
-        .spawn(move || {
-            let msg = match webdav::download_missing_media(&cfg, &entries, &dir) {
-                Ok(n) if n > 0 => format!("{}下载完成：{} 个文件", label, n),
-                Ok(_) => format!("{}已是最新", label),
-                Err(e) => format!("{}下载失败: {}", label, e),
-            };
-            let _ = webdav::reconcile_local_media(&database, &media_map, &dir);
-            emit_media_sync_done(&handle, &msg);
-        })
-        .ok();
-}
-
-/// 后台上传实际媒体文件（图片线程 + 文件线程 + 图标线程）
+/// Run all media types through one bounded worker so a sync cannot fan out into four I/O bursts.
 fn spawn_media_upload_files(
     app: &tauri::AppHandle,
     config: &webdav::WebDavConfig,
@@ -276,19 +238,20 @@ fn spawn_media_upload_files(
     if media_map.is_empty() {
         return;
     }
-
-    let images: Vec<_> = media_map.iter().filter(|e| e.media_type == "image").cloned().collect();
-    let files: Vec<_> = media_map.iter().filter(|e| e.media_type == "file").cloned().collect();
-    let videos: Vec<_> = media_map.iter().filter(|e| e.media_type == "video").cloned().collect();
-    let icons: Vec<_> = media_map.iter().filter(|e| e.media_type == "icon").cloned().collect();
-
-    spawn_media_upload_worker(app, config, data_dir, images, "webdav-upload-images", "图片");
-    spawn_media_upload_worker(app, config, data_dir, files, "webdav-upload-files", "文件");
-    spawn_media_upload_worker(app, config, data_dir, videos, "webdav-upload-videos", "视频");
-    spawn_media_upload_worker(app, config, data_dir, icons, "webdav-upload-icons", "图标");
+    let cfg = config.clone();
+    let dir = data_dir.to_path_buf();
+    let handle = app.clone();
+    let entries = media_map.to_vec();
+    std::thread::Builder::new()
+        .name("webdav-upload-media".into())
+        .spawn(move || {
+            webdav::sync_media_entries_sequential(&cfg, &dir, &entries, &[]);
+            emit_media_sync_done(&handle, "Media upload completed");
+        })
+        .ok();
 }
 
-/// 后台下载缺失媒体：检查本地路径，不存在则从 WebDAV 下载到对应位置
+/// Run all media types through one bounded worker and refresh the database once.
 fn spawn_media_download(
     app: &tauri::AppHandle,
     config: &webdav::WebDavConfig,
@@ -297,18 +260,23 @@ fn spawn_media_download(
     full_media_map: &[webdav::MediaEntry],
     media_map: Vec<webdav::MediaEntry>,
 ) {
-    let images: Vec<_> = media_map.iter().filter(|e| e.media_type == "image").cloned().collect();
-    let files: Vec<_> = media_map.iter().filter(|e| e.media_type == "file").cloned().collect();
-    let videos: Vec<_> = media_map.iter().filter(|e| e.media_type == "video").cloned().collect();
-    let icons: Vec<_> = media_map.iter().filter(|e| e.media_type == "icon").cloned().collect();
-
-    spawn_media_download_worker(app, config, data_dir, db, full_media_map, images, "webdav-download-images", "图片");
-    spawn_media_download_worker(app, config, data_dir, db, full_media_map, files, "webdav-download-files", "文件");
-    spawn_media_download_worker(app, config, data_dir, db, full_media_map, videos, "webdav-download-videos", "视频");
-    spawn_media_download_worker(app, config, data_dir, db, full_media_map, icons, "webdav-download-icons", "图标");
+    if media_map.is_empty() {
+        return;
+    }
+    let cfg = config.clone();
+    let dir = data_dir.to_path_buf();
+    let handle = app.clone();
+    let database = db.clone();
+    let full_map = full_media_map.to_vec();
+    std::thread::Builder::new()
+        .name("webdav-download-media".into())
+        .spawn(move || {
+            webdav::sync_media_entries_sequential(&cfg, &dir, &[], &media_map);
+            let _ = webdav::reconcile_local_media(&database, &full_map, &dir);
+            emit_media_sync_done(&handle, "Media download completed");
+        })
+        .ok();
 }
-
-/// 向前端发送媒体同步完成事件
 fn emit_media_sync_done(app: &tauri::AppHandle, message: &str) {
     use tauri::Emitter;
     let _ = app.emit("media-sync-done", message.to_string());

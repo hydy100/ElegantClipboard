@@ -22,6 +22,7 @@ static LOADED_VERSION: LazyLock<parking_lot::RwLock<Option<String>>> =
     LazyLock::new(|| parking_lot::RwLock::new(None));
 static NATIVE_EVENTS_REGISTERED: AtomicBool = AtomicBool::new(false);
 static INTENTIONAL_EXIT: AtomicBool = AtomicBool::new(false);
+static VERSION_UPDATE_NOTIFIED: AtomicBool = AtomicBool::new(false);
 // 0 = none, 1 = restart when safe, 2 = restart immediately, 3 = recovery fuse open.
 static RESTART_LEVEL: AtomicU8 = AtomicU8::new(0);
 static MANAGED_WINDOWS: LazyLock<parking_lot::Mutex<HashMap<String, Arc<WindowReadiness>>>> =
@@ -204,13 +205,9 @@ pub(crate) fn ensure_runtime_current(app: &tauri::AppHandle) -> Result<(), Strin
     let loaded = LOADED_VERSION.read().clone();
 
     if runtime_version_changed(loaded.as_deref(), &available) {
-        tracing::warn!(
-            loaded_version = ?loaded,
-            available_version = %available,
-            "A newer WebView2 runtime is available; dynamic window creation is suspended"
-        );
-        schedule_restart(app, "runtime_version_changed", false);
-        return Err("WebView2 运行时已更新，ElegantClipboard 正在重启".to_string());
+        note_pending_runtime_update(app, Some(&available));
+    } else {
+        VERSION_UPDATE_NOTIFIED.store(false, Ordering::Release);
     }
 
     Ok(())
@@ -218,6 +215,28 @@ pub(crate) fn ensure_runtime_current(app: &tauri::AppHandle) -> Result<(), Strin
 
 fn runtime_version_changed(loaded: Option<&str>, available: &str) -> bool {
     loaded.is_some_and(|loaded| loaded != available)
+}
+
+fn note_pending_runtime_update(app: &tauri::AppHandle, available: Option<&str>) {
+    let loaded = LOADED_VERSION.read().clone();
+    let version_differs = available
+        .map(|available| runtime_version_changed(loaded.as_deref(), available))
+        .unwrap_or(true);
+    if !version_differs {
+        VERSION_UPDATE_NOTIFIED.store(false, Ordering::Release);
+        return;
+    }
+
+    if VERSION_UPDATE_NOTIFIED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    tracing::warn!(
+        loaded_version = ?loaded,
+        available_version = ?available,
+        "A newer WebView2 runtime is available; automatic restart is deferred"
+    );
+    notify_runtime_update_available(app);
 }
 
 #[tauri::command]
@@ -280,8 +299,8 @@ fn start_version_poll(app: tauri::AppHandle) {
             if INTENTIONAL_EXIT.load(Ordering::Acquire) {
                 return;
             }
-            if ensure_runtime_current(&app).is_err() {
-                return;
+            if let Err(error) = ensure_runtime_current(&app) {
+                tracing::warn!(%error, "WebView2 runtime poll failed; retrying later");
             }
         }
     });
@@ -366,6 +385,17 @@ fn notify_recovery_fuse(app: &tauri::AppHandle) {
         .builder()
         .title("ElegantClipboard WebView2 恢复失败")
         .body("已停止自动重启以避免循环，请手动重启或修复 WebView2 Runtime")
+        .show();
+}
+
+fn notify_runtime_update_available(app: &tauri::AppHandle) {
+    use tauri_plugin_notification::NotificationExt;
+
+    let _ = app
+        .notification()
+        .builder()
+        .title("WebView2 运行时已更新")
+        .body("当前窗口继续使用现有运行时；请在方便时重启电脑或结束残留的 msedgewebview2.exe 进程后，再手动重启 ElegantClipboard")
         .show();
 }
 
@@ -487,7 +517,10 @@ fn register_environment_handlers(
 
     let update_app = app.clone();
     let update_handler = NewBrowserVersionAvailableEventHandler::create(Box::new(move |_, _| {
-        schedule_restart(&update_app, "new_browser_version_available", false);
+        let available = tauri::webview_version()
+            .ok()
+            .map(|version| version.to_string());
+        note_pending_runtime_update(&update_app, available.as_deref());
         Ok(())
     }));
     let mut update_token = 0;
@@ -628,7 +661,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_version_change_requires_restart() {
+    fn runtime_version_difference_is_detected_without_implying_recovery() {
         assert!(!runtime_version_changed(None, "151.0"));
         assert!(!runtime_version_changed(Some("151.0"), "151.0"));
         assert!(runtime_version_changed(Some("150.0"), "151.0"));

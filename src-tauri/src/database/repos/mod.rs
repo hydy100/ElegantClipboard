@@ -3,5 +3,5 @@ pub mod sync_dto;
 pub mod tag;
 
 pub use settings::SettingsRepository;
-pub use sync_dto::{TagAssocSyncEntry, TagSyncEntry, TagsSyncData};
+pub use sync_dto::{TagItemSyncEntry, TagSyncEntry, TagsSyncData};
 pub use tag::{Tag, TagRepository};

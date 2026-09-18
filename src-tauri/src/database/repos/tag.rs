@@ -1,8 +1,9 @@
-use crate::database::repos::{TagAssocSyncEntry, TagSyncEntry, TagsSyncData};
+use crate::database::repos::{TagItemSyncEntry, TagSyncEntry, TagsSyncData};
 use crate::database::Database;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
 
@@ -196,12 +197,13 @@ impl TagRepository {
         let mut stmt = conn.prepare(
             "SELECT name, sort_order, created_at FROM tags ORDER BY sort_order ASC",
         )?;
-        let tags: Vec<TagSyncEntry> = stmt
+        let mut tags: Vec<TagSyncEntry> = stmt
             .query_map([], |row| {
                 Ok(TagSyncEntry {
                     name: row.get(0)?,
                     sort_order: row.get(1)?,
                     created_at: row.get(2)?,
+                    associations: Vec::new(),
                 })
             })?
             .filter_map(|r| r.ok())
@@ -213,18 +215,29 @@ impl TagRepository {
              INNER JOIN clipboard_items ci ON ci.id = it.item_id \
              INNER JOIN tags t ON t.id = it.tag_id",
         )?;
-        let associations: Vec<TagAssocSyncEntry> = stmt
-            .query_map([], |row| {
-                Ok(TagAssocSyncEntry {
-                    content_hash: row.get(0)?,
-                    tag_name: row.get(1)?,
-                    sort_order: row.get(2)?,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+        let mut associations_by_tag: HashMap<String, Vec<TagItemSyncEntry>> = HashMap::new();
+        for association in stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })? {
+            let (content_hash, tag_name, sort_order) = association?;
+            associations_by_tag
+                .entry(tag_name)
+                .or_default()
+                .push(TagItemSyncEntry {
+                    content_hash,
+                    sort_order,
+                });
+        }
 
-        Ok(TagsSyncData { tags, associations })
+        for tag in &mut tags {
+            tag.associations = associations_by_tag.remove(&tag.name).unwrap_or_default();
+        }
+
+        Ok(TagsSyncData { tags })
     }
 
     /// 导入标签及其条目关联
@@ -256,11 +269,11 @@ impl TagRepository {
         }
 
         let mut assoc_count = 0usize;
-        for assoc in &data.associations {
+        for (tag_name, content_hash, sort_order) in data.iter_associations() {
             let item_id: Option<i64> = conn
                 .query_row(
                     "SELECT id FROM clipboard_items WHERE content_hash = ?1 LIMIT 1",
-                    params![assoc.content_hash],
+                    params![content_hash],
                     |row| row.get(0),
                 )
                 .ok();
@@ -268,7 +281,7 @@ impl TagRepository {
             let tag_id: Option<i64> = conn
                 .query_row(
                     "SELECT id FROM tags WHERE name = ?1",
-                    params![assoc.tag_name],
+                    params![tag_name],
                     |row| row.get(0),
                 )
                 .ok();
@@ -276,14 +289,14 @@ impl TagRepository {
             if let (Some(item_id), Some(tag_id)) = (item_id, tag_id) {
                 let inserted = conn.execute(
                     "INSERT OR IGNORE INTO item_tags (item_id, tag_id, sort_order) VALUES (?1, ?2, ?3)",
-                    params![item_id, tag_id, assoc.sort_order],
+                    params![item_id, tag_id, sort_order],
                 )?;
                 if inserted > 0 {
                     assoc_count += 1;
                 } else {
                     conn.execute(
                         "UPDATE item_tags SET sort_order = ?1 WHERE item_id = ?2 AND tag_id = ?3",
-                        params![assoc.sort_order, item_id, tag_id],
+                        params![sort_order, item_id, tag_id],
                     )?;
                 }
             }

@@ -1,15 +1,74 @@
 use crate::database::ClipboardRepository;
 use crate::file_preview_limits::{
-    is_too_large_for_preview, preview_limit_bytes, DEFAULT_MAX_IMAGE_SIZE_KB,
+    DEFAULT_MAX_IMAGE_SIZE_KB, is_too_large_for_preview, is_unc_path, preview_limit_bytes,
 };
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 use tauri::State;
 use tracing::{debug, info};
 
 use super::{
-    clipboard::simulate_paste, hide_main_window_if_not_pinned, with_paused_monitor, AppState,
+    AppState, clipboard::simulate_paste, hide_main_window_if_not_pinned, with_paused_monitor,
 };
+
+const LOCAL_FILE_STATUS_TTL: Duration = Duration::from_secs(30);
+const NETWORK_FILE_STATUS_TTL: Duration = Duration::from_secs(300);
+const FULL_VALIDITY_REFRESH_TTL: Duration = Duration::from_secs(180);
+const FILE_METADATA_CACHE_LIMIT: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct CachedMetadata {
+    checked_at: Instant,
+    exists: bool,
+    is_dir: bool,
+    size: Option<u64>,
+}
+
+static FILE_METADATA_CACHE: LazyLock<Mutex<HashMap<String, CachedMetadata>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static LAST_VALIDITY_REFRESH: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
+
+fn metadata_ttl(path: &str) -> Duration {
+    if is_unc_path(path) {
+        NETWORK_FILE_STATUS_TTL
+    } else {
+        LOCAL_FILE_STATUS_TTL
+    }
+}
+
+fn cached_metadata(path: &str, force_refresh: bool) -> CachedMetadata {
+    let now = Instant::now();
+    if !force_refresh {
+        if let Some(cached) = FILE_METADATA_CACHE.lock().get(path).copied() {
+            if now.duration_since(cached.checked_at) < metadata_ttl(path) {
+                return cached;
+            }
+        }
+    }
+
+    let metadata = std::fs::metadata(path).ok();
+    let fresh = CachedMetadata {
+        checked_at: now,
+        exists: metadata.is_some(),
+        is_dir: metadata.as_ref().is_some_and(|value| value.is_dir()),
+        size: metadata.map(|value| value.len()),
+    };
+
+    let mut cache = FILE_METADATA_CACHE.lock();
+    if cache.len() >= FILE_METADATA_CACHE_LIMIT && !cache.contains_key(path) {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, value)| value.checked_at)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(path.to_string(), fresh);
+    fresh
+}
 
 // ============ 文件校验命令 ============
 
@@ -27,21 +86,24 @@ pub async fn check_files_exist(
 ) -> Result<HashMap<String, FileCheckResult>, String> {
     super::run_blocking("check_files_exist", move || {
         use rayon::prelude::*;
-        use std::path::Path;
 
         let result: HashMap<String, FileCheckResult> = paths
             .par_iter()
             .map(|path| {
-                let p = Path::new(path);
-                let metadata = p.metadata().ok();
-                let exists = metadata.is_some();
-                let is_dir = metadata.is_some_and(|m| m.is_dir());
-                (path.clone(), FileCheckResult { exists, is_dir })
+                let metadata = cached_metadata(path, false);
+                (
+                    path.clone(),
+                    FileCheckResult {
+                        exists: metadata.exists,
+                        is_dir: metadata.is_dir,
+                    },
+                )
             })
             .collect();
 
         Ok(result)
-    }).await
+    })
+    .await
 }
 
 #[derive(serde::Serialize)]
@@ -86,29 +148,27 @@ fn item_file_status(
     let checks: HashMap<String, FileCheckResult> = paths
         .iter()
         .map(|path| {
-            let metadata = std::fs::metadata(path).ok();
+            let metadata = cached_metadata(path, false);
             (
                 path.clone(),
                 FileCheckResult {
-                    exists: metadata.is_some(),
-                    is_dir: metadata.as_ref().is_some_and(|meta| meta.is_dir()),
+                    exists: metadata.exists,
+                    is_dir: metadata.is_dir,
                 },
             )
         })
         .collect();
     let all_exist = !paths.is_empty() && checks.values().all(|result| result.exists);
-    let too_large = if item.content_type == "files"
-        && paths.len() == 1
-        && is_image_path(&paths[0])
+    let too_large = if item.content_type == "files" && paths.len() == 1 && is_image_path(&paths[0])
     {
         if item.byte_size > 0 {
             is_too_large_for_preview(&paths[0], item.byte_size, max_image_size_kb, true)
         } else {
-            std::fs::metadata(&paths[0])
-                .map(|meta| meta.len() > preview_limit_bytes(&paths[0], max_image_size_kb))
-                .unwrap_or_else(|_| {
-                    is_too_large_for_preview(&paths[0], 0, max_image_size_kb, true)
-                })
+            let metadata = cached_metadata(&paths[0], false);
+            metadata
+                .size
+                .map(|size| size > preview_limit_bytes(&paths[0], max_image_size_kb))
+                .unwrap_or_else(|| is_too_large_for_preview(&paths[0], 0, max_image_size_kb, true))
         }
     } else {
         false
@@ -162,17 +222,34 @@ pub async fn batch_get_item_file_status(
 #[tauri::command]
 pub async fn refresh_files_validity(
     state: State<'_, Arc<AppState>>,
+    force: Option<bool>,
 ) -> Result<usize, String> {
     static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let Some(guard) = super::activity::ActivityGuard::acquire(&ACTIVE) else { return Ok(0); };
+    let Some(guard) = super::activity::ActivityGuard::acquire(&ACTIVE) else {
+        return Ok(0);
+    };
     let state = state.inner().clone();
     super::run_blocking("refresh_files_validity", move || {
         let _guard = guard;
         use rayon::prelude::*;
-        use std::path::Path;
+
+        let force_refresh = force.unwrap_or(false);
+        if !force_refresh {
+            let now = Instant::now();
+            let mut last_refresh = LAST_VALIDITY_REFRESH.lock();
+            if last_refresh
+                .as_ref()
+                .is_some_and(|last| now.duration_since(*last) < FULL_VALIDITY_REFRESH_TTL)
+            {
+                return Ok(0);
+            }
+            *last_refresh = Some(now);
+        }
 
         let repo = ClipboardRepository::new(&state.db);
-        let file_items = repo.get_file_items_for_validity_check().map_err(|e| e.to_string())?;
+        let file_items = repo
+            .get_file_items_for_validity_check()
+            .map_err(|e| e.to_string())?;
 
         if file_items.is_empty() {
             return Ok(0);
@@ -182,17 +259,23 @@ pub async fn refresh_files_validity(
             .par_iter()
             .map(|(id, file_paths_json, _current)| {
                 let paths: Vec<String> = serde_json::from_str(file_paths_json).unwrap_or_default();
-                let all_exist = !paths.is_empty() && paths.iter().all(|p| Path::new(p).exists());
+                let all_exist = !paths.is_empty()
+                    && paths
+                        .iter()
+                        .all(|path| cached_metadata(path, force_refresh).exists);
                 (*id, all_exist)
             })
             .collect();
 
-        let changed = repo.batch_update_files_valid(&updates).map_err(|e| e.to_string())?;
+        let changed = repo
+            .batch_update_files_valid(&updates)
+            .map_err(|e| e.to_string())?;
         if changed > 0 {
             debug!("refresh_files_validity: {} items changed", changed);
         }
         Ok(changed)
-    }).await
+    })
+    .await
 }
 
 // ============ 文件操作命令 ============
@@ -238,7 +321,8 @@ pub async fn show_in_explorer(path: String) -> Result<(), String> {
         }
 
         Ok(())
-    }).await
+    })
+    .await
 }
 
 /// 将文件路径作为文本写入剪贴板并粘贴
@@ -269,8 +353,8 @@ pub async fn paste_as_path(
         };
 
         with_paused_monitor(&state, || {
-            let mut clipboard =
-                arboard::Clipboard::new().map_err(|e| format!("Failed to access clipboard: {}", e))?;
+            let mut clipboard = arboard::Clipboard::new()
+                .map_err(|e| format!("Failed to access clipboard: {}", e))?;
             clipboard
                 .set_text(&paths_text)
                 .map_err(|e| format!("Failed to set clipboard text: {}", e))?;
@@ -283,7 +367,8 @@ pub async fn paste_as_path(
             debug!("Pasted file path as text for item {}", id);
             Ok(())
         })
-    }).await
+    })
+    .await
 }
 
 /// 通过系统另存为对话框保存文件
@@ -322,7 +407,8 @@ pub async fn save_file_as(app: tauri::AppHandle, source_path: String) -> Result<
                 Ok(false)
             }
         }
-    }).await
+    })
+    .await
 }
 
 const VIDEO_EXTENSIONS: &[&str] = &[
@@ -347,9 +433,7 @@ fn stream_file_hash(path: &str) -> Option<(String, u64)> {
 /// 获取数据目录大小明细（数据库+图片+文件+视频）
 /// 文件/视频按实际磁盘路径去重，失效条目不计入大小但标注数量
 #[tauri::command]
-pub async fn get_data_size(
-    state: State<'_, Arc<AppState>>,
-) -> Result<DataSizeInfo, String> {
+pub async fn get_data_size(state: State<'_, Arc<AppState>>) -> Result<DataSizeInfo, String> {
     let state = state.inner().clone();
     super::run_blocking("get_data_size", move || {
         let config = crate::config::AppConfig::load();
@@ -373,7 +457,9 @@ pub async fn get_data_size(
             let mut seen_hashes = std::collections::HashSet::<String>::new();
             let mut seen_paths = std::collections::HashSet::new();
             for path in &referenced {
-                if !seen_paths.insert(path) { continue; }
+                if !seen_paths.insert(path) {
+                    continue;
+                }
                 if let Some((hash, file_size)) = stream_file_hash(path) {
                     if seen_hashes.insert(hash) {
                         size += file_size;
@@ -386,9 +472,18 @@ pub async fn get_data_size(
 
         // 从数据库查询 files/video 类型条目
         // 按文件内容 hash 去重计算实际大小，失效条目只计数不计大小
-        let (files_size, files_count, files_invalid_count, videos_size, videos_count, videos_invalid_count) = {
+        let (
+            files_size,
+            files_count,
+            files_invalid_count,
+            videos_size,
+            videos_count,
+            videos_invalid_count,
+        ) = {
             let repo = ClipboardRepository::new(&state.db);
-            let rows = repo.get_files_stats_with_validity().map_err(|e| e.to_string())?;
+            let rows = repo
+                .get_files_stats_with_validity()
+                .map_err(|e| e.to_string())?;
 
             let mut seen_hashes = std::collections::HashSet::<String>::new();
             let mut f_size = 0u64;
@@ -405,13 +500,19 @@ pub async fn get_data_size(
                 let is_invalid = files_valid == Some(false);
 
                 if is_invalid {
-                    if is_video { v_invalid += 1; } else { f_invalid += 1; }
+                    if is_video {
+                        v_invalid += 1;
+                    } else {
+                        f_invalid += 1;
+                    }
                     continue;
                 }
 
                 // 有效条目：按内容 hash 去重后累计实际磁盘大小和数量
                 for p in &paths {
-                    if !seen_paths.insert(p.clone()) { continue; }
+                    if !seen_paths.insert(p.clone()) {
+                        continue;
+                    }
                     if let Some((hash, file_size)) = stream_file_hash(p) {
                         if seen_hashes.insert(hash) {
                             if is_video {
@@ -440,7 +541,8 @@ pub async fn get_data_size(
             videos_invalid_count,
             total_size: db_size + images_size + files_size + videos_size,
         })
-    }).await
+    })
+    .await
 }
 
 #[derive(serde::Serialize)]
@@ -465,7 +567,8 @@ pub async fn get_file_details(path: String) -> Result<FileDetails, String> {
         use std::path::Path;
 
         let path = Path::new(&path);
-        let metadata = fs::metadata(path).map_err(|e| format!("Failed to get file metadata: {}", e))?;
+        let metadata =
+            fs::metadata(path).map_err(|e| format!("Failed to get file metadata: {}", e))?;
 
         let file_type = if metadata.is_dir() {
             "folder".to_string()
@@ -501,7 +604,8 @@ pub async fn get_file_details(path: String) -> Result<FileDetails, String> {
             modified_at: modified,
             created_at: created,
         })
-    }).await
+    })
+    .await
 }
 
 #[derive(serde::Serialize)]

@@ -1031,7 +1031,7 @@ impl ClipboardRepository {
         Ok(items)
     }
 
-    /// 导入同步条目（基于 content_hash 去重，已存在则跳过）
+    /// 导入同步条目（基于 content_hash 去重，已存在则同步状态字段）
     /// 使用事务包裹批量操作，减少 WAL 刷盘次数；复用预编译语句提升逐条处理性能
     pub fn import_sync_items(&self, items: &[ClipboardItem]) -> Result<usize, rusqlite::Error> {
         let mut conn = self.write_conn.lock();
@@ -1045,6 +1045,12 @@ impl ClipboardRepository {
             )?;
             let mut update_stmt = tx.prepare_cached(
                 "UPDATE clipboard_items SET files_valid = 0 WHERE content_hash = ?1 AND (files_valid IS NULL OR files_valid != 0)"
+            )?;
+            let mut update_flags_stmt = tx.prepare_cached(
+                "UPDATE clipboard_items
+                 SET is_pinned = ?1, is_favorite = ?2
+                 WHERE content_hash = ?3
+                   AND (is_pinned != ?1 OR is_favorite != ?2)"
             )?;
             let mut insert_stmt = tx.prepare_cached(
                 "INSERT INTO clipboard_items
@@ -1060,6 +1066,12 @@ impl ClipboardRepository {
                 let exists = exists_stmt.exists(params![item.content_hash])?;
 
                 if exists {
+                    // 条目内容相同不代表状态相同。同步远端的收藏/置顶状态，避免已有条目永久保留旧状态。
+                    update_flags_stmt.execute(params![
+                        item.is_pinned,
+                        item.is_favorite,
+                        item.content_hash,
+                    ])?;
                     // 远端标记失效时，同步更新本地的 files_valid 状态
                     if (item.content_type == "files" || item.content_type == "video") && item.files_valid == Some(false) {
                         let _ = update_stmt.execute(params![item.content_hash]);
@@ -1102,5 +1114,48 @@ impl ClipboardRepository {
         tx.commit()?;
 
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+
+    #[test]
+    fn import_sync_items_updates_existing_favorite_and_pin_flags() {
+        let db_path = std::env::temp_dir().join(format!(
+            "elegant-clipboard-sync-flags-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Database::new(db_path.clone()).unwrap();
+        let repo = ClipboardRepository::new(&db);
+
+        let item_id = repo
+            .insert(NewClipboardItem {
+                content_type: ContentType::Text,
+                text_content: Some("sync state".to_string()),
+                content_hash: "sync-state-hash".to_string(),
+                semantic_hash: "sync-state-hash".to_string(),
+                preview: Some("sync state".to_string()),
+                byte_size: 10,
+                ..NewClipboardItem::default()
+            })
+            .unwrap();
+        let mut remote_item = repo.get_by_id(item_id).unwrap().unwrap();
+        remote_item.is_pinned = true;
+        remote_item.is_favorite = true;
+
+        // The content already exists locally, so no new row is inserted.
+        assert_eq!(repo.import_sync_items(&[remote_item]).unwrap(), 0);
+
+        let synced_item = repo.get_by_id(item_id).unwrap().unwrap();
+        assert!(synced_item.is_pinned);
+        assert!(synced_item.is_favorite);
+
+        drop(repo);
+        drop(db);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
     }
 }

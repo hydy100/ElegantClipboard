@@ -9,7 +9,9 @@ import { useUISettings } from "@/stores/ui-settings";
 
 type FetchItems = (options?: { search?: string }) => Promise<void>;
 
-const refreshFileValidity = singleFlight(() => invoke<number>("refresh_files_validity"));
+const refreshFileValidity = singleFlight(() =>
+  invoke<number>("refresh_files_validity", { force: false }),
+);
 
 interface UseWindowLifecycleOptions {
   autoResetState: boolean;

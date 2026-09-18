@@ -329,7 +329,7 @@ export function DataTab({ settings, onSettingsChange }: DataTabProps) {
   const refreshDataSize = useCallback(async () => {
     setDataSizeLoading(true);
     try {
-      const changed = await invoke<number>("refresh_files_validity");
+      const changed = await invoke<number>("refresh_files_validity", { force: true });
       const info = await invoke<DataSizeInfo>("get_data_size");
       const time = new Date().toLocaleTimeString();
       setDataSize(info);

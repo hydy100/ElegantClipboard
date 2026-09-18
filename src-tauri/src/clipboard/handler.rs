@@ -18,6 +18,8 @@ const DEFAULT_MAX_CONTENT_SIZE: usize = 1_048_576;
 const MAX_PREVIEW_LENGTH: usize = 200;
 const DEFAULT_MAX_HISTORY_COUNT: i64 = 0;
 const DEFAULT_AUTO_CLEANUP_DAYS: i64 = 30;
+const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(45);
+const MAINTENANCE_INSERT_THRESHOLD: usize = 64;
 
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mpeg", "mpg",
@@ -102,14 +104,8 @@ fn truncate_content(content: String, max_size: usize, content_type: &str) -> Str
 #[derive(Debug, Clone)]
 pub enum ClipboardContent {
     Text(String),
-    Html {
-        html: String,
-        text: Option<String>,
-    },
-    Rtf {
-        rtf: String,
-        text: Option<String>,
-    },
+    Html { html: String, text: Option<String> },
+    Rtf { rtf: String, text: Option<String> },
     Image(Vec<u8>),
     Files(Vec<String>),
     Video(Vec<String>),
@@ -217,6 +213,11 @@ impl CachedProcessSettings {
     }
 }
 
+struct MaintenanceState {
+    last_run: Option<std::time::Instant>,
+    pending_items: usize,
+}
+
 /// 全局设置版本号，前端/后端修改设置时递增以通知缓存失效
 static SETTINGS_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -234,6 +235,7 @@ pub struct ClipboardHandler {
     content_filter_cache: Mutex<CachedContentFilter>,
     /// 缓存的处理设置
     settings_cache: Mutex<CachedProcessSettings>,
+    maintenance_state: Mutex<MaintenanceState>,
 }
 
 impl ClipboardHandler {
@@ -251,13 +253,39 @@ impl ClipboardHandler {
             icons_path,
             content_filter_cache: Mutex::new(CachedContentFilter::new()),
             settings_cache: Mutex::new(CachedProcessSettings::new()),
+            maintenance_state: Mutex::new(MaintenanceState {
+                last_run: None,
+                pending_items: 0,
+            }),
+        }
+    }
+
+    fn should_run_maintenance(&self) -> bool {
+        let now = std::time::Instant::now();
+        let mut state = self.maintenance_state.lock();
+        state.pending_items = state.pending_items.saturating_add(1);
+        let due_by_time = state
+            .last_run
+            .map(|last| now.duration_since(last) >= MAINTENANCE_INTERVAL)
+            .unwrap_or(true);
+        let due_by_count = state.pending_items >= MAINTENANCE_INSERT_THRESHOLD;
+        if due_by_time || due_by_count {
+            state.last_run = Some(now);
+            state.pending_items = 0;
+            true
+        } else {
+            false
         }
     }
 
     // 以下设置读取方法已被 process() 中的 get_multiple 批量读取取代，不再单独调用
 
     /// 检查内容类型是否被允许监听（使用缓存设置）
-    pub fn is_content_type_allowed_cached(&self, content: &ClipboardContent, settings: &HashMap<String, String>) -> bool {
+    pub fn is_content_type_allowed_cached(
+        &self,
+        content: &ClipboardContent,
+        settings: &HashMap<String, String>,
+    ) -> bool {
         let allowed = settings.get("monitor_types");
 
         // 无设置或空字符串 → 全部允许
@@ -290,13 +318,18 @@ impl ClipboardHandler {
     ///   - `app_filter_list`: 逗号分隔的规则列表，支持通配符 * 和 ?
     ///
     /// 黑名单模式：匹配则排除；白名单模式：不匹配则排除
-    pub fn is_source_app_excluded_cached(&self, source: &Option<super::source_app::SourceAppInfo>, settings: &HashMap<String, String>) -> bool {
+    pub fn is_source_app_excluded_cached(
+        &self,
+        source: &Option<super::source_app::SourceAppInfo>,
+        settings: &HashMap<String, String>,
+    ) -> bool {
         let source = match source {
             Some(s) => s,
             None => return false,
         };
 
-        let enabled = settings.get("app_filter_enabled")
+        let enabled = settings
+            .get("app_filter_enabled")
             .map(|v| v == "true")
             .unwrap_or(false);
         if !enabled {
@@ -308,7 +341,8 @@ impl ClipboardHandler {
             _ => return false,
         };
 
-        let mode = settings.get("app_filter_mode")
+        let mode = settings
+            .get("app_filter_mode")
             .map(|s| s.as_str())
             .unwrap_or("blacklist");
 
@@ -323,7 +357,9 @@ impl ClipboardHandler {
 
         let matches = filter_list.split(',').any(|entry| {
             let entry = entry.trim();
-            if entry.is_empty() { return false; }
+            if entry.is_empty() {
+                return false;
+            }
             matches_app_filter(entry, &targets_lower)
         });
 
@@ -339,8 +375,13 @@ impl ClipboardHandler {
     ///   - `content_filter_rules`: 换行分隔的正则表达式列表
     ///
     /// 任意一条规则匹配即排除该内容
-    pub fn is_content_excluded_by_rules_cached(&self, content: &ClipboardContent, settings: &HashMap<String, String>) -> bool {
-        let enabled = settings.get("content_filter_enabled")
+    pub fn is_content_excluded_by_rules_cached(
+        &self,
+        content: &ClipboardContent,
+        settings: &HashMap<String, String>,
+    ) -> bool {
+        let enabled = settings
+            .get("content_filter_enabled")
             .map(|v| v == "true")
             .unwrap_or(false);
         if !enabled {
@@ -396,7 +437,10 @@ impl ClipboardHandler {
         if max_content_size > 0 && Self::is_text_like_content(&content) {
             let content_size = self.get_content_size(&content);
             if content_size > max_content_size {
-                warn!("Text size {} bytes exceeds max {} bytes, skipping", content_size, max_content_size);
+                warn!(
+                    "Text size {} bytes exceeds max {} bytes, skipping",
+                    content_size, max_content_size
+                );
                 return Ok(None);
             }
         }
@@ -409,7 +453,11 @@ impl ClipboardHandler {
                 .map(|kb| kb * 1024)
                 .unwrap_or(0);
             if max_image > 0 && data.len() > max_image {
-                warn!("Image size {} bytes exceeds max {} bytes, skipping", data.len(), max_image);
+                warn!(
+                    "Image size {} bytes exceeds max {} bytes, skipping",
+                    data.len(),
+                    max_image
+                );
                 return Ok(None);
             }
         }
@@ -425,7 +473,10 @@ impl ClipboardHandler {
                 .map(|kb| kb * 1024)
                 .unwrap_or(0);
             if max_file > 0 && (total as usize) > max_file {
-                warn!("Files size {} bytes exceeds max {} bytes, skipping", total, max_file);
+                warn!(
+                    "Files size {} bytes exceeds max {} bytes, skipping",
+                    total, max_file
+                );
                 return Ok(None);
             }
         }
@@ -440,7 +491,10 @@ impl ClipboardHandler {
                 .map(|kb| kb * 1024)
                 .unwrap_or(0);
             if max_video > 0 && (total as usize) > max_video {
-                warn!("Video size {} bytes exceeds max {} bytes, skipping", total, max_video);
+                warn!(
+                    "Video size {} bytes exceeds max {} bytes, skipping",
+                    total, max_video
+                );
                 return Ok(None);
             }
         }
@@ -519,8 +573,12 @@ impl ClipboardHandler {
                 self.process_rtf(rtf, text, &hashes, max_content_size)?
             }
             ClipboardContent::Image(data) => self.process_image(data, &hashes)?,
-            ClipboardContent::Files(files) => self.process_files(files, &hashes, precomputed_file_size)?,
-            ClipboardContent::Video(files) => self.process_video(files, &hashes, precomputed_file_size)?,
+            ClipboardContent::Files(files) => {
+                self.process_files(files, &hashes, precomputed_file_size)?
+            }
+            ClipboardContent::Video(files) => {
+                self.process_video(files, &hashes, precomputed_file_size)?
+            }
         };
 
         item.source_app_name = source_app_name;
@@ -528,7 +586,10 @@ impl ClipboardHandler {
 
         let log_type = format!("{:?}", item.content_type);
         let log_size = item.byte_size;
-        let log_source = item.source_app_name.clone().unwrap_or_else(|| "unknown".to_string());
+        let log_source = item
+            .source_app_name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
 
         let id = self.repository.insert(item).map_err(|e| e.to_string())?;
         info!(
@@ -541,7 +602,14 @@ impl ClipboardHandler {
             .get("max_history_count")
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(DEFAULT_MAX_HISTORY_COUNT);
-        if max_history_count > 0 {
+        let auto_cleanup_days = settings
+            .get("auto_cleanup_days")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(DEFAULT_AUTO_CLEANUP_DAYS);
+        let maintenance_due =
+            (max_history_count > 0 || auto_cleanup_days > 0) && self.should_run_maintenance();
+
+        if max_history_count > 0 && maintenance_due {
             match self.repository.enforce_max_count(max_history_count) {
                 Ok((deleted, image_paths)) => {
                     super::cleanup_image_files(&image_paths);
@@ -554,16 +622,15 @@ impl ClipboardHandler {
         }
 
         // 自动清理超过指定天数的旧记录（复用批量读取的 settings）
-        let auto_cleanup_days = settings
-            .get("auto_cleanup_days")
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(DEFAULT_AUTO_CLEANUP_DAYS);
-        if auto_cleanup_days > 0 {
+        if auto_cleanup_days > 0 && maintenance_due {
             match self.repository.delete_older_than(auto_cleanup_days) {
                 Ok((deleted, image_paths)) => {
                     super::cleanup_image_files(&image_paths);
                     if deleted > 0 {
-                        info!("Auto-cleanup: removed {} items older than {} days", deleted, auto_cleanup_days);
+                        info!(
+                            "Auto-cleanup: removed {} items older than {} days",
+                            deleted, auto_cleanup_days
+                        );
                     }
                 }
                 Err(e) => warn!("Failed to auto-cleanup old items: {}", e),
@@ -587,21 +654,29 @@ impl ClipboardHandler {
         }
 
         // 缓存失效，重新从数据库批量读取（包含过滤设置）
-        let values = match self.settings_repo
-            .get_multiple(&[
-                "max_content_size_kb", "max_image_size_kb", "max_file_size_kb",
-                "max_video_size_kb", "dedup_strategy", "text_dedup_mode",
-                "max_history_count", "auto_cleanup_days",
-                // 过滤相关设置（供 is_source_app_excluded / is_content_type_allowed / is_content_excluded_by_rules 使用）
-                "monitor_types", "app_filter_enabled", "app_filter_mode",
-                "app_filter_list", "content_filter_enabled", "content_filter_rules",
-            ]) {
-                Ok(values) => values,
-                Err(error) => {
-                    warn!("Failed to refresh clipboard settings: {}", error);
-                    return cache.values.clone(); // retry next time, keeping last good settings
-                }
-            };
+        let values = match self.settings_repo.get_multiple(&[
+            "max_content_size_kb",
+            "max_image_size_kb",
+            "max_file_size_kb",
+            "max_video_size_kb",
+            "dedup_strategy",
+            "text_dedup_mode",
+            "max_history_count",
+            "auto_cleanup_days",
+            // 过滤相关设置（供 is_source_app_excluded / is_content_type_allowed / is_content_excluded_by_rules 使用）
+            "monitor_types",
+            "app_filter_enabled",
+            "app_filter_mode",
+            "app_filter_list",
+            "content_filter_enabled",
+            "content_filter_rules",
+        ]) {
+            Ok(values) => values,
+            Err(error) => {
+                warn!("Failed to refresh clipboard settings: {}", error);
+                return cache.values.clone(); // retry next time, keeping last good settings
+            }
+        };
 
         let arc_values = Arc::new(values);
         cache.values = arc_values.clone();
@@ -615,14 +690,18 @@ impl ClipboardHandler {
             ClipboardContent::Html { html, .. } => html.len(),
             ClipboardContent::Rtf { rtf, .. } => rtf.len(),
             ClipboardContent::Image(data) => data.len(),
-            ClipboardContent::Files(files) | ClipboardContent::Video(files) => files.iter().map(|f| f.len()).sum(),
+            ClipboardContent::Files(files) | ClipboardContent::Video(files) => {
+                files.iter().map(|f| f.len()).sum()
+            }
         }
     }
 
     fn is_text_like_content(content: &ClipboardContent) -> bool {
         matches!(
             content,
-            ClipboardContent::Text(_) | ClipboardContent::Html { .. } | ClipboardContent::Rtf { .. }
+            ClipboardContent::Text(_)
+                | ClipboardContent::Html { .. }
+                | ClipboardContent::Rtf { .. }
         )
     }
 
@@ -642,7 +721,9 @@ impl ClipboardHandler {
             ClipboardContent::Rtf { text, .. } => {
                 compute_semantic_hash("rtf", text.as_deref(), &content_hash)
             }
-            ClipboardContent::Image(_) | ClipboardContent::Files(_) | ClipboardContent::Video(_) => content_hash.clone(),
+            ClipboardContent::Image(_)
+            | ClipboardContent::Files(_)
+            | ClipboardContent::Video(_) => content_hash.clone(),
         };
 
         ContentHashes {
@@ -703,14 +784,22 @@ impl ClipboardHandler {
         max_size: usize,
     ) -> Result<NewClipboardItem, String> {
         let is_url = canonical_url_text(&text).is_some();
-        let text = if is_url { text.trim().to_string() } else { text };
+        let text = if is_url {
+            text.trim().to_string()
+        } else {
+            text
+        };
         let byte_size = text.len() as i64;
         let char_count = Some(text.chars().count() as i64);
         let preview = Self::create_preview(&text);
         let text_content = truncate_content(text, max_size, "Text");
 
         Ok(NewClipboardItem {
-            content_type: if is_url { ContentType::Url } else { ContentType::Text },
+            content_type: if is_url {
+                ContentType::Url
+            } else {
+                ContentType::Text
+            },
             text_content: Some(text_content),
             content_hash: hashes.content_hash.clone(),
             semantic_hash: hashes.semantic_hash.clone(),
@@ -780,7 +869,11 @@ impl ClipboardHandler {
     }
 
     /// 处理图片内容：保存到磁盘并提取宽高元数据
-    fn process_image(&self, data: Vec<u8>, hashes: &ContentHashes) -> Result<NewClipboardItem, String> {
+    fn process_image(
+        &self,
+        data: Vec<u8>,
+        hashes: &ContentHashes,
+    ) -> Result<NewClipboardItem, String> {
         let byte_size = data.len() as i64;
 
         let filename = format!("{}.png", &hashes.content_hash[..16]);
@@ -826,7 +919,12 @@ impl ClipboardHandler {
     }
 
     /// 参数 precomputed_size: 若已在大小限制检查中计算过文件总大小则直接复用
-    fn process_files(&self, files: Vec<String>, hashes: &ContentHashes, precomputed_size: Option<i64>) -> Result<NewClipboardItem, String> {
+    fn process_files(
+        &self,
+        files: Vec<String>,
+        hashes: &ContentHashes,
+        precomputed_size: Option<i64>,
+    ) -> Result<NewClipboardItem, String> {
         debug!("Processing {} file(s)", files.len());
 
         let byte_size = precomputed_size.unwrap_or_else(|| Self::sum_file_sizes(&files));
@@ -849,7 +947,12 @@ impl ClipboardHandler {
     }
 
     /// 参数 precomputed_size: 若已在大小限制检查中计算过文件总大小则直接复用
-    fn process_video(&self, files: Vec<String>, hashes: &ContentHashes, precomputed_size: Option<i64>) -> Result<NewClipboardItem, String> {
+    fn process_video(
+        &self,
+        files: Vec<String>,
+        hashes: &ContentHashes,
+        precomputed_size: Option<i64>,
+    ) -> Result<NewClipboardItem, String> {
         debug!("Processing {} video file(s)", files.len());
 
         let byte_size = precomputed_size.unwrap_or_else(|| Self::sum_file_sizes(&files));
