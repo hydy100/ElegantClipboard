@@ -387,12 +387,16 @@ export const ClipboardItemCard = memo(function ClipboardItemCard({
 
   const handleTranslate = useCallback(async () => {
     if (translatingRef.current) return;
-    const text = item.text_content || item.preview || "";
-    if (!text) return;
     translatingRef.current = true;
     setTranslating(true);
     setTranslateError(null);
     try {
+      // List/search payloads omit the body; preview is deliberately truncated.
+      // Read fresh detail even when a previously loaded body is still present.
+      const detail = await invoke<ClipboardItemDetail | null>("get_clipboard_item", { id: item.id });
+      if (!detail) throw new Error("条目已被删除，请刷新列表");
+      const text = detail.text_content;
+      if (!text?.trim()) throw new Error("该条目没有可翻译的完整文本");
       const result = await translateText(text);
       setTranslatedText(result);
     } catch (error) {
@@ -401,7 +405,7 @@ export const ClipboardItemCard = memo(function ClipboardItemCard({
       translatingRef.current = false;
       setTranslating(false);
     }
-  }, [item.text_content, item.preview]);
+  }, [item.id]);
 
   const handleCopyTranslation = useCallback(async () => {
     if (!translatedText) return;

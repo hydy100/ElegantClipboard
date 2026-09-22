@@ -12,6 +12,7 @@ use windows::core::w;
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(250);
 const REGISTER_RETRY: Duration = Duration::from_secs(2);
 const MAX_READ_ATTEMPTS: u8 = 5;
+const SLOW_READ_RETRY: Duration = Duration::from_secs(2);
 
 pub(super) struct Listener(HWND);
 
@@ -121,15 +122,23 @@ impl SequenceTracker {
             .filter(|(seq, _, _)| *seq == sequence)
             .map(|(_, attempts, _)| attempts)
             .unwrap_or(0)
-            + 1;
-        if consumed || attempts >= MAX_READ_ATTEMPTS {
+            .saturating_add(1);
+        if consumed {
             self.acknowledged = sequence;
             self.pending = None;
-            if !consumed {
-                tracing::warn!(sequence, attempts, "Clipboard read retries exhausted");
-            }
         } else {
-            self.pending = Some((sequence, attempts, now + RECONCILE_INTERVAL));
+            // A busy/delayed-rendering provider may become readable without a
+            // second copy event. Failure is not acknowledgement: retain this
+            // sequence and retry slowly until success, pause, or a newer copy.
+            if attempts == MAX_READ_ATTEMPTS {
+                tracing::warn!(sequence, attempts, "Clipboard still unavailable; switching to slow retries");
+            }
+            let delay = if attempts >= MAX_READ_ATTEMPTS {
+                SLOW_READ_RETRY
+            } else {
+                RECONCILE_INTERVAL
+            };
+            self.pending = Some((sequence, attempts, now + delay));
         }
     }
 }
@@ -253,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_reads_retry_without_another_copy_but_are_bounded() {
+    fn failed_reads_back_off_without_abandoning_the_copy() {
         let mut now = Instant::now();
         let mut state = SequenceTracker::new(10);
         for _ in 0..MAX_READ_ATTEMPTS {
@@ -263,6 +272,25 @@ mod tests {
             now += RECONCILE_INTERVAL;
         }
         assert!(!state.should_read(11, false, now));
+        now += SLOW_READ_RETRY;
+        assert!(state.should_read(11, false, now));
+        state.finish(11, true, now);
+        assert!(!state.should_read(11, false, now));
+        assert!(state.should_read(12, false, now));
+        state.finish(12, true, now);
+        assert!(!state.should_read(12, false, now));
+    }
+
+    #[test]
+    fn prolonged_failure_does_not_overflow_or_block_new_copies() {
+        let mut now = Instant::now();
+        let mut state = SequenceTracker::new(10);
+        for _ in 0..300 {
+            assert!(state.should_read(11, false, now));
+            state.finish(11, false, now);
+            assert!(!state.should_read(11, false, now));
+            now += SLOW_READ_RETRY;
+        }
         assert!(state.should_read(12, false, now));
         state.finish(12, true, now);
         assert!(!state.should_read(12, false, now));
