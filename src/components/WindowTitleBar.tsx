@@ -1,5 +1,6 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Card } from "@/components/ui/card";
+import { closeAllTooltips } from "@/components/ui/tooltip";
 
 interface WindowTitleBarProps {
   icon: React.ReactNode;
@@ -14,6 +15,8 @@ export function WindowTitleBar({ icon, title, extra }: WindowTitleBarProps) {
       <div
         className="h-11 flex items-center justify-between px-4 select-none"
         data-tauri-drag-region
+        onMouseDownCapture={closeAllTooltips}
+        onPointerDownCapture={closeAllTooltips}
       >
         <div className="flex items-center gap-3">
           {icon}

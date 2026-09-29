@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { closeAllTooltips } from "@/components/ui/tooltip";
 import { focusWindowImmediately, releaseWebViewFocus } from "@/hooks/useInputFocus";
 import { logError } from "@/lib/logger";
 import { singleFlight } from "@/lib/single-flight";
@@ -75,6 +76,7 @@ export function useWindowLifecycle({
 
   useEffect(() => {
     const unlisten = listen("window-shown", () => {
+      closeAllTooltips();
       setWindowVisible(true);
       useUISettings.persist.rehydrate();
       // The list must not wait for disconnected disks/network shares to respond.
@@ -104,6 +106,7 @@ export function useWindowLifecycle({
 
   useEffect(() => {
     const unlisten = listen("window-hidden", () => {
+      closeAllTooltips();
       releaseWebViewFocus();
       setWindowVisible(false);
       dismissOverlays();
