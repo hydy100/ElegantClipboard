@@ -730,8 +730,15 @@ fn trigger_ocr_capture(app: &tauri::AppHandle, guard: super::activity::ActivityG
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 let _guard = guard; // includes window creation, not just capture/file I/O
-                if let Err(e) = open_ocr_screenshot_window(app, path_str).await {
+                if let Err(e) = open_ocr_screenshot_window(app.clone(), path_str).await {
                     tracing::error!("打开截图窗口失败: {}", e);
+                    use tauri_plugin_notification::NotificationExt;
+                    let _ = app
+                        .notification()
+                        .builder()
+                        .title("OCR")
+                        .body(format!("打开 OCR 截图窗口失败：{}", e))
+                        .show();
                 }
             });
         }

@@ -667,8 +667,15 @@ fn trigger_translate_selection(app: &tauri::AppHandle) {
         Ok(text) if !text.trim().is_empty() => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = open_translate_result_window(app, text).await {
+                if let Err(e) = open_translate_result_window(app.clone(), text).await {
                     tracing::error!("打开翻译结果窗口失败: {}", e);
+                    use tauri_plugin_notification::NotificationExt;
+                    let _ = app
+                        .notification()
+                        .builder()
+                        .title("翻译选中文字")
+                        .body(format!("打开翻译窗口失败：{}", e))
+                        .show();
                 }
             });
         }
