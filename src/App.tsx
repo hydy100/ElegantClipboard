@@ -13,6 +13,7 @@ import {
   Tag16Filled,
 } from "@fluentui/react-icons";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useShallow } from "zustand/react/shallow";
 import { ClipboardList } from "@/components/ClipboardList";
 import { Button } from "@/components/ui/button";
@@ -29,6 +30,7 @@ import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
+  closeAllTooltips,
 } from "@/components/ui/tooltip";
 import { useInputFocus } from "@/hooks/useInputFocus";
 import { useSearchDebounce } from "@/hooks/useSearchDebounce";
@@ -314,7 +316,16 @@ function App() {
       {/* 顶栏：搜索 + 操作 */}
       <div
         className="flex items-center gap-1 px-2 pt-2 pb-0.5 shrink-0 select-none"
-        data-tauri-drag-region
+        onMouseDown={(event) => {
+          if (event.target !== event.currentTarget || event.button !== 0) return;
+          event.preventDefault();
+          closeAllTooltips();
+          if (event.detail === 1) {
+            void getCurrentWindow().startDragging().catch((error) => logError("Failed to drag window:", error));
+          }
+        }}
+        onMouseDownCapture={closeAllTooltips}
+        onPointerDownCapture={closeAllTooltips}
       >
         {/* 常驻按钮：收藏 & 标签 */}
         <Tooltip>
