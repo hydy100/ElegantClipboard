@@ -10,6 +10,7 @@
 
 use crate::config::AppConfig;
 use std::path::PathBuf;
+use tauri::Manager;
 
 fn get_exe_path() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| e.to_string())
@@ -168,9 +169,16 @@ pub fn perform_restart<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     crate::webview_runtime::mark_intentional_exit();
     crate::commands::window::save_main_window_placement(app);
     if restart_app() {
-        app.exit(0);
+        // WebView2 recovery can be requested from a worker thread while the
+        // runtime is already disconnected. Do not wait for the Tauri event
+        // loop to deliver an exit request in that state.
+        tracing::info!("WebView recovery process started; exiting current process");
+        std::process::exit(0);
     } else {
-        app.restart();
+        // `App::restart` waits for the event loop when called off-thread. The
+        // direct process helper launches the replacement and exits immediately.
+        tracing::warn!("elevation-aware restart launch failed; using direct process restart");
+        tauri::process::restart(&app.env());
     }
 }
 

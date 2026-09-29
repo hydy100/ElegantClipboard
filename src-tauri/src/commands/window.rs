@@ -240,29 +240,37 @@ pub(crate) fn toggle_window_visibility(app: &tauri::AppHandle, reposition: bool)
 #[tauri::command]
 pub async fn show_window(window: tauri::WebviewWindow) -> Result<(), String> {
     super::run_blocking("show_window", move || {
-        let _ = window.show();
+        let app = window.app_handle().clone();
+        let label = window.label().to_string();
+        window.show().map_err(|error| {
+            crate::webview_runtime::window_operation_error(&app, &label, "显示窗口失败", error)
+        })?;
         crate::keyboard_hook::set_window_state(crate::keyboard_hook::WindowState::Visible);
         let _ = window.emit("window-shown", ());
-            Ok(())
+        Ok(())
     }).await
 }
 
 #[tauri::command]
 pub async fn hide_window(window: tauri::WebviewWindow) -> Result<(), String> {
     super::run_blocking("hide_window", move || {
-        save_window_size_if_enabled(window.app_handle(), &window);
+        let app = window.app_handle().clone();
+        let label = window.label().to_string();
+        save_window_size_if_enabled(&app, &window);
         let _ = window.set_focusable(false);
-        let _ = window.hide();
+        window.hide().map_err(|error| {
+            crate::webview_runtime::window_operation_error(&app, &label, "隐藏窗口失败", error)
+        })?;
         crate::keyboard_hook::set_window_state(crate::keyboard_hook::WindowState::Hidden);
         crate::input_monitor::disable_mouse_monitoring();
-        crate::commands::hide_preview_windows(window.app_handle());
+        crate::commands::hide_preview_windows(&app);
         let _ = window.emit("window-hidden", ());
         // 延迟释放工作集内存，等待 WebView2 内部清理完成
         tauri::async_runtime::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             trim_working_set();
         });
-            Ok(())
+        Ok(())
     }).await
 }
 
@@ -303,19 +311,23 @@ pub async fn toggle_maximize(window: tauri::WebviewWindow) -> Result<(), String>
 #[tauri::command]
 pub async fn close_window(window: tauri::WebviewWindow) -> Result<(), String> {
     super::run_blocking("close_window", move || {
-        save_window_size_if_enabled(window.app_handle(), &window);
+        let app = window.app_handle().clone();
+        let label = window.label().to_string();
+        save_window_size_if_enabled(&app, &window);
         let _ = window.set_focusable(false);
-        let _ = window.hide();
+        window.hide().map_err(|error| {
+            crate::webview_runtime::window_operation_error(&app, &label, "关闭窗口失败", error)
+        })?;
         crate::keyboard_hook::set_window_state(crate::keyboard_hook::WindowState::Hidden);
         crate::input_monitor::disable_mouse_monitoring();
-        crate::commands::hide_preview_windows(window.app_handle());
+        crate::commands::hide_preview_windows(&app);
         let _ = window.emit("window-hidden", ());
         // 延迟释放工作集内存
         tauri::async_runtime::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             trim_working_set();
         });
-            Ok(())
+        Ok(())
     }).await
 }
 
