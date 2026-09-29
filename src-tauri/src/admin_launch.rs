@@ -10,7 +10,6 @@
 
 use crate::config::AppConfig;
 use std::path::PathBuf;
-use tauri::Manager;
 
 fn get_exe_path() -> Result<PathBuf, String> {
     std::env::current_exe().map_err(|e| e.to_string())
@@ -162,23 +161,90 @@ pub fn restart_app() -> bool {
     launch_via_explorer()
 }
 
-/// Restart through the same elevation-aware path used by the tray and
-/// settings commands.  WebView recovery uses this entry point so an elevated
-/// installation does not silently downgrade on recovery.
-pub fn perform_restart<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+/// Recover without calling the UI event loop; the child inherits the current
+/// elevation and waits for this instance and its WebView browser to exit.
+pub fn perform_restart(browser_pid: u32) -> Result<(), String> {
+    // Recovery preserves the current security token. Never synchronously query
+    // window geometry here: a broken UI event loop could block the restart.
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let mut command = std::process::Command::new(executable);
+    command.arg(format!("--webview-recovery-parent={}", std::process::id()));
+    if browser_pid != 0 {
+        command.arg(format!("--webview-recovery-browser={browser_pid}"));
+    }
+    command.spawn().map_err(|error| format!("启动恢复进程失败: {error}"))?;
     crate::webview_runtime::mark_intentional_exit();
-    crate::commands::window::save_main_window_placement(app);
-    if restart_app() {
-        // WebView2 recovery can be requested from a worker thread while the
-        // runtime is already disconnected. Do not wait for the Tauri event
-        // loop to deliver an exit request in that state.
-        tracing::info!("WebView recovery process started; exiting current process");
-        std::process::exit(0);
-    } else {
-        // `App::restart` waits for the event loop when called off-thread. The
-        // direct process helper launches the replacement and exits immediately.
-        tracing::warn!("elevation-aware restart launch failed; using direct process restart");
-        tauri::process::restart(&app.env());
+    std::process::exit(0);
+}
+
+/// Run before single-instance registration and before creating any WebView.
+pub(crate) fn wait_for_recovery_processes() -> Result<(), String> {
+    for prefix in ["--webview-recovery-parent=", "--webview-recovery-browser="] {
+        for argument in std::env::args().filter(|argument| argument.starts_with(prefix)) {
+            let pid = parse_recovery_pid(&argument, prefix)?;
+            #[cfg(windows)]
+            wait_for_process_exit(pid, 30_000)?;
+            #[cfg(not(windows))]
+            let _ = pid;
+        }
+    }
+    Ok(())
+}
+
+fn parse_recovery_pid(argument: &str, prefix: &str) -> Result<u32, String> {
+    argument.strip_prefix(prefix).and_then(|value| value.parse::<u32>().ok())
+        .filter(|pid| *pid != 0 && *pid != std::process::id())
+        .ok_or_else(|| "无效的 WebView2 恢复进程参数".to_string())
+}
+
+#[cfg(windows)]
+fn wait_for_process_exit(pid: u32, timeout_ms: u32) -> Result<(), String> {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+    let handle = match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
+        Ok(handle) => handle,
+        // The old process may already have exited before this child runs.
+        Err(error) if error.code() == windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) => return Ok(()),
+        Err(error) => return Err(format!("访问恢复进程 {pid} 失败: {error}")),
+    };
+    let result = unsafe { WaitForSingleObject(handle, timeout_ms) };
+    let _ = unsafe { CloseHandle(handle) };
+    if result == WAIT_OBJECT_0 { Ok(()) }
+    else { Err(format!("等待恢复进程 {pid} 退出失败: {}", result.0)) }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_arguments_reject_invalid_or_self_pid() {
+        let prefix = "--webview-recovery-parent=";
+        assert!(parse_recovery_pid("--webview-recovery-parent=42", prefix).is_ok());
+        for value in ["0".to_string(), "bad".to_string(), std::process::id().to_string()] {
+            assert!(parse_recovery_pid(&format!("{prefix}{value}"), prefix).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_wait_times_out_instead_of_starting_a_duplicate_instance() {
+        assert!(wait_for_process_exit(std::process::id(), 1).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_wait_observes_real_process_exit() {
+        use std::os::windows::process::CommandExt;
+        let mut child = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Milliseconds 200"])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .spawn().unwrap();
+        let result = wait_for_process_exit(child.id(), 10_000);
+        if result.is_err() { let _ = child.kill(); }
+        let status = child.wait().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(status.success());
     }
 }
 

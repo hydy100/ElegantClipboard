@@ -4,7 +4,7 @@ use std::{
     fmt::Display,
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -22,6 +22,7 @@ static LOADED_VERSION: LazyLock<parking_lot::RwLock<Option<String>>> =
     LazyLock::new(|| parking_lot::RwLock::new(None));
 static NATIVE_EVENTS_REGISTERED: AtomicBool = AtomicBool::new(false);
 static INTENTIONAL_EXIT: AtomicBool = AtomicBool::new(false);
+static BROWSER_PID: AtomicU32 = AtomicU32::new(0);
 // 0 = none, 1 = restart when safe, 2 = restart immediately, 3 = recovery fuse open.
 static RESTART_LEVEL: AtomicU8 = AtomicU8::new(0);
 static MANAGED_WINDOWS: LazyLock<parking_lot::Mutex<HashMap<String, Arc<WindowReadiness>>>> =
@@ -190,7 +191,10 @@ pub(crate) fn initialize(app: &tauri::AppHandle, main_window: &tauri::WebviewWin
 
 pub(crate) fn ensure_runtime_current(app: &tauri::AppHandle) -> Result<(), String> {
     match RESTART_LEVEL.load(Ordering::Acquire) {
-        1 | 2 => {
+        1 => {
+            return Err("WebView2 更新待重启，请先完成并关闭设置、编辑器、翻译及 OCR 窗口".to_string());
+        }
+        2 => {
             return Err("WebView2 正在恢复，ElegantClipboard 即将重启".to_string());
         }
         3 => {
@@ -210,7 +214,7 @@ pub(crate) fn ensure_runtime_current(app: &tauri::AppHandle) -> Result<(), Strin
             "A newer WebView2 runtime is available; dynamic window creation is suspended"
         );
         schedule_restart(app, "runtime_version_changed", false);
-        return Err("WebView2 运行时已更新，ElegantClipboard 正在重启".to_string());
+        return Err("WebView2 更新待重启，请先完成并关闭设置、编辑器、翻译及 OCR 窗口".to_string());
     }
 
     Ok(())
@@ -327,19 +331,35 @@ fn schedule_restart(app: &tauri::AppHandle, reason: &str, immediate: bool) {
         }
 
         tracing::warn!(reason, "Restarting application to recover WebView2");
-        mark_intentional_exit();
-        crate::admin_launch::perform_restart(&app);
+        if let Err(error) = crate::admin_launch::perform_restart(BROWSER_PID.load(Ordering::Acquire)) {
+            // Keep the current process alive and permit a subsequent recovery attempt.
+            RESTART_LEVEL.store(0, Ordering::Release);
+            tracing::error!(%error, "Failed to launch WebView recovery process");
+            use tauri_plugin_notification::NotificationExt;
+            let _ = app.notification().builder().title("WebView2 恢复启动失败")
+                .body(format!("{error}；当前程序保留运行，请手动重启"))
+                .show();
+        }
     });
 }
 
 fn safe_to_restart(app: &tauri::AppHandle) -> bool {
+    if crate::commands::activity::has_active_operations()
+        || MANAGED_WINDOWS.lock().values().any(|readiness| {
+            !readiness.frontend_ready.load(Ordering::Acquire)
+                && !readiness.cancelled.load(Ordering::Acquire)
+        })
+    {
+        return false;
+    }
     app.webview_windows().iter().all(|(label, window)| {
-        !requires_user_attention(label) || !window.is_visible().unwrap_or(false)
+        !requires_user_attention(label) || !window.is_visible().unwrap_or(true)
     })
 }
 
 fn requires_user_attention(label: &str) -> bool {
-    label == "settings" || label == "translate-result" || label.starts_with("text-editor-")
+    matches!(label, "settings" | "translate-result" | "ocr-screenshot" | "ocr-result")
+        || label.starts_with("text-editor-")
 }
 
 fn notify_restart(app: &tauri::AppHandle, immediate: bool) {
@@ -348,7 +368,7 @@ fn notify_restart(app: &tauri::AppHandle, immediate: bool) {
     let body = if immediate {
         "WebView2 连接已失效，程序将自动重启恢复"
     } else {
-        "WebView2 已更新；关闭设置、编辑器或翻译窗口后将自动重启"
+        "WebView2 已更新；任务完成并关闭设置、编辑器、翻译及 OCR 窗口后将自动重启"
     };
     let _ = app
         .notification()
@@ -564,6 +584,11 @@ fn register_process_failed_handler_inner(
         return;
     };
 
+    let mut browser_pid = 0;
+    if unsafe { webview.BrowserProcessId(&mut browser_pid) }.is_ok() {
+        BROWSER_PID.store(browser_pid, Ordering::Release);
+    }
+
     let failure_app = app.clone();
     let failure_label = label.clone();
     let reload_webview = webview.clone();
@@ -626,6 +651,16 @@ fn is_renderer_unresponsive(kind: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_update_preserves_interactive_windows_including_ocr() {
+        for label in ["settings", "translate-result", "text-editor-12", "ocr-screenshot", "ocr-result"] {
+            assert!(requires_user_attention(label), "{label}");
+        }
+        for label in ["image-preview", "text-preview"] {
+            assert!(!requires_user_attention(label), "{label}");
+        }
+    }
 
     #[test]
     fn runtime_version_difference_is_detected() {

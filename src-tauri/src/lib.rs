@@ -674,6 +674,10 @@ fn set_hotkey_mode(app: tauri::AppHandle, mode: String) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if let Err(error) = admin_launch::wait_for_recovery_processes() {
+        eprintln!("{error}");
+        return;
+    }
     let config = AppConfig::load();
     init_logging(&config);
 
