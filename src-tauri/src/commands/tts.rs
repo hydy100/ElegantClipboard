@@ -1,5 +1,11 @@
-use sha2::{Sha256, Digest};
+use std::sync::atomic::{AtomicI64, Ordering};
 use tracing::debug;
+
+#[path = "tts_auth.rs"]
+mod auth;
+
+// Service-clock offset only; never change the user's system clock.
+static CLOCK_SKEW_SECONDS: AtomicI64 = AtomicI64::new(0);
 
 /// Edge TTS 朗读结果（音频 + 词边界时间戳）
 #[derive(serde::Serialize, Clone)]
@@ -18,31 +24,47 @@ pub struct TtsResult {
     pub boundaries: Vec<WordBoundary>,
 }
 
-/// Edge TTS 使用的固定 Token
-const EDGE_TTS_TOKEN: &str = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
-
 /// Chromium 版本号（需要跟随 Edge 浏览器版本更新）
-const CHROMIUM_FULL_VERSION: &str = "143.0.3650.75";
 const CHROMIUM_MAJOR_VERSION: &str = "143";
 
-/// 生成 Sec-MS-GEC 安全令牌（基于当前时间 + Token 的 SHA-256）
-/// 算法来源：https://github.com/rany2/edge-tts/blob/master/src/edge_tts/drm.py
-fn generate_sec_ms_gec() -> String {
-    // Windows FILETIME epoch offset (1601-01-01 到 1970-01-01 的秒数)
-    const WIN_EPOCH: f64 = 11644473600.0;
-    const S_TO_NS: f64 = 1e9;
+fn server_time_for_retry(error: &tungstenite::Error) -> Option<i64> {
+    let tungstenite::Error::Http(response) = error else {
+        return None;
+    };
+    if response.status() != tungstenite::http::StatusCode::FORBIDDEN {
+        return None;
+    }
+    let date = response.headers().get("Date")?.to_str().ok()?;
+    let timestamp = chrono::DateTime::parse_from_rfc2822(date).ok()?.timestamp();
+    (0..=253_402_300_799)
+        .contains(&timestamp)
+        .then_some(timestamp)
+}
 
-    let unix_time = chrono::Utc::now().timestamp() as f64;
-    // 转换到 Windows 纪元
-    let mut ticks = unix_time + WIN_EPOCH;
-    // 先向下取整到最近的 5 分钟（300 秒）
-    ticks -= ticks % 300.0;
-    // 再转换为 100 纳秒刻度
-    ticks *= S_TO_NS / 100.0;
-
-    let hash_input = format!("{:.0}{}", ticks, EDGE_TTS_TOKEN);
-    let hash = Sha256::digest(hash_input.as_bytes());
-    hash.iter().map(|b| format!("{:02X}", b)).collect()
+fn connect_with_clock_retry<T>(
+    local_time: impl Fn() -> i64,
+    initial_skew: i64,
+    mut connect: impl FnMut(i64) -> Result<T, tungstenite::Error>,
+) -> Result<(T, i64), String> {
+    let now = local_time();
+    match connect(now.saturating_add(initial_skew)) {
+        Ok(socket) => Ok((socket, initial_skew)),
+        Err(error) => {
+            let Some(server_time) = server_time_for_retry(&error) else {
+                return Err(format!("Edge TTS WebSocket 连接失败: {error}"));
+            };
+            let skew = server_time - local_time();
+            // At most one retry, and only after a 403 carrying a valid service Date.
+            // Rebuild the entire request so its token, connection ID and cookie are fresh.
+            debug!(
+                "Edge TTS 403: retrying once with service clock offset {}s",
+                skew
+            );
+            connect(local_time().saturating_add(skew))
+                .map(|socket| (socket, skew))
+                .map_err(|error| format!("Edge TTS 校正服务端时间后连接仍失败: {error}"))
+        }
+    }
 }
 
 /// 生成随机 MUID（用于 Cookie）
@@ -54,24 +76,27 @@ fn generate_muid() -> String {
 /// Edge TTS 预定义声源列表
 pub const EDGE_VOICES: &[(&str, &str)] = &[
     // 美式英语
-    ("en-US-AriaNeural",          "Aria（美式女声·自然）"),
-    ("en-US-JennyNeural",         "Jenny（美式女声·亲切）"),
-    ("en-US-GuyNeural",           "Guy（美式男声·稳重）"),
-    ("en-US-ChristopherNeural",   "Christopher（美式男声·清晰）"),
-    ("en-US-AnaNeural",           "Ana（美式女声·年轻）"),
-    ("en-US-AndrewMultilingualNeural", "Andrew（美式男声·多语言）"),
-    ("en-US-AvaMultilingualNeural",    "Ava（美式女声·多语言）"),
-    ("en-US-BrianMultilingualNeural",  "Brian（美式男声·多语言）"),
+    ("en-US-AriaNeural", "Aria（美式女声·自然）"),
+    ("en-US-JennyNeural", "Jenny（美式女声·亲切）"),
+    ("en-US-GuyNeural", "Guy（美式男声·稳重）"),
+    ("en-US-ChristopherNeural", "Christopher（美式男声·清晰）"),
+    ("en-US-AnaNeural", "Ana（美式女声·年轻）"),
+    (
+        "en-US-AndrewMultilingualNeural",
+        "Andrew（美式男声·多语言）",
+    ),
+    ("en-US-AvaMultilingualNeural", "Ava（美式女声·多语言）"),
+    ("en-US-BrianMultilingualNeural", "Brian（美式男声·多语言）"),
     // 英式英语
-    ("en-GB-SoniaNeural",         "Sonia（英式女声·优雅）"),
-    ("en-GB-RyanNeural",          "Ryan（英式男声·绅士）"),
-    ("en-GB-LibbyNeural",         "Libby（英式女声·温暖）"),
-    ("en-GB-MaisieNeural",        "Maisie（英式女声·活泼）"),
+    ("en-GB-SoniaNeural", "Sonia（英式女声·优雅）"),
+    ("en-GB-RyanNeural", "Ryan（英式男声·绅士）"),
+    ("en-GB-LibbyNeural", "Libby（英式女声·温暖）"),
+    ("en-GB-MaisieNeural", "Maisie（英式女声·活泼）"),
     // 中文
-    ("zh-CN-XiaoxiaoNeural",      "晓晓（中文女声·温柔）"),
-    ("zh-CN-YunxiNeural",         "云希（中文男声·阳光）"),
-    ("zh-CN-YunjianNeural",       "云健（中文男声·沉稳）"),
-    ("zh-CN-XiaoyiNeural",        "晓伊（中文女声·活泼）"),
+    ("zh-CN-XiaoxiaoNeural", "晓晓（中文女声·温柔）"),
+    ("zh-CN-YunxiNeural", "云希（中文男声·阳光）"),
+    ("zh-CN-YunjianNeural", "云健（中文男声·沉稳）"),
+    ("zh-CN-XiaoyiNeural", "晓伊（中文女声·活泼）"),
 ];
 
 /// 解析 audio.metadata 消息中的 WordBoundary 条目
@@ -94,7 +119,8 @@ fn parse_word_boundaries(msg: &str) -> Vec<WordBoundary> {
             if let Some(data) = item.get("Data") {
                 let offset_ticks = data.get("Offset").and_then(|o| o.as_f64()).unwrap_or(0.0);
                 let duration_ticks = data.get("Duration").and_then(|d| d.as_f64()).unwrap_or(0.0);
-                let word = data.get("text")
+                let word = data
+                    .get("text")
                     .and_then(|t| t.get("Text"))
                     .and_then(|t| t.as_str())
                     .unwrap_or("")
@@ -112,23 +138,20 @@ fn parse_word_boundaries(msg: &str) -> Vec<WordBoundary> {
     boundaries
 }
 
-/// 通过 Edge TTS WebSocket 合成音频，返回 MP3 字节和词边界
-fn edge_tts_synthesize(text: &str, voice: &str, rate: &str, _proxy_mode: &str, _proxy_url: &str) -> Result<(Vec<u8>, Vec<WordBoundary>), String> {
-    use tungstenite::{connect, Message};
+/// Build a fresh v2 handshake for each connection attempt.
+fn build_request(unix_seconds: i64) -> Result<(tungstenite::http::Request<()>, String), String> {
     use tungstenite::client::IntoClientRequest;
     use tungstenite::http::HeaderValue;
 
     let conn_id = uuid::Uuid::new_v4().to_string().replace('-', "");
-    let sec_ms_gec = generate_sec_ms_gec();
-    let sec_ms_gec_version = format!("1-{}", CHROMIUM_FULL_VERSION);
+    let sec_ms_gec = auth::generate(unix_seconds);
     let ws_url = format!(
         "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken={}&ConnectionId={}&Sec-MS-GEC={}&Sec-MS-GEC-Version={}",
-        EDGE_TTS_TOKEN, conn_id, sec_ms_gec, sec_ms_gec_version
+        auth::TOKEN, conn_id, sec_ms_gec, auth::VERSION
     );
 
-    debug!("Edge TTS URL: {}", ws_url);
-
-    let mut request = ws_url.into_client_request()
+    let mut request = ws_url
+        .into_client_request()
         .map_err(|e| format!("构建 WebSocket 请求失败: {}", e))?;
     let headers = request.headers_mut();
     let ua = format!(
@@ -136,25 +159,58 @@ fn edge_tts_synthesize(text: &str, voice: &str, rate: &str, _proxy_mode: &str, _
         CHROMIUM_MAJOR_VERSION, CHROMIUM_MAJOR_VERSION
     );
     headers.insert("User-Agent", HeaderValue::from_str(&ua).unwrap());
-    headers.insert("Origin", HeaderValue::from_static("chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold"));
+    headers.insert(
+        "Origin",
+        HeaderValue::from_static("chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold"),
+    );
     headers.insert("Pragma", HeaderValue::from_static("no-cache"));
     headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
-    headers.insert("Accept-Encoding", HeaderValue::from_static("gzip, deflate, br, zstd"));
-    headers.insert("Accept-Language", HeaderValue::from_static("en-US,en;q=0.9"));
+    headers.insert(
+        "Accept-Encoding",
+        HeaderValue::from_static("gzip, deflate, br, zstd"),
+    );
+    headers.insert(
+        "Accept-Language",
+        HeaderValue::from_static("en-US,en;q=0.9"),
+    );
     let muid_cookie = format!("muid={};", generate_muid());
     headers.insert("Cookie", HeaderValue::from_str(&muid_cookie).unwrap());
 
-    let (mut socket, _) = connect(request)
-        .map_err(|e| format!("Edge TTS WebSocket 连接失败: {}", e))?;
+    Ok((request, conn_id))
+}
+
+/// 通过 Edge TTS WebSocket 合成音频，返回 MP3 字节和词边界
+fn edge_tts_synthesize(
+    text: &str,
+    voice: &str,
+    rate: &str,
+    _proxy_mode: &str,
+    _proxy_url: &str,
+) -> Result<(Vec<u8>, Vec<WordBoundary>), String> {
+    use tungstenite::{connect, Message};
+    let ((mut socket, conn_id), skew) = connect_with_clock_retry(
+        || chrono::Utc::now().timestamp(),
+        CLOCK_SKEW_SECONDS.load(Ordering::Relaxed),
+        |timestamp| {
+            let (request, conn_id) = build_request(timestamp)
+                .map_err(|error| tungstenite::Error::Io(std::io::Error::other(error)))?;
+            connect(request).map(|(socket, _)| (socket, conn_id))
+        },
+    )?;
+    CLOCK_SKEW_SECONDS.store(skew, Ordering::Relaxed);
 
     // 1. 发送配置消息
-    let timestamp = chrono::Utc::now().format("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)").to_string();
+    let timestamp = chrono::Utc::now()
+        .format("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)")
+        .to_string();
     let config_msg = format!(
         "X-Timestamp:{}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n\
 {{\"context\":{{\"synthesis\":{{\"audio\":{{\"metadataoptions\":{{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"true\"}},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}}}}}",
         timestamp
     );
-    socket.send(Message::Text(config_msg.into())).map_err(|e| format!("发送配置失败: {}", e))?;
+    socket
+        .send(Message::Text(config_msg.into()))
+        .map_err(|e| format!("发送配置失败: {}", e))?;
 
     // 2. 发送 SSML 消息
     let escaped_text = text
@@ -169,19 +225,25 @@ fn edge_tts_synthesize(text: &str, voice: &str, rate: &str, _proxy_mode: &str, _
         voice, rate, escaped_text
     );
 
-    let timestamp2 = chrono::Utc::now().format("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)").to_string();
+    let timestamp2 = chrono::Utc::now()
+        .format("%a %b %d %Y %H:%M:%S GMT+0000 (Coordinated Universal Time)")
+        .to_string();
     let ssml_msg = format!(
         "X-RequestId:{}\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:{}Z\r\nPath:ssml\r\n\r\n{}",
         conn_id, timestamp2, ssml
     );
-    socket.send(Message::Text(ssml_msg.into())).map_err(|e| format!("发送 SSML 失败: {}", e))?;
+    socket
+        .send(Message::Text(ssml_msg.into()))
+        .map_err(|e| format!("发送 SSML 失败: {}", e))?;
 
     // 3. 接收音频数据 + 词边界
     let mut audio_data = Vec::new();
     let mut boundaries: Vec<WordBoundary> = Vec::new();
 
     loop {
-        let msg = socket.read().map_err(|e| format!("读取 WebSocket 消息失败: {}", e))?;
+        let msg = socket
+            .read()
+            .map_err(|e| format!("读取 WebSocket 消息失败: {}", e))?;
         match msg {
             Message::Binary(data) => {
                 // 二进制消息：前 2 字节为头部长度（big-endian u16）
@@ -214,7 +276,11 @@ fn edge_tts_synthesize(text: &str, voice: &str, rate: &str, _proxy_mode: &str, _
         return Err("Edge TTS 未返回音频数据".to_string());
     }
 
-    debug!("Edge TTS 合成完成，音频大小: {} bytes, 词边界: {} 条", audio_data.len(), boundaries.len());
+    debug!(
+        "Edge TTS 合成完成，音频大小: {} bytes, 词边界: {} 条",
+        audio_data.len(),
+        boundaries.len()
+    );
     Ok((audio_data, boundaries))
 }
 
@@ -228,7 +294,8 @@ pub async fn tts_speak_edge(
     proxy_url: String,
 ) -> Result<TtsResult, String> {
     tokio::task::spawn_blocking(move || {
-        let (audio, boundaries) = edge_tts_synthesize(&text, &voice, &rate, &proxy_mode, &proxy_url)?;
+        let (audio, boundaries) =
+            edge_tts_synthesize(&text, &voice, &rate, &proxy_mode, &proxy_url)?;
         Ok(TtsResult {
             audio: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &audio),
             boundaries,
@@ -241,5 +308,136 @@ pub async fn tts_speak_edge(
 /// 获取 Edge TTS 可用声源列表（Tauri 命令）
 #[tauri::command]
 pub fn tts_get_edge_voices() -> Vec<(String, String)> {
-    EDGE_VOICES.iter().map(|(id, label)| (id.to_string(), label.to_string())).collect()
+    EDGE_VOICES
+        .iter()
+        .map(|(id, label)| (id.to_string(), label.to_string()))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn http_error(status: u16, date: Option<&str>) -> tungstenite::Error {
+        let mut response = tungstenite::http::Response::builder().status(status);
+        if let Some(date) = date {
+            response = response.header("Date", date);
+        }
+        tungstenite::Error::Http(response.body(None).unwrap())
+    }
+
+    #[test]
+    fn request_uses_matching_v2_token_and_fresh_identity() {
+        let (a, id_a) = build_request(1700000000).unwrap();
+        let (b, id_b) = build_request(1700000000).unwrap();
+        assert!(a
+            .uri()
+            .to_string()
+            .contains(&format!("Sec-MS-GEC={}&", auth::generate(1700000000))));
+        assert!(a
+            .uri()
+            .to_string()
+            .contains("Sec-MS-GEC-Version=2-143.0.3650.75"));
+        assert_ne!(id_a, id_b);
+        assert_ne!(a.headers()["Cookie"], b.headers()["Cookie"]);
+        assert_eq!(a.headers()["Sec-WebSocket-Version"], "13");
+        assert_eq!(
+            a.headers()["Origin"],
+            "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold"
+        );
+    }
+
+    #[test]
+    fn forbidden_corrects_positive_and_negative_clock_skew_once() {
+        for now in [1700000000 - 3600, 1700000000 + 3600] {
+            let mut times = Vec::new();
+            let (value, skew) = connect_with_clock_retry(
+                || now,
+                0,
+                |time| {
+                    times.push(time);
+                    if times.len() == 1 {
+                        Err(http_error(403, Some("Tue, 14 Nov 2023 22:13:20 GMT")))
+                    } else {
+                        Ok(42)
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(value, 42);
+            assert_eq!(times, [now, 1700000000]);
+            assert_eq!(skew, 1700000000 - now);
+        }
+    }
+
+    #[test]
+    fn retry_is_bounded_even_when_forbidden_persists() {
+        let mut attempts = 0;
+        let result: Result<((), i64), _> = connect_with_clock_retry(
+            || 1700000000,
+            0,
+            |_| {
+                attempts += 1;
+                Err(http_error(403, Some("Tue, 14 Nov 2023 22:13:20 GMT")))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn missing_invalid_date_or_other_status_does_not_retry() {
+        for (status, date) in [
+            (403, None),
+            (403, Some("invalid")),
+            (429, Some("Tue, 14 Nov 2023 22:13:20 GMT")),
+            (500, None),
+        ] {
+            let mut attempts = 0;
+            let result: Result<((), i64), _> = connect_with_clock_retry(
+                || 1700000000,
+                0,
+                |_| {
+                    attempts += 1;
+                    Err(http_error(status, date))
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(attempts, 1);
+        }
+    }
+
+    #[test]
+    fn successful_first_attempt_uses_existing_skew_without_retry() {
+        let mut times = Vec::new();
+        let result = connect_with_clock_retry(
+            || 1700000000,
+            -120,
+            |time| {
+                times.push(time);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(times, [1699999880]);
+        assert_eq!(result.1, -120);
+    }
+
+    #[test]
+    #[ignore = "live service: sends only fixed synthetic text; requires network"]
+    fn edge_tts_live_synthesis() {
+        for (text, voice) in [
+            ("Hello.", "en-US-AriaNeural"),
+            ("你好。", "zh-CN-XiaoxiaoNeural"),
+        ] {
+            let (audio, boundaries) = edge_tts_synthesize(text, voice, "+0%", "none", "").unwrap();
+            assert!(audio.len() > 1000);
+            assert!(!boundaries.is_empty());
+            println!(
+                "LIVE_AUDIO_PASS voice={voice} bytes={} boundaries={}",
+                audio.len(),
+                boundaries.len()
+            );
+        }
+    }
 }
