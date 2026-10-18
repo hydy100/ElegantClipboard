@@ -45,3 +45,16 @@ src-tauri/gen/schemas/
 
 # wingetcreate generated manifests
 manifests/
+
+# Local repair, verification and release artifacts
+/.repair/
+/artifacts/
+/docs/
+/test-results/
+/playwright-report/
+*.tsbuildinfo
+
+# Local assistant configuration
+/AGENTS.md
+/.agents/
+/.codex/
