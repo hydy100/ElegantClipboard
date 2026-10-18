@@ -35,6 +35,7 @@ import { WindowTitleBar } from "@/components/WindowTitleBar";
 import { logError } from "@/lib/logger";
 import { initTheme } from "@/lib/theme-applier";
 import { cn } from "@/lib/utils";
+import { registerWindowRequestHandler } from "@/lib/window-request";
 
 interface AppSettings extends GeneralSettings, ShortcutSettings, DataSettings {}
 
@@ -94,6 +95,8 @@ export function Settings() {
   const savePendingRef = useRef(false);
   const [themeReady, setThemeReady] = useState(false);
   const [appVersion, setAppVersion] = useState("0.0.0");
+
+  useEffect(() => registerWindowRequestHandler(() => {}), []);
 
   useEffect(() => {
     invoke<string>("get_app_version").then(setAppVersion).catch(console.error);

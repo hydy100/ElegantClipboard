@@ -155,6 +155,7 @@ impl WindowCreationGuard {
             window.on_window_event(move |event| {
                 if matches!(event, WindowEvent::Destroyed) {
                     cancel_window_readiness(&label, &readiness);
+                    crate::window_requests::cancel_for_destroyed_window(&label, Arc::as_ptr(&readiness) as usize);
                 }
             });
         }
@@ -163,6 +164,20 @@ impl WindowCreationGuard {
 
 fn tracked_window_readiness(label: &str) -> Option<Arc<WindowReadiness>> {
     MANAGED_WINDOWS.lock().get(label).cloned()
+}
+
+pub(crate) fn bind_window_request(label: &str, bind: impl FnOnce(usize)) -> Result<(), String> {
+    let readiness = tracked_window_readiness(label).ok_or("窗口已关闭")?;
+    bind_readiness(&readiness, bind)
+}
+
+fn bind_readiness(readiness: &Arc<WindowReadiness>, bind: impl FnOnce(usize)) -> Result<(), String> {
+    // Retain the generation through registration and check cancellation on both
+    // sides. Destroy publishes cancellation before scanning registered requests.
+    if readiness.cancelled.load(Ordering::Acquire) { return Err("窗口已关闭".into()); }
+    bind(Arc::as_ptr(readiness) as usize);
+    if readiness.cancelled.load(Ordering::Acquire) { return Err("窗口已关闭".into()); }
+    Ok(())
 }
 
 fn cancel_window_readiness(label: &str, readiness: &Arc<WindowReadiness>) {
@@ -188,7 +203,7 @@ pub(crate) fn initialize(_app: &tauri::AppHandle, main_window: &tauri::WebviewWi
     start_version_poll();
 }
 
-pub(crate) fn ensure_runtime_current(_app: &tauri::AppHandle) -> Result<(), String> {
+pub(crate) fn ensure_runtime_current<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> Result<(), String> {
     ensure_recovery_idle(&RESTART_LEVEL)
 }
 
@@ -290,14 +305,46 @@ pub(crate) fn window_operation_error(
 }
 
 fn is_webview_connection_failure(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
     message.contains("0x80010108")
-        || message.contains("RPC_E_DISCONNECTED")
+        || message.contains("0x800706ba")
+        || message.contains("0x800706be")
+        || message.contains("0x8007139f")
+        || message.contains("rpc_e_disconnected")
+        || message.contains("rpc_s_server_unavailable")
         || message.contains("disconnected from its clients")
         || message.contains("已与其客户端断开连接")
 }
 
 pub(crate) fn mark_intentional_exit() {
     INTENTIONAL_EXIT.store(true, Ordering::Release);
+}
+
+pub(crate) fn request_recovery(app: &tauri::AppHandle, reason: &str) {
+    schedule_restart(app, reason);
+}
+
+/// Request watchdog covers this wait as well as queueing and native operations.
+pub(crate) async fn wait_for_frontend_ready(label: &str) -> Result<(), String> {
+    let Some(readiness) = tracked_window_readiness(label) else { return Ok(()); };
+    loop {
+        let notified = readiness.ready.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if readiness.cancelled.load(Ordering::Acquire) { return Err("窗口创建已取消".into()); }
+        if readiness.frontend_ready.load(Ordering::Acquire) { return Ok(()); }
+        notified.await;
+    }
+}
+
+pub(crate) fn show_reused_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+    let app = window.app_handle();
+    let label = window.label();
+    window.unminimize().map_err(|error| window_operation_error(app, label, "还原窗口失败", error))?;
+    window.show().map_err(|error| window_operation_error(app, label, "显示窗口失败", error))?;
+    window.set_always_on_top(true).map_err(|error| window_operation_error(app, label, "置顶窗口失败", error))?;
+    window.set_focus().map_err(|error| window_operation_error(app, label, "聚焦窗口失败", error))?;
+    Ok(())
 }
 
 fn start_version_poll() {
@@ -349,8 +396,8 @@ fn schedule_restart(app: &tauri::AppHandle, reason: &str) {
             RESTART_LEVEL.store(0, Ordering::Release);
             tracing::error!(%error, "Failed to launch WebView recovery process");
             use tauri_plugin_notification::NotificationExt;
-            let _ = app.notification().builder().title("WebView2 ??????")
-                .body(format!("{error}???????????????"))
+            let _ = app.notification().builder().title("WebView2 恢复启动失败")
+                .body(format!("{error}；当前程序保留运行，请手动重启"))
                 .show();
         }
     });
@@ -363,7 +410,7 @@ fn notify_restart(app: &tauri::AppHandle) {
         .notification()
         .builder()
         .title("ElegantClipboard 正在恢复")
-        .body("WebView2 连接已失效，程序将自动重启恢复")
+        .body("检测到窗口或剪贴板监控异常，程序将自动重启恢复")
         .show();
 }
 
@@ -655,6 +702,22 @@ fn is_renderer_unresponsive(kind: i32) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn destruction_between_generation_lookup_and_registration_is_cancelled() {
+        let readiness = Arc::new(WindowReadiness::new());
+        let registered = std::sync::atomic::AtomicUsize::new(0);
+        let result = bind_readiness(&readiness, |generation| {
+            // Destruction scans before this generation is registered.
+            readiness.cancelled.store(true, Ordering::Release);
+            registered.store(generation, Ordering::Release);
+        });
+        assert!(result.is_err());
+        assert_ne!(registered.load(Ordering::Acquire), 0);
+        assert!(bind_readiness(&readiness, |_| panic!("cancelled generation rebound")).is_err());
+        let replacement = Arc::new(WindowReadiness::new());
+        assert!(bind_readiness(&replacement, |_| {}).is_ok());
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn runtime_update_event_does_not_schedule_recovery() {
@@ -945,5 +1008,9 @@ mod tests {
         assert!(is_webview_connection_failure("HRESULT 0x80010108"));
         assert!(is_webview_connection_failure("已与其客户端断开连接"));
         assert!(!is_webview_connection_failure("the window is hidden"));
+        assert!(is_webview_connection_failure("HRESULT 0X800706BA"));
+        assert!(is_webview_connection_failure("HRESULT 0x800706be"));
+        assert!(is_webview_connection_failure("WebView2 HRESULT 0x8007139F"));
+        assert!(!is_webview_connection_failure("HTTP request timed out"));
     }
 }

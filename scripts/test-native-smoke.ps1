@@ -10,7 +10,10 @@ if (-not $mt) { throw 'Windows SDK mt.exe is required for the WebView2 test mani
 Push-Location (Join-Path $root 'src-tauri')
 try {
     $lines = & cargo test --lib --offline --features native-smoke --no-run --message-format=json
-    if ($LASTEXITCODE -ne 0) { throw "Native test build failed: $LASTEXITCODE" }
+    if ($LASTEXITCODE -ne 0) {
+        $lines | Write-Output
+        throw "Native test build failed: $LASTEXITCODE"
+    }
     $exe = $lines | ForEach-Object {
         $entry = $_ | ConvertFrom-Json
         if ($entry.reason -eq 'compiler-artifact' -and $entry.profile.test -and $entry.executable) {
@@ -27,11 +30,13 @@ try {
     $process = Start-Process -FilePath $copy -WindowStyle Hidden -PassThru `
         -ArgumentList 'tray::tests::native_window_smoke --ignored --exact --nocapture --test-threads=1' `
         -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    # Retain the OS process handle before a short-lived test can exit. Refresh()
+    # can otherwise discard the only exit-code snapshot on Windows PowerShell.
+    $nativeProcessHandle = $process.Handle
     if (-not $process.WaitForExit(45000)) {
         Stop-Process -Id $process.Id
         throw 'Native window test exceeded 45 seconds.'
     }
-    $process.Refresh()
     Get-Content -LiteralPath $stdout
     Get-Content -LiteralPath $stderr
     "EXIT_CODE=$($process.ExitCode)"

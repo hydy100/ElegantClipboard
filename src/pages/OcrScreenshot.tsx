@@ -1,10 +1,10 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { logError } from "@/lib/logger";
 import { cropScreenRegion, recognizeText } from "@/lib/ocr";
+import { registerWindowRequestHandler } from "@/lib/window-request";
 import { useOcrSettings } from "@/stores/ocr-settings";
 
 export function OcrScreenshot() {
@@ -13,56 +13,97 @@ export function OcrScreenshot() {
   const [drawing, setDrawing] = useState(false);
   const [startPos, setStartPos] = useState({ x: 0, y: 0 });
   const [imagePath, setImagePath] = useState("");
-  const [loadKey, setLoadKey] = useState(0);
+  const cancelScreenshotRef = useRef<(() => void) | null>(null);
 
-  const params = new URLSearchParams(window.location.search);
-  const pathParam = params.get("path") || "";
-
-  // 首次加载 + 监听复用事件
   useEffect(() => {
-    useOcrSettings.getState().loadSettings();
-    if (pathParam) setImagePath(pathParam);
-
-    // 窗口复用时，Rust 会发此事件传入新截图路径
-    const unlisten = listen<string>("ocr-screenshot-update", (event) => {
+    let cancelLoad: (() => void) | undefined;
+    let loadSequence = 0;
+    const cancelScreenshot = () => {
+      ++loadSequence;
+      cancelLoad?.();
+      imgRef.current = null;
+    };
+    cancelScreenshotRef.current = cancelScreenshot;
+    const cleanup = registerWindowRequestHandler(async (path) => {
+      cancelLoad?.();
+      const sequence = ++loadSequence;
       setDrawing(false);
-      // 立即清除 canvas，避免复用窗口时闪烁上一次的选区
+      setStartPos({ x: 0, y: 0 });
+      setImagePath("");
+      imgRef.current = null;
       const canvas = canvasRef.current;
       const ctx = canvas?.getContext("2d");
-      if (canvas && ctx) {
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-      }
-      setImagePath(event.payload);
-      setLoadKey((k) => k + 1); // 强制触发重新加载（路径可能相同）
-    });
-    void unlisten
-      .then(() => invoke("managed_window_ready"))
-      .catch(() => {});
-    return () => { unlisten.then((fn) => fn()); };
-  }, []);
+      if (!canvas || !ctx) throw new Error("Screenshot canvas unavailable");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (!path) throw new Error("Screenshot path is empty");
 
-  // 加载截图到 canvas
-  const loadImage = useCallback((path: string) => {
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext("2d");
-    if (!canvas || !ctx) return;
-
-    const img = new Image();
-    img.onload = async () => {
-      imgRef.current = img;
-      canvas.width = img.width;
-      canvas.height = img.height;
-      ctx.drawImage(img, 0, 0);
-      // 截图绘制完成后通知 Rust 设置窗口位置并显示
+      await new Promise<void>((resolve, reject) => {
+        const img = new Image();
+        let settled = false;
+        const detach = () => {
+          settled = true;
+          img.onload = null;
+          img.onerror = null;
+          if (cancelLoad === cancel) cancelLoad = undefined;
+        };
+        const cancel = () => {
+          if (settled) return;
+          detach();
+          img.src = "";
+          reject(new Error("Screenshot request cancelled"));
+        };
+        cancelLoad = cancel;
+        img.onerror = () => {
+          if (settled) return;
+          detach();
+          reject(new Error("Failed to load screenshot"));
+        };
+        img.onload = () => {
+          // A queued browser task can retain the old listener after explicit close.
+          if (settled) return;
+          if (sequence !== loadSequence) {
+            cancel();
+            return;
+          }
+          detach();
+          try {
+            imgRef.current = img;
+            canvas.width = img.width;
+            canvas.height = img.height;
+            ctx.drawImage(img, 0, 0);
+            setImagePath(path);
+            resolve();
+          } catch (error) {
+            reject(error);
+          }
+        };
+        // Reload even when the backend overwrites the same file.
+        try {
+          img.src = convertFileSrc(path) + "?t=" + Date.now() + "-" + sequence;
+        } catch (error) {
+          detach();
+          reject(error);
+        }
+      });
+      if (sequence !== loadSequence) throw new Error("Screenshot request cancelled");
+      // Resolves only once the drawn screenshot has been positioned and shown.
       await invoke("ocr_screenshot_ready");
+      if (sequence !== loadSequence) {
+        // Close may race the native show IPC; keep its eventual result hidden too.
+        await invoke("hide_ocr_screenshot_window");
+        throw new Error("Screenshot request cancelled");
+      }
+    });
+    void useOcrSettings.getState().loadSettings()
+      .catch((error) => logError("Failed to load OCR settings:", error));
+    void invoke("managed_window_ready")
+      .catch((error) => logError("Failed to initialize screenshot window:", error));
+    return () => {
+      cleanup();
+      cancelScreenshot();
+      if (cancelScreenshotRef.current === cancelScreenshot) cancelScreenshotRef.current = null;
     };
-    // 加 timestamp 避免浏览器缓存（复用窗口时文件路径相同但内容已变）
-    img.src = convertFileSrc(path) + "?t=" + Date.now();
   }, []);
-
-  useEffect(() => {
-    if (imagePath) loadImage(imagePath);
-  }, [imagePath, loadKey, loadImage]);
 
   // 重绘 canvas（背景 + 选区）
   const redraw = useCallback(
@@ -161,6 +202,7 @@ export function OcrScreenshot() {
   };
 
   const closeWindow = () => {
+    cancelScreenshotRef.current?.();
     invoke("hide_ocr_screenshot_window").catch(() => {
       getCurrentWindow().hide();
     });

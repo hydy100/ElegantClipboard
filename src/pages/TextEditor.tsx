@@ -8,17 +8,53 @@ import { WindowTitleBar } from "@/components/WindowTitleBar";
 import { logError } from "@/lib/logger";
 import { initTheme } from "@/lib/theme-applier";
 import { cn } from "@/lib/utils";
+import { registerWindowRequestHandler } from "@/lib/window-request";
 
 export function TextEditor() {
   const [text, setText] = useState("");
   const [originalText, setOriginalText] = useState("");
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
   const [saving, setSaving] = useState(false);
   const [themeReady, setThemeReady] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const params = new URLSearchParams(window.location.search);
   const id = Number(params.get("id"));
+
+  const loadResultRef = useRef<Promise<string | null>>(Promise.resolve("Editor not initialized"));
+
+  useEffect(() => {
+    let disposed = false;
+    setLoading(true);
+    setLoadError("");
+    // Store a fulfilled result even on failure: initialization can finish before
+    // the open request arrives, without creating an unhandled rejection.
+    loadResultRef.current = (async (): Promise<string | null> => {
+      try {
+        if (!Number.isSafeInteger(id) || id <= 0) throw new Error("Invalid clipboard item ID");
+        const item = await invoke<{ text_content: string | null } | null>("get_clipboard_item", { id });
+        if (!item) throw new Error("Clipboard item not found");
+        if (disposed) return "Editor disposed";
+        const content = item.text_content ?? "";
+        setText(content);
+        setOriginalText(content);
+        return null;
+      } catch (error) {
+        const message = String(error);
+        if (!disposed) setLoadError(message);
+        return message;
+      } finally {
+        if (!disposed) setLoading(false);
+      }
+    })();
+    return () => { disposed = true; };
+  }, [id]);
+
+  useEffect(() => registerWindowRequestHandler(async () => {
+    const error = await loadResultRef.current;
+    if (error) throw new Error(error);
+  }), [id]);
 
   // 加载主题后显示窗口
   useEffect(() => {
@@ -33,19 +69,6 @@ export function TextEditor() {
       setThemeReady(true);
     });
   }, []);
-
-  // 加载条目内容
-  useEffect(() => {
-    if (!id) return;
-    invoke<{ text_content: string | null }>("get_clipboard_item", { id }).then(
-      (item) => {
-        const content = item?.text_content ?? "";
-        setText(content);
-        setOriginalText(content);
-        setLoading(false);
-      },
-    );
-  }, [id]);
 
   // Refs for stable keydown handler
   const textRef = useRef(text);
@@ -130,6 +153,8 @@ export function TextEditor() {
           <div className="flex-1 flex items-center justify-center">
             <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin" />
           </div>
+        ) : loadError ? (
+          <p role="alert" className="p-4 text-sm text-destructive">{loadError}</p>
         ) : (
           <textarea
             ref={textareaRef}

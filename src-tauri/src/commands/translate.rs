@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tauri::{Emitter, Manager, State};
+use tauri::{Manager, State};
 
 use super::AppState;
 use crate::database;
@@ -531,58 +531,61 @@ pub async fn get_pending_translate_text() -> Result<String, String> {
 /// 打开翻译选中文字结果窗口
 #[tauri::command]
 pub async fn open_translate_result_window(app: tauri::AppHandle, text: String) -> Result<(), String> {
-    let _creation = super::WINDOW_CREATION.lock().await;
-    super::run_blocking("open_translate_result_window", move || {
-        let label = "translate-result";
-
-        // Save before checking existence: the webview may exist before its listener.
-        *PENDING_TRANSLATE_TEXT.lock().unwrap() = text.clone();
-
-        if let Some(window) = app.get_webview_window(label) {
-            let _ = window.emit("translate-result-update", &text);
-            let _ = window.unminimize();
-            let _ = window.show();
-            let _ = window.set_always_on_top(true);
-            let _ = window.set_focus();
-            return Ok(());
-        }
-
+    let request_app = app.clone();
+    let request_label = "translate-result".to_string();
+    let request_payload = text.clone();
+    crate::window_requests::run(&request_app, &request_label, request_payload, async move {
+        let queue_guard = super::WINDOW_CREATION.clone().lock_owned().await;
         crate::webview_runtime::ensure_runtime_current(&app)?;
-        let creation_guard = crate::webview_runtime::WindowCreationGuard::start(&app, label);
-        let page_load_guard = creation_guard.clone();
-        let build_result = tauri::WebviewWindowBuilder::new(
-            &app,
-            label,
-            tauri::WebviewUrl::App("/translate-result".into()),
-        )
-        .title("翻译选中文字")
-        .inner_size(520.0, 420.0)
-        .min_inner_size(360.0, 300.0)
-        .decorations(false)
-        .transparent(true)
-        .shadow(true)
-        .visible(false)
-        .resizable(true)
-        .always_on_top(true)
-        .center()
-        .on_page_load(move |window, payload| {
-            page_load_guard.on_page_load(&window, &payload);
-        })
-        .build();
-        match build_result {
-            Ok(_) => {}
-            Err(error) => {
-                creation_guard.cancel();
-                return Err(crate::webview_runtime::window_operation_error(
-                    &app,
-                    label,
-                    "创建翻译结果窗口失败",
-                    error,
-                ));
-            }
-        }
+        super::run_blocking("open_translate_result_window", move || {
+            let _queue_guard = queue_guard;
+            let label = "translate-result";
 
-        Ok(())
+            // Save before checking existence: the webview may exist before its listener.
+            *PENDING_TRANSLATE_TEXT.lock().unwrap() = text.clone();
+
+            if let Some(window) = app.get_webview_window(label) {
+                crate::webview_runtime::show_reused_window(&window)?;
+                return Ok(());
+            }
+
+            crate::webview_runtime::ensure_runtime_current(&app)?;
+            let creation_guard = crate::webview_runtime::WindowCreationGuard::start(&app, label);
+            let page_load_guard = creation_guard.clone();
+            let build_result = tauri::WebviewWindowBuilder::new(
+                &app,
+                label,
+                tauri::WebviewUrl::App("/translate-result".into()),
+            )
+            .title("翻译选中文字")
+            .inner_size(520.0, 420.0)
+            .min_inner_size(360.0, 300.0)
+            .decorations(false)
+            .transparent(true)
+            .shadow(true)
+            .visible(false)
+            .resizable(true)
+            .always_on_top(true)
+            .center()
+            .on_page_load(move |window, payload| {
+                page_load_guard.on_page_load(&window, &payload);
+            })
+            .build();
+            match build_result {
+                Ok(_) => {}
+                Err(error) => {
+                    creation_guard.cancel();
+                    return Err(crate::webview_runtime::window_operation_error(
+                        &app,
+                        label,
+                        "创建翻译结果窗口失败",
+                        error,
+                    ));
+                }
+            }
+
+            Ok(())
+        }).await
     }).await
 }
 
@@ -627,8 +630,7 @@ pub fn register_translate_selection_shortcut(app: &tauri::AppHandle) {
                 let Some(guard) = super::activity::ActivityGuard::acquire(&SELECTION_ACTIVE) else { return; };
                 let app = app.clone();
                 std::thread::spawn(move || {
-                    let _guard = guard;
-                    trigger_translate_selection(&app);
+                    trigger_translate_selection(&app, guard);
                 });
             }
         }),
@@ -657,7 +659,11 @@ pub fn unregister_translate_selection_shortcut(app: &tauri::AppHandle) {
 }
 
 /// 触发翻译选中文字流程
-fn trigger_translate_selection(app: &tauri::AppHandle) {
+fn trigger_translate_selection(app: &tauri::AppHandle, guard: super::activity::ActivityGuard) {
+    let _health = match crate::window_requests::watch_operation(app, "selection") {
+        Ok(guard) => guard,
+        Err(error) => { tracing::error!(%error, "Failed to supervise native operation"); return; }
+    };
     let state = match app.try_state::<Arc<AppState>>() {
         Some(s) => s,
         None => return,
@@ -667,6 +673,7 @@ fn trigger_translate_selection(app: &tauri::AppHandle) {
         Ok(text) if !text.trim().is_empty() => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
+                let _guard = guard;
                 if let Err(e) = open_translate_result_window(app.clone(), text).await {
                     tracing::error!("打开翻译结果窗口失败: {}", e);
                     use tauri_plugin_notification::NotificationExt;

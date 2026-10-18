@@ -36,8 +36,10 @@ fn schedule_preview_destroy<R: tauri::Runtime>(app: tauri::AppHandle<R>, label: 
     let seq = slot.fetch_add(1, Ordering::AcqRel) + 1;
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(PREVIEW_DESTROY_DELAY).await;
-        let _creation = super::WINDOW_CREATION.lock().await;
+        let queue_guard = super::WINDOW_CREATION.clone().lock_owned().await;
+        if crate::webview_runtime::ensure_runtime_current(&app).is_err() { return; }
         let _ = super::run_blocking("destroy_preview", move || {
+        let _queue_guard = queue_guard;
             if slot.load(Ordering::Acquire) != seq { return Ok(()); }
             if let Some(window) = app.get_webview_window(label)
                 && !window.is_visible().unwrap_or(false) {
@@ -83,8 +85,11 @@ pub async fn show_image_preview(
     align: Option<String>,
     token: Option<u64>,
 ) -> Result<(), String> {
-    let _creation = super::WINDOW_CREATION.lock().await;
+    let _health = crate::window_requests::watch_operation(&app, "show_image_preview")?;
+    let queue_guard = super::WINDOW_CREATION.clone().lock_owned().await;
+    crate::webview_runtime::ensure_runtime_current(&app)?;
     super::run_blocking("show_image_preview", move || {
+        let _queue_guard = queue_guard;
         let token = token.unwrap_or(0);
         if token != 0 && !promote_preview_token(&IMAGE_PREVIEW_TOKEN, token) {
             return Ok(());
@@ -198,8 +203,11 @@ pub async fn show_video_preview(
     duration: Option<f64>,
     token: Option<u64>,
 ) -> Result<(), String> {
-    let _creation = super::WINDOW_CREATION.lock().await;
+    let _health = crate::window_requests::watch_operation(&app, "show_video_preview")?;
+    let queue_guard = super::WINDOW_CREATION.clone().lock_owned().await;
+    crate::webview_runtime::ensure_runtime_current(&app)?;
     super::run_blocking("show_video_preview", move || {
+        let _queue_guard = queue_guard;
         let token = token.unwrap_or(0);
         if token != 0 && !promote_preview_token(&IMAGE_PREVIEW_TOKEN, token) {
             return Ok(());
@@ -337,8 +345,11 @@ pub async fn show_text_preview(
     font_size: Option<f64>,
     token: Option<u64>,
 ) -> Result<(), String> {
-    let _creation = super::WINDOW_CREATION.lock().await;
+    let _health = crate::window_requests::watch_operation(&app, "show_text_preview")?;
+    let queue_guard = super::WINDOW_CREATION.clone().lock_owned().await;
+    crate::webview_runtime::ensure_runtime_current(&app)?;
     super::run_blocking("show_text_preview", move || {
+        let _queue_guard = queue_guard;
         let token = token.unwrap_or(0);
         if token != 0 && !promote_preview_token(&TEXT_PREVIEW_TOKEN, token) {
             return Ok(());
@@ -466,62 +477,75 @@ pub async fn hide_text_preview(app: tauri::AppHandle, token: Option<u64>) {
 
 #[tauri::command]
 pub async fn open_text_editor_window(app: tauri::AppHandle, id: i64) -> Result<(), String> {
-    let _creation = super::WINDOW_CREATION.lock().await;
-    super::run_blocking("open_text_editor_window", move || {
-        let label = format!("text-editor-{}", id);
-
-        if let Some(window) = app.get_webview_window(&label) {
-            let _ = window.unminimize();
-            let _ = window.show();
-            let _ = window.set_always_on_top(true);
-            let _ = window.set_focus();
-            return Ok(());
-        }
-
+    let request_app = app.clone();
+    let request_label = format!("text-editor-{id}");
+    let request_payload = String::new();
+    crate::window_requests::run(&request_app, &request_label, request_payload, async move {
+        let queue_guard = super::WINDOW_CREATION.clone().lock_owned().await;
         crate::webview_runtime::ensure_runtime_current(&app)?;
-        let creation_guard = crate::webview_runtime::WindowCreationGuard::start(&app, label.clone());
-        let page_load_guard = creation_guard.clone();
-        let build_result = tauri::WebviewWindowBuilder::new(
-            &app,
-            &label,
-            tauri::WebviewUrl::App(format!("/editor?id={}", id).into()),
-        )
-        .title("编辑")
-        .inner_size(600.0, 460.0)
-        .min_inner_size(400.0, 300.0)
-        .decorations(false)
-        .transparent(true)
-        .shadow(true)
-        .visible(false)
-        .resizable(true)
-        .always_on_top(true)
-        .center()
-        .on_page_load(move |window, payload| {
-            page_load_guard.on_page_load(&window, &payload);
-        })
-        .build();
-        let window = match build_result {
-            Ok(window) => window,
-            Err(error) => {
-                creation_guard.cancel();
-                return Err(crate::webview_runtime::window_operation_error(
-                    &app,
-                    &label,
-                    "创建编辑器窗口失败",
-                    error,
-                ));
-            }
-        };
+        super::run_blocking("open_text_editor_window", move || {
+            let _queue_guard = queue_guard;
+            let label = format!("text-editor-{}", id);
 
-        let _ = window;
-        Ok(())
+            if let Some(window) = app.get_webview_window(&label) {
+                crate::webview_runtime::show_reused_window(&window)?;
+                return Ok(());
+            }
+
+            crate::webview_runtime::ensure_runtime_current(&app)?;
+            let creation_guard = crate::webview_runtime::WindowCreationGuard::start(&app, label.clone());
+            let page_load_guard = creation_guard.clone();
+            let build_result = tauri::WebviewWindowBuilder::new(
+                &app,
+                &label,
+                tauri::WebviewUrl::App(format!("/editor?id={}", id).into()),
+            )
+            .title("编辑")
+            .inner_size(600.0, 460.0)
+            .min_inner_size(400.0, 300.0)
+            .decorations(false)
+            .transparent(true)
+            .shadow(true)
+            .visible(false)
+            .resizable(true)
+            .always_on_top(true)
+            .center()
+            .on_page_load(move |window, payload| {
+                page_load_guard.on_page_load(&window, &payload);
+            })
+            .build();
+            let window = match build_result {
+                Ok(window) => window,
+                Err(error) => {
+                    creation_guard.cancel();
+                    return Err(crate::webview_runtime::window_operation_error(
+                        &app,
+                        &label,
+                        "创建编辑器窗口失败",
+                        error,
+                    ));
+                }
+            };
+
+            let _ = window;
+            Ok(())
+        }).await
     }).await
 }
 
 #[tauri::command]
 pub async fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> {
-    let _creation = super::WINDOW_CREATION.lock().await;
-    super::run_blocking("open_settings_window", move || crate::tray::open_settings_window(&app)).await
+    let request_app = app.clone();
+    let request_label = "settings".to_string();
+    let request_payload = String::new();
+    crate::window_requests::run(&request_app, &request_label, request_payload, async move {
+        let queue_guard = super::WINDOW_CREATION.clone().lock_owned().await;
+        crate::webview_runtime::ensure_runtime_current(&app)?;
+        super::run_blocking("open_settings_window", move || {
+            let _queue_guard = queue_guard;
+            crate::tray::open_settings_window(&app)
+        }).await
+    }).await
 }
 
 #[tauri::command]

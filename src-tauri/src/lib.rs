@@ -16,6 +16,7 @@ mod tray;
 pub(crate) mod proxy;
 mod webdav;
 mod webview_runtime;
+mod window_requests;
 mod win_v_registry;
 
 use clipboard::ClipboardMonitor;
@@ -952,6 +953,7 @@ pub fn run() {
             commands::preview::hide_text_preview,
             commands::preview::open_text_editor_window,
             webview_runtime::managed_window_ready,
+            window_requests::window_request_ack,
             commands::window::set_window_pinned,
             commands::window::is_window_pinned,
             commands::window::set_window_effect,

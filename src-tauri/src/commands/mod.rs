@@ -14,7 +14,8 @@ mod selection;
 
 // Serialize webview creation on callers, never by locking the GUI event loop.
 // In particular, concurrent preview/translation/OCR creation must not nest pumps.
-pub(crate) static WINDOW_CREATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static WINDOW_CREATION: std::sync::LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
 use crate::clipboard::ClipboardMonitor;
 use crate::database::Database;

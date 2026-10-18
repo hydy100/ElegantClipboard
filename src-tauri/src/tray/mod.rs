@@ -114,10 +114,7 @@ pub(crate) fn open_settings_window(app: &AppHandle) -> Result<(), String> {
     // Called only from the serialized creation worker, never the event loop.
     // 设置窗口已存在则聚焦
     if let Some(window) = app.get_webview_window("settings") {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_always_on_top(true);
-        let _ = window.set_focus();
+        crate::webview_runtime::show_reused_window(&window)?;
         return Ok(());
     }
 

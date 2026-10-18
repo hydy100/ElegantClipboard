@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Translate16Regular, Copy16Regular } from "@fluentui/react-icons";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { TtsButtonLarge } from "@/components/TtsButton";
 import { TtsHighlightText } from "@/components/TtsHighlightText";
@@ -12,6 +11,7 @@ import { logError } from "@/lib/logger";
 import { initTheme } from "@/lib/theme-applier";
 import { translateText } from "@/lib/translate";
 import { cn } from "@/lib/utils";
+import { registerWindowRequestHandler } from "@/lib/window-request";
 import { useTranslateSettings } from "@/stores/translate-settings";
 import { useTtsPlayback } from "@/stores/tts-playback";
 import { useTtsSettings } from "@/stores/tts-settings";
@@ -39,47 +39,6 @@ export function TranslateResult() {
     if (!translateLoaded) useTranslateSettings.getState().loadSettings();
     if (!ttsLoaded) useTtsSettings.getState().loadSettings();
   }, [translateLoaded, ttsLoaded]);
-
-  // 加载主题后显示窗口
-  useEffect(() => {
-    initTheme().then(async () => {
-      const win = getCurrentWindow();
-      document.body.getBoundingClientRect();
-      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
-      await new Promise((r) => setTimeout(r, 30));
-      await win.show();
-      await win.setFocus();
-      await invoke("managed_window_ready");
-      await new Promise((r) => requestAnimationFrame(r));
-      setThemeReady(true);
-    });
-  }, []);
-
-  // Subscribe before fetching the snapshot so an update during startup is not lost.
-  useEffect(() => {
-    let disposed = false;
-    let updated = false;
-    const unlisten = listen<string>("translate-result-update", (event) => {
-      if (disposed) return;
-      updated = true;
-      setText(event.payload);
-      setTranslatedText("");
-      setTranslateError("");
-      doTranslate(event.payload);
-    });
-    unlisten.then(async () => {
-      const pending = await invoke<string>("get_pending_translate_text");
-      if (!disposed && !updated && pending) {
-        setText(pending);
-        doTranslate(pending);
-      }
-    }).catch((error) => logError("Failed to initialize selection translation:", error));
-    return () => {
-      disposed = true;
-      ++translationRequest.current;
-      unlisten.then((fn) => fn());
-    };
-  }, []);
 
   // ESC 关闭
   useEffect(() => {
@@ -114,6 +73,36 @@ export function TranslateResult() {
     } finally {
       if (request === translationRequest.current) setTranslating(false);
     }
+  }, []);
+
+  useEffect(() => {
+    const cleanup = registerWindowRequestHandler((payload) => {
+      setText(payload);
+      setCopied(false);
+      setTranslatedCopied(false);
+      setTranslatedText("");
+      setTranslateError("");
+      void doTranslate(payload);
+    });
+    return () => {
+      cleanup();
+      ++translationRequest.current;
+    };
+  }, [doTranslate]);
+
+  // 加载主题后显示窗口
+  useEffect(() => {
+    initTheme().then(async () => {
+      const win = getCurrentWindow();
+      document.body.getBoundingClientRect();
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      await new Promise((r) => setTimeout(r, 30));
+      await win.show();
+      await win.setFocus();
+      await invoke("managed_window_ready");
+      await new Promise((r) => requestAnimationFrame(r));
+      setThemeReady(true);
+    });
   }, []);
 
   const handleCopy = useCallback(async () => {

@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { ScanText16Regular, Copy16Regular, Translate16Regular, Edit16Regular } from "@fluentui/react-icons";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import Linkify from "linkify-react";
@@ -14,6 +13,7 @@ import { logError } from "@/lib/logger";
 import { initTheme } from "@/lib/theme-applier";
 import { translateText } from "@/lib/translate";
 import { cn } from "@/lib/utils";
+import { registerWindowRequestHandler } from "@/lib/window-request";
 import { useOcrSettings } from "@/stores/ocr-settings";
 import { useTranslateSettings } from "@/stores/translate-settings";
 import { useTtsPlayback } from "@/stores/tts-playback";
@@ -31,6 +31,7 @@ export function OcrResult() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const ocrTextRef = useRef<HTMLDivElement>(null);
   const translationRef = useRef<HTMLDivElement>(null);
+  const translationRequest = useRef(0);
   const [editing, setEditing] = useState(false);
 
   // Linkify 配置：URL 渲染为蓝色下划线，Ctrl+点击打开
@@ -79,6 +80,48 @@ export function OcrResult() {
     if (!ttsLoaded) useTtsSettings.getState().loadSettings();
   }, [translateLoaded, ocrLoaded, ttsLoaded]);
 
+  // Invalidate older translations when a reused window receives another payload.
+  const doTranslate = useCallback(async (sourceText: string) => {
+    const request = ++translationRequest.current;
+    setTranslating(true);
+    setTranslateError("");
+    setTranslatedText("");
+    try {
+      const result = await translateText(sourceText);
+      if (request === translationRequest.current) setTranslatedText(result);
+    } catch (error) {
+      if (request === translationRequest.current) setTranslateError(String(error));
+    } finally {
+      if (request === translationRequest.current) setTranslating(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const cleanup = registerWindowRequestHandler((payload) => {
+      ++translationRequest.current;
+      setText(payload);
+      setOcrRecognizing(payload === "");
+      setEditing(false);
+      setCopied(false);
+      setTranslatedCopied(false);
+      setTranslating(false);
+      setTranslatedText("");
+      setTranslateError("");
+      const { autoCopy, recordOcrCopy: record, autoTranslate } = useOcrSettings.getState();
+      if (autoCopy && payload.trim()) {
+        void invoke("write_text_to_clipboard", { text: payload, record })
+          .catch((error) => logError("Failed to auto-copy OCR result:", error));
+      }
+      if (autoTranslate && useTranslateSettings.getState().enabled && payload.trim()) {
+        void doTranslate(payload);
+      }
+    });
+    return () => {
+      cleanup();
+      ++translationRequest.current;
+    };
+  }, [doTranslate]);
+
   // 加载主题后显示窗口
   useEffect(() => {
     initTheme().then(async () => {
@@ -92,74 +135,6 @@ export function OcrResult() {
       await new Promise((r) => requestAnimationFrame(r));
       setThemeReady(true);
     });
-  }, []);
-
-  // 挂载后从 Rust 获取暂存文本（兜底：防止窗口刚创建时 emit 事件丢失）
-  useEffect(() => {
-    invoke<string>("get_pending_ocr_text").then((t) => {
-      if (t) {
-        setText(t);
-        setOcrRecognizing(false);
-        // 自动复制
-        const { autoCopy, recordOcrCopy: record } = useOcrSettings.getState();
-        if (autoCopy && t.trim()) {
-          invoke("write_text_to_clipboard", { text: t, record }).catch(() => {});
-        }
-        // 自动翻译
-        const { autoTranslate } = useOcrSettings.getState();
-        const { enabled: transEnabled } = useTranslateSettings.getState();
-        if (autoTranslate && transEnabled && t.trim()) {
-          setTranslating(true);
-          translateText(t).then((r) => {
-            setTranslatedText(r);
-          }).catch((e) => {
-            setTranslateError(String(e));
-          }).finally(() => {
-            setTranslating(false);
-          });
-        }
-      }
-    }).catch(() => {});
-  }, []);
-
-  // 监听文本更新事件（窗口已存在时复用）
-  useEffect(() => {
-    const unlisten = listen<string>("ocr-result-update", (event) => {
-      if (event.payload === "") {
-        // 空文本 = 开始识别
-        setText("");
-        setOcrRecognizing(true);
-        setEditing(false);
-      } else {
-        const newText = event.payload;
-        setText(newText);
-        setOcrRecognizing(false);
-        // 识别完成后自动复制
-        const { autoCopy, recordOcrCopy: record } = useOcrSettings.getState();
-        if (autoCopy && newText.trim()) {
-          invoke("write_text_to_clipboard", { text: newText, record }).catch(() => {});
-        }
-        // 识别完成后自动翻译
-        const { autoTranslate } = useOcrSettings.getState();
-        const { enabled: transEnabled } = useTranslateSettings.getState();
-        if (autoTranslate && transEnabled && newText.trim()) {
-          setTranslating(true);
-          translateText(newText).then((r) => {
-            setTranslatedText(r);
-          }).catch((e) => {
-            setTranslateError(String(e));
-          }).finally(() => {
-            setTranslating(false);
-          });
-          return; // 跳过下面的重置
-        }
-      }
-      setTranslatedText("");
-      setTranslateError("");
-    });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
   }, []);
 
   // ESC 关闭
@@ -189,17 +164,8 @@ export function OcrResult() {
 
   const handleTranslate = useCallback(async () => {
     if (!text.trim() || translating) return;
-    setTranslating(true);
-    setTranslateError("");
-    try {
-      const result = await translateText(text);
-      setTranslatedText(result);
-    } catch (error) {
-      setTranslateError(String(error));
-    } finally {
-      setTranslating(false);
-    }
-  }, [text, translating]);
+    await doTranslate(text);
+  }, [text, translating, doTranslate]);
 
   const handleCopyTranslation = useCallback(async () => {
     try {
