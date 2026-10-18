@@ -1,10 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-static ACTIVE_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
-
-pub(crate) fn has_active_operations() -> bool {
-    ACTIVE_OPERATIONS.load(Ordering::Acquire) != 0
-}
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Production recovery relies on destructors and catch_unwind, not process abort.
 #[cfg(all(not(debug_assertions), panic = "abort"))]
@@ -18,33 +12,19 @@ impl ActivityGuard {
         active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
-            .map(|_| {
-                ACTIVE_OPERATIONS.fetch_add(1, Ordering::AcqRel);
-                Self(active)
-            })
+            .map(|_| Self(active))
     }
 }
 
 impl Drop for ActivityGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
-        ACTIVE_OPERATIONS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn active_worker_defers_runtime_update_restart() {
-        static ACTIVE: AtomicBool = AtomicBool::new(false);
-        let guard = ActivityGuard::acquire(&ACTIVE).unwrap();
-        assert!(has_active_operations());
-        assert!(ActivityGuard::acquire(&ACTIVE).is_none());
-        drop(guard);
-        assert!(!ACTIVE.load(Ordering::Acquire));
-    }
 
     #[test]
     fn guard_recovers_after_worker_panic_or_unstarted_worker_drop() {
