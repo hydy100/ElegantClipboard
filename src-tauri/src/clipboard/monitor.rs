@@ -3,6 +3,9 @@ use crate::database::Database;
 #[cfg(not(windows))]
 use clipboard_master::Master;
 use clipboard_master::{CallbackResult, ClipboardHandler as CMHandler};
+#[cfg(windows)]
+#[path = "monitor_health.rs"]
+mod monitor_health;
 #[cfg(all(test, windows, feature = "native-smoke"))]
 #[path = "monitor_smoke.rs"]
 mod smoke;
@@ -31,6 +34,7 @@ use tracing::{debug, error, info, warn};
 #[derive(Clone)]
 pub struct ClipboardMonitor {
     running: Arc<AtomicBool>,
+    #[cfg(not(windows))]
     baseline_sequence: Arc<AtomicU32>,
     /// 暂停计数器：> 0 时忽略剪贴板变化，防止并发复制操作竞态
     pause_count: Arc<AtomicU32>,
@@ -38,17 +42,26 @@ pub struct ClipboardMonitor {
     user_paused: Arc<AtomicBool>,
     handler: Arc<Mutex<Option<ClipboardHandler>>>,
     thread_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    #[cfg(windows)]
+    watchdog_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    #[cfg(windows)]
+    health: Arc<monitor_health::Health>,
 }
 
 impl ClipboardMonitor {
     pub fn new() -> Self {
         Self {
             running: Arc::new(AtomicBool::new(false)),
+            #[cfg(not(windows))]
             baseline_sequence: Arc::new(AtomicU32::new(clipboard_sequence())),
             pause_count: Arc::new(AtomicU32::new(0)),
             user_paused: Arc::new(AtomicBool::new(false)),
             handler: Arc::new(Mutex::new(None)),
             thread_handle: Arc::new(Mutex::new(None)),
+            #[cfg(windows)]
+            watchdog_handle: Arc::new(Mutex::new(None)),
+            #[cfg(windows)]
+            health: Arc::new(monitor_health::Health::new(clipboard_sequence())),
         }
     }
 
@@ -59,31 +72,81 @@ impl ClipboardMonitor {
         info!("Clipboard monitor initialized");
     }
 
-    /// Start once; even a missing native listener keeps sequence reconciliation alive.
+    /// Serialize lifecycle changes: never replace a worker still inside a provider.
     pub fn start(&self, app_handle: AppHandle) {
         let mut slot = self.thread_handle.lock();
+        #[cfg(windows)]
+        let mut watchdog = self.watchdog_handle.lock();
         if slot.as_ref().is_some_and(|thread| !thread.is_finished()) {
             warn!("Clipboard monitor is already running or still stopping");
+            return;
+        }
+        #[cfg(windows)]
+        if watchdog
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+        {
+            warn!("Clipboard supervisor is already running or still stopping");
             return;
         }
         if let Some(old) = slot.take() {
             let _ = old.join();
         }
         self.running.store(true, Ordering::Release);
+        match self.spawn_worker(app_handle.clone()) {
+            Ok(thread) => *slot = Some(thread),
+            Err(error) => {
+                self.running.store(false, Ordering::Release);
+                error!(%error, "Failed to spawn clipboard monitor worker");
+                return;
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Some(old) = watchdog.take() {
+                let _ = old.join();
+            }
+            let monitor = self.clone();
+            match std::thread::Builder::new()
+                .name("clipboard-watchdog".into())
+                .spawn(move || monitor.supervise(app_handle))
+            {
+                Ok(thread) => *watchdog = Some(thread),
+                Err(error) => {
+                    self.running.store(false, Ordering::Release);
+                    error!(%error, "Failed to spawn clipboard watchdog; stopping unsupervised worker");
+                }
+            }
+        }
+    }
+
+    fn spawn_worker(&self, app_handle: AppHandle) -> std::io::Result<JoinHandle<()>> {
+        #[cfg(windows)]
+        let health = self.health.clone();
+        // Shared acknowledgement is published by the native loop immediately,
+        // so a worker unwind cannot revert to the original startup sequence.
+        #[cfg(windows)]
+        let baseline = health.snapshot().acknowledged;
         let running = self.running.clone();
+        #[cfg(not(windows))]
         let baseline_sequence = self.baseline_sequence.clone();
         let pause_count = self.pause_count.clone();
         let user_paused = self.user_paused.clone();
         let handler = self.handler.clone();
-        let result = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("clipboard-monitor".into())
             .spawn(move || {
+                // On Windows `running` is supervisor intent, not worker liveness.
+                // Preserve the previous unsupervised behavior on other platforms.
+                #[cfg(not(windows))]
                 struct Finished(Arc<AtomicBool>);
+                #[cfg(not(windows))]
                 impl Drop for Finished {
                     fn drop(&mut self) {
                         self.0.store(false, Ordering::Release);
                     }
                 }
+                #[cfg(not(windows))]
                 let _finished = Finished(running.clone());
                 info!("Clipboard monitor worker started (main window may remain hidden)");
                 let mut clipboard_handler = MonitorHandler {
@@ -95,9 +158,10 @@ impl ClipboardMonitor {
                     retry_pending: false,
                 };
                 #[cfg(windows)]
-                windows_monitor::run(
+                windows_monitor::run_supervised(
                     &running,
-                    baseline_sequence.load(Ordering::Acquire),
+                    &health,
+                    baseline,
                     clipboard_sequence,
                     || {
                         pause_count.load(Ordering::Acquire) > 0
@@ -124,14 +188,91 @@ impl ClipboardMonitor {
                         std::thread::sleep(std::time::Duration::from_millis(250));
                     }
                 }
+                #[cfg(not(windows))]
                 baseline_sequence.store(clipboard_sequence(), Ordering::Release);
                 info!("Clipboard monitor worker stopped");
-            });
-        match result {
-            Ok(thread) => *slot = Some(thread),
-            Err(error) => {
-                self.running.store(false, Ordering::Release);
-                error!(%error, "Failed to spawn clipboard monitor worker");
+            })
+    }
+
+    #[cfg(windows)]
+    fn supervise(&self, app: AppHandle) {
+        use monitor_health::{RestartBudget, RestartDecision, Status, Supervisor};
+        use std::time::{Duration, Instant};
+        let mut supervisor = Supervisor::new(self.health.snapshot());
+        let mut restart_budget = RestartBudget::default();
+        let mut previous_status = None;
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            // stop/start and all restart decisions share this lock. The watchdog
+            // never acquires the handler/database/provider lock or invokes UI IPC.
+            let mut slot = self.thread_handle.lock();
+            let now = Instant::now();
+            let finished = slot.as_ref().is_none_or(|thread| thread.is_finished());
+            let telemetry = self.health.snapshot();
+            restart_budget.observe_progress(now, !finished, telemetry.loops);
+            let status = supervisor.observe(
+                now,
+                self.running.load(Ordering::Acquire),
+                finished,
+                self.is_paused(),
+                clipboard_sequence(),
+                telemetry,
+            );
+            if previous_status != Some(status) {
+                debug!(?status,
+                    user_paused = self.user_paused.load(Ordering::Acquire),
+                    internal_pause_count = self.pause_count.load(Ordering::Acquire),
+                    telemetry = ?self.health.snapshot(), "Clipboard monitor health");
+                previous_status = Some(status);
+            }
+            match status {
+                Status::Stopped => break,
+                Status::Restart => {
+                    match restart_budget.replacement(now) {
+                        RestartDecision::Replace => {}
+                        RestartDecision::Recover => {
+                            error!(
+                                "Clipboard worker exhausted 3 replacement attempts in 10 minutes; requesting application recovery and fusing local restarts"
+                            );
+                            drop(slot);
+                            if self.running.load(Ordering::Acquire) {
+                                crate::webview_runtime::request_recovery(
+                                    &app,
+                                    "clipboard worker exhausted 3 replacement attempts in 10 minutes",
+                                );
+                            }
+                            continue;
+                        }
+                        RestartDecision::Fused => continue,
+                    }
+                    // is_finished above is mandatory; never cancel/detach a reader.
+                    if let Some(old) = slot.take() {
+                        let panicked = old.join().is_err();
+                        warn!(panicked, "Clipboard worker terminated; restarting monitor");
+                    }
+                    match self.spawn_worker(app.clone()) {
+                        Ok(thread) => {
+                            *slot = Some(thread);
+                            supervisor = Supervisor::new(self.health.snapshot());
+                        }
+                        Err(error) => {
+                            error!(%error, "Clipboard worker restart failed; retrying next watchdog tick")
+                        }
+                    }
+                }
+                Status::Recover => {
+                    error!(telemetry = ?self.health.snapshot(), "Clipboard worker blocked with sequence evidence for 60s; requesting application recovery (no duplicate reader)");
+                    // Recovery may re-enter monitor.stop(); never hold the
+                    // lifecycle lock across an application-level recovery call.
+                    drop(slot);
+                    if self.running.load(Ordering::Acquire) {
+                        crate::webview_runtime::request_recovery(
+                            &app,
+                            "clipboard worker stalled with sequence evidence for at least 60 seconds",
+                        );
+                    }
+                }
+                _ => {}
             }
         }
     }

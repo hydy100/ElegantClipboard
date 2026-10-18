@@ -38,7 +38,7 @@ for (const scenario of ['list', 'search', 'stale', 'deleted', 'read-error', 'emp
 }
 // Compile the production sequence tracker without GUI/dependency setup.
 const rustSource = fs.readFileSync(path.join(root, 'src-tauri/src/clipboard/windows_monitor.rs'), 'utf8');
-const tracker = rustSource.slice(rustSource.indexOf('struct SequenceTracker'), rustSource.indexOf('pub(super) fn run('));
+const tracker = rustSource.slice(rustSource.indexOf('struct SequenceTracker'), rustSource.indexOf('pub(super) fn run_supervised('));
 const constants = rustSource.match(/^const .*$/gm).join('\n');
 const harness = `use std::time::{Duration, Instant};
 extern crate self as tracing;

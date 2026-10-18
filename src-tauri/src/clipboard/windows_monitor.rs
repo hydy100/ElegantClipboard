@@ -1,5 +1,6 @@
 //! A native, message-only listener with sequence-number reconciliation.
 //! No WebView, window visibility, frontend subscription or Tauri IPC is needed.
+use super::monitor_health::Health;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, WAIT_FAILED};
@@ -131,7 +132,11 @@ impl SequenceTracker {
             // second copy event. Failure is not acknowledgement: retain this
             // sequence and retry slowly until success, pause, or a newer copy.
             if attempts == MAX_READ_ATTEMPTS {
-                tracing::warn!(sequence, attempts, "Clipboard still unavailable; switching to slow retries");
+                tracing::warn!(
+                    sequence,
+                    attempts,
+                    "Clipboard still unavailable; switching to slow retries"
+                );
             }
             let delay = if attempts >= MAX_READ_ATTEMPTS {
                 SLOW_READ_RETRY
@@ -143,28 +148,61 @@ impl SequenceTracker {
     }
 }
 
-pub(super) fn run(
+pub(super) fn run_supervised(
     running: &AtomicBool,
+    health: &Health,
     baseline: u32,
     sample: impl FnMut() -> u32,
     paused: impl FnMut() -> bool,
     process: impl FnMut() -> bool,
 ) {
-    run_with_factory(running, baseline, sample, paused, process, Listener::new);
+    run_with_health(
+        running,
+        baseline,
+        sample,
+        paused,
+        process,
+        Listener::new,
+        Some(health),
+    );
 }
 
+#[cfg(test)]
 pub(super) fn run_with_factory(
+    running: &AtomicBool,
+    baseline: u32,
+    sample: impl FnMut() -> u32,
+    paused: impl FnMut() -> bool,
+    process: impl FnMut() -> bool,
+    create_listener: impl FnMut() -> Result<Listener, String>,
+) {
+    run_with_health(
+        running,
+        baseline,
+        sample,
+        paused,
+        process,
+        create_listener,
+        None,
+    );
+}
+
+fn run_with_health(
     running: &AtomicBool,
     baseline: u32,
     mut sample: impl FnMut() -> u32,
     mut paused: impl FnMut() -> bool,
     mut process: impl FnMut() -> bool,
     mut create_listener: impl FnMut() -> Result<Listener, String>,
+    health: Option<&Health>,
 ) {
     let mut tracker = SequenceTracker::new(baseline);
     let mut listener = None;
     let mut register_due = Instant::now();
     while running.load(Ordering::Acquire) {
+        if let Some(health) = health {
+            health.progress(tracker.acknowledged);
+        }
         if listener.is_none() && Instant::now() >= register_due {
             match create_listener() {
                 Ok(value) => {
@@ -178,14 +216,25 @@ pub(super) fn run_with_factory(
             register_due = Instant::now() + REGISTER_RETRY;
         }
         let sequence = sample();
-        if tracker.should_read(sequence, paused(), Instant::now()) {
+        let should_read = tracker.should_read(sequence, paused(), Instant::now());
+        if let Some(health) = health {
+            // Paused sequences are intentionally consumed without a callback.
+            health.acknowledge(tracker.acknowledged);
+        }
+        if should_read {
             // A Rust panic in one item must not permanently stop future recording.
+            let completion = health.map(|health| health.callback(sequence));
             let consumed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&mut process))
                 .unwrap_or_else(|_| {
                     tracing::error!("Clipboard item processing panicked; retrying");
                     false
                 });
+            drop(completion);
             tracker.finish(sequence, consumed, Instant::now());
+            if let Some(health) = health {
+                // Checkpoint before wait/re-registration/sample can unwind.
+                health.acknowledge(tracker.acknowledged);
+            }
         }
         if !running.load(Ordering::Acquire) {
             break;
@@ -205,6 +254,153 @@ pub(super) fn run_with_factory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_tracks_real_loop_entry_completion_and_caught_callback_panic() {
+        let running = AtomicBool::new(true);
+        let health = Health::new(10);
+        let mut samples = 0;
+        let mut registrations = 0;
+        let mut callbacks = 0;
+        run_with_health(
+            &running,
+            10,
+            || {
+                samples += 1;
+                assert!(
+                    samples <= 2,
+                    "worker failed to stop after controlled callbacks"
+                );
+                let state = health.snapshot();
+                assert_eq!(state.loops, samples);
+                assert_eq!(state.entered, samples - 1);
+                assert_eq!(state.completed, samples - 1);
+                assert_eq!(state.acknowledged, 10);
+                11
+            },
+            || false,
+            || {
+                callbacks += 1;
+                let state = health.snapshot();
+                assert_eq!(state.entered, callbacks);
+                assert_eq!(state.completed, callbacks - 1);
+                assert_eq!(state.callback_sequence, 11);
+                if callbacks == 1 {
+                    panic!("injected callback panic");
+                }
+                running.store(false, Ordering::Release);
+                true // consumed/filtered/deduplicated, without a database
+            },
+            || {
+                registrations += 1;
+                Err("injected registration failure; no native listener".into())
+            },
+            Some(&health),
+        );
+        let state = health.snapshot();
+        assert!(registrations >= 1); // scheduling delays may trigger registration retries
+        assert_eq!(state.loops, 2);
+        assert_eq!(state.entered, 2);
+        assert_eq!(state.completed, 2);
+        assert_eq!(state.acknowledged, 11); // published even when stop ends this iteration
+    }
+
+    #[test]
+    fn health_tracks_unavailable_paused_and_idle_iterations_without_callbacks() {
+        use std::cell::Cell;
+        let running = AtomicBool::new(true);
+        let health = Health::new(10);
+        let samples = Cell::new(0);
+        run_with_health(
+            &running,
+            10,
+            || {
+                let n = samples.get() + 1;
+                samples.set(n);
+                assert!(n <= 3);
+                assert_eq!(health.snapshot().loops, n);
+                if n == 3 {
+                    // Sequence 11 was skipped while paused in iteration 2.
+                    assert_eq!(health.snapshot().acknowledged, 11);
+                    running.store(false, Ordering::Release);
+                }
+                if n == 1 { 0 } else { 11 }
+            },
+            || samples.get() == 2,
+            || panic!("unavailable, paused, and idle sequences must not be read"),
+            || Err("injected registration failure".into()),
+            Some(&health),
+        );
+        let state = health.snapshot();
+        assert_eq!(state.loops, 3);
+        assert_eq!(state.entered, 0);
+        assert_eq!(state.completed, 0);
+        assert_eq!(state.acknowledged, 11);
+    }
+
+    #[test]
+    fn worker_unwind_preserves_acknowledgement_and_retries_only_unconsumed_sequence() {
+        for pending_failure in [false, true] {
+            let running = AtomicBool::new(true);
+            let health = Health::new(10);
+            let mut samples = 0;
+            let mut callbacks = 0;
+            let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_with_health(
+                    &running,
+                    10,
+                    || {
+                        samples += 1;
+                        match samples {
+                            1 => 11,
+                            2 if pending_failure => 12,
+                            _ => panic!("injected worker exit outside callback catch"),
+                        }
+                    },
+                    || false,
+                    || {
+                        callbacks += 1;
+                        callbacks == 1 // acknowledge 11, but retain failed 12
+                    },
+                    || Err("injected registration failure".into()),
+                    Some(&health),
+                );
+            }));
+            assert!(exit.is_err());
+            let checkpoint = health.snapshot();
+            assert_eq!(checkpoint.acknowledged, 11);
+            assert_eq!(checkpoint.entered, checkpoint.completed);
+
+            // The production spawn_worker uses this same shared checkpoint.
+            // With no pending failure, first resample 11 to prove no replay.
+            let mut restart_samples = 0;
+            let mut restart_callbacks = 0;
+            run_with_health(
+                &running,
+                checkpoint.acknowledged,
+                || {
+                    restart_samples += 1;
+                    assert!(restart_samples <= 2);
+                    if restart_samples == 1 && !pending_failure {
+                        11
+                    } else {
+                        12
+                    }
+                },
+                || false,
+                || {
+                    restart_callbacks += 1;
+                    assert_eq!(health.snapshot().callback_sequence, 12);
+                    running.store(false, Ordering::Release);
+                    true
+                },
+                || Err("injected registration failure".into()),
+                Some(&health),
+            );
+            assert_eq!(restart_callbacks, 1);
+            assert_eq!(health.snapshot().acknowledged, 12);
+        }
+    }
 
     #[test]
     fn newer_sequence_does_not_wait_for_failed_older_item() {
