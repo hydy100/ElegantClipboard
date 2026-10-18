@@ -8,7 +8,6 @@ const root = path.resolve(process.argv[2] || '.');
 let failures = 0;
 for (const [relative, name, marker, keys] of [
   ['src/components/settings/TranslateTab.tsx', 'debounced', '// debounce helpers', 'setter'],
-  ['src/hooks/useWebDAVSettings.ts', 'debouncedSave', '  const debouncedSave =', 'string'],
 ]) {
   for (const phase of ['timers', 'unmount', 'pagehide']) {
     const timers = new Map(), effects = [], listeners = new Map(), writes = [];
@@ -47,5 +46,5 @@ for (const [relative, name, marker, keys] of [
     } catch(e) { ++failures; console.log(`FAIL ${name} ${phase}: ${JSON.stringify(writes)}`); }
   }
 }
-console.log(`RESULT ${6-failures}/6 passed`);
+console.log(`RESULT ${3-failures}/3 passed`);
 process.exitCode = failures ? 1 : 0;

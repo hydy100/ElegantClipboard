@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, type ChangeEvent } from "react";
 import debounce from "lodash.debounce";
+import { useClipboardStore } from "@/stores/clipboard";
 
 type FetchItems = (options?: { search?: string }) => Promise<void>;
 
@@ -17,7 +18,16 @@ export function useSearchDebounce({ fetchItems, setSearchQuery }: UseSearchDebou
   );
 
   useEffect(() => {
+    const unsubscribe = useClipboardStore.subscribe((state, previous) => {
+      if (state.searchQuery !== previous.searchQuery ||
+          state.selectedCategory !== previous.selectedCategory ||
+          state.selectedTagId !== previous.selectedTagId ||
+          state._resetToken !== previous._resetToken) {
+        debouncedSearch.cancel();
+      }
+    });
     return () => {
+      unsubscribe();
       debouncedSearch.cancel();
     };
   }, [debouncedSearch]);
