@@ -325,6 +325,7 @@ impl ClipboardRepository {
     /// 构建通用的 WHERE 条件（content_type / pinned_only / favorite_only / search / tag_id）
     fn build_filter_conditions(
         options: &QueryOptions,
+        parameter_offset: usize,
     ) -> (Vec<String>, Vec<Box<dyn rusqlite::ToSql>>) {
         let mut conditions = Vec::new();
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -332,18 +333,17 @@ impl ClipboardRepository {
         // LIKE 搜索（支持中文，匹配全文任意位置）
         if let Some(ref search) = options.search
             && !search.is_empty() {
-                conditions.push(
-                    "(text_content LIKE ? ESCAPE '\\' OR file_paths LIKE ? ESCAPE '\\')"
-                        .to_string(),
-                );
-                let pattern = format!(
-                    "%{}%",
-                    search
-                        .replace('\\', "\\\\")
-                        .replace('%', "\\%")
-                        .replace('_', "\\_")
-                );
-                params_vec.push(Box::new(pattern.clone()));
+                let parameter = parameter_offset + 1;
+                conditions.push(format!(
+                    "(text_content LIKE ?{parameter} ESCAPE '\\' OR file_paths LIKE ?{parameter} ESCAPE '\\')"
+                ));
+                let mut pattern = String::with_capacity(search.len() + 2);
+                pattern.push('%');
+                for ch in search.chars() {
+                    if matches!(ch, '\\' | '%' | '_') { pattern.push('\\'); }
+                    pattern.push(ch);
+                }
+                pattern.push('%');
                 params_vec.push(Box::new(pattern));
             }
 
@@ -467,7 +467,9 @@ impl ClipboardRepository {
             );
         }
 
-        let (conditions, mut params_vec) = Self::build_filter_conditions(&opts_for_filter);
+        let (conditions, mut params_vec) = Self::build_filter_conditions(
+            &opts_for_filter, usize::from(tag_id_value.is_some()),
+        );
 
         // JOIN 参数需要插在 WHERE 参数之前
         if let Some(tid) = tag_id_value {
@@ -503,7 +505,7 @@ impl ClipboardRepository {
         let conn = self.read_conn.lock();
 
         let mut sql = "SELECT COUNT(*) FROM clipboard_items".to_string();
-        let (conditions, params_vec) = Self::build_filter_conditions(&options);
+        let (conditions, params_vec) = Self::build_filter_conditions(&options, 0);
         Self::append_where(&mut sql, &conditions);
 
         let params_refs: Vec<&dyn rusqlite::ToSql> =

@@ -109,6 +109,24 @@ fn gpui_url_marker_failure_rolls_back_all_data_updates() {
 }
 
 #[test]
+fn gpui_search_escaping_keeps_filters_tags_and_pagination_correct() {
+    let f = Fixture::new();
+    let literal = r"中文%_\needle";
+    let a = f.insert(literal);
+    f.insert("中文ABCneedle");
+    let tag = TagRepository::new(f.db()).create("search").unwrap();
+    TagRepository::new(f.db()).add_tag_to_item(a, tag.id).unwrap();
+    let repo = ClipboardRepository::new(f.db());
+    let options = QueryOptions { search: Some(literal.into()), tag_id: Some(tag.id), content_type: Some("text,url".into()), limit: Some(1), offset: Some(0), ..QueryOptions::default() };
+    assert_eq!(repo.count(options.clone()).unwrap(), 1);
+    assert_eq!(repo.list(options.clone()).unwrap()[0].id, a);
+    assert!(repo.list(QueryOptions { offset: Some(1), ..options }).unwrap().is_empty());
+    let untagged = QueryOptions { search: Some(literal.into()), content_type: Some("text,url".into()), limit: Some(1), ..QueryOptions::default() };
+    assert_eq!(repo.count(untagged.clone()).unwrap(), 1);
+    assert_eq!(repo.list(untagged).unwrap()[0].id, a);
+}
+
+#[test]
 fn gpui_reopen_never_inserts_probe_rows_or_deletes_real_sentinel_hashes() {
     let mut f = Fixture::new();
     let id = f.insert("__test__");
