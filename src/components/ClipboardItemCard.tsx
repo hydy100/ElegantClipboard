@@ -497,6 +497,7 @@ export const ClipboardItemCard = memo(function ClipboardItemCard({
               ref={textPreviewAnchorRef}
               className="flex-1 min-w-0 px-3 py-2.5"
               onMouseEnter={handleTextMouseEnter}
+      onMouseMove={handleTextMouseEnter}
               onMouseLeave={handleTextMouseLeave}
             >
               <pre

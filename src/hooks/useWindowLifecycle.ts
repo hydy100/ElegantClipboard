@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { closeAllTooltips } from "@/components/ui/tooltip";
 import { focusWindowImmediately, releaseWebViewFocus } from "@/hooks/useInputFocus";
+import { cancelHoverPreviews } from "@/lib/hover-preview-interaction";
 import { logError } from "@/lib/logger";
 import { singleFlight } from "@/lib/single-flight";
 import { useClipboardStore } from "@/stores/clipboard";
@@ -55,6 +56,11 @@ export function useWindowLifecycle({
   const [windowVisible, setWindowVisible] = useState<boolean | null>(null);
 
   useEffect(() => {
+    const unlisten = listen("cancel-hover-previews", cancelHoverPreviews);
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
+  useEffect(() => {
     if (!viewSwitchRef.current) { viewSwitchRef.current = true; return; }
     refreshFileValidity().then((changed) => {
       if (changed > 0) return refresh();
@@ -76,6 +82,7 @@ export function useWindowLifecycle({
 
   useEffect(() => {
     const unlisten = listen("window-shown", () => {
+      cancelHoverPreviews();
       closeAllTooltips();
       setWindowVisible(true);
       useUISettings.persist.rehydrate();
@@ -106,6 +113,7 @@ export function useWindowLifecycle({
 
   useEffect(() => {
     const unlisten = listen("window-hidden", () => {
+      cancelHoverPreviews();
       closeAllTooltips();
       releaseWebViewFocus();
       setWindowVisible(false);

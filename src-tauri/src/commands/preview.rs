@@ -11,6 +11,29 @@ static IMAGE_PREVIEW_DESTROY_SEQ: AtomicU64 = AtomicU64::new(0);
 static TEXT_PREVIEW_DESTROY_SEQ: AtomicU64 = AtomicU64::new(0);
 const PREVIEW_DESTROY_DELAY: std::time::Duration = std::time::Duration::from_secs(15);
 
+fn ensure_hover_preview_allowed(app: &tauri::AppHandle) -> Result<(), String> {
+    // A newly built settings WebView starts hidden while waiting for readiness.
+    // Its presence, not just visibility, must block late preview work too.
+    if app.get_webview_window("settings").is_some() {
+        return Err("设置窗口打开期间已取消悬停预览".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::{HWND, POINT};
+        use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetCursorPos, WindowFromPoint, GA_ROOT};
+        let main = app.get_webview_window("main").ok_or("主窗口已关闭，取消悬停预览")?;
+        let hwnd = HWND(main.hwnd().map_err(|e| e.to_string())?.0 as *mut _);
+        let mut point = POINT::default();
+        unsafe {
+            GetCursorPos(&mut point).map_err(|e| e.to_string())?;
+            if GetAncestor(WindowFromPoint(point), GA_ROOT) != hwnd {
+                return Err("鼠标已离开主窗口或被其他窗口遮挡，取消悬停预览".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 #[inline]
 fn promote_preview_token(slot: &AtomicU64, token: u64) -> bool {
     slot.fetch_max(token, Ordering::AcqRel);
@@ -90,6 +113,7 @@ pub async fn show_image_preview(
     crate::webview_runtime::ensure_runtime_current(&app)?;
     super::run_blocking("show_image_preview", move || {
         let _queue_guard = queue_guard;
+        ensure_hover_preview_allowed(&app)?;
         let token = token.unwrap_or(0);
         if token != 0 && !promote_preview_token(&IMAGE_PREVIEW_TOKEN, token) {
             return Ok(());
@@ -176,6 +200,7 @@ pub async fn show_image_preview(
             return Ok(());
         }
 
+        ensure_hover_preview_allowed(&app)?;
         let _ = window.show();
         if token != 0 && !is_preview_token_current(&IMAGE_PREVIEW_TOKEN, token) {
             let _ = window.hide();
@@ -208,6 +233,7 @@ pub async fn show_video_preview(
     crate::webview_runtime::ensure_runtime_current(&app)?;
     super::run_blocking("show_video_preview", move || {
         let _queue_guard = queue_guard;
+        ensure_hover_preview_allowed(&app)?;
         let token = token.unwrap_or(0);
         if token != 0 && !promote_preview_token(&IMAGE_PREVIEW_TOKEN, token) {
             return Ok(());
@@ -304,6 +330,7 @@ pub async fn show_video_preview(
             return Ok(());
         }
 
+        ensure_hover_preview_allowed(&app)?;
         let _ = window.show();
         if token != 0 && !is_preview_token_current(&IMAGE_PREVIEW_TOKEN, token) {
             let _ = window.hide();
@@ -350,6 +377,7 @@ pub async fn show_text_preview(
     crate::webview_runtime::ensure_runtime_current(&app)?;
     super::run_blocking("show_text_preview", move || {
         let _queue_guard = queue_guard;
+        ensure_hover_preview_allowed(&app)?;
         let token = token.unwrap_or(0);
         if token != 0 && !promote_preview_token(&TEXT_PREVIEW_TOKEN, token) {
             return Ok(());
@@ -436,6 +464,7 @@ pub async fn show_text_preview(
         if token != 0 && !is_preview_token_current(&TEXT_PREVIEW_TOKEN, token) {
             return Ok(());
         }
+        ensure_hover_preview_allowed(&app)?;
         let _ = window.show();
         if token != 0 && !is_preview_token_current(&TEXT_PREVIEW_TOKEN, token) {
             let _ = window.hide();

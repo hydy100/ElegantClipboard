@@ -145,6 +145,7 @@ function TagItemRowContent({ item, timeFormat }: TagItemRowContentProps) {
     <div
       ref={textRef}
       onMouseEnter={onTextEnter}
+      onMouseMove={onTextEnter}
       onMouseLeave={onTextLeave}
     >
       <p className="text-xs leading-relaxed line-clamp-2 break-all text-foreground/90"><HighlightText text={truncated || "(空)"} /></p>

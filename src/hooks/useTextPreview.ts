@@ -19,6 +19,7 @@ import {
 } from "@/components/text-preview";
 import { getPreviewBounds } from "@/hooks/useImagePreview";
 import { useNonPassiveWheel } from "@/hooks/useNonPassiveWheel";
+import { canShowHoverPreview, registerHoverPreviewCleanup } from "@/lib/hover-preview-interaction";
 import { logError } from "@/lib/logger";
 import { useClipboardStore } from "@/stores/clipboard";
 import { useUISettings } from "@/stores/ui-settings";
@@ -159,13 +160,13 @@ export function useTextPreview({
     if (!textPreviewEnabled || !isTextLikeContent || !textPreviewAnchorRef.current) {
       return;
     }
-    if (!textPreviewHoveringRef.current || reqId !== textPreviewReqIdRef.current || !isTextPreviewLeaseCurrent(lease)) return;
+    if (!textPreviewHoveringRef.current || reqId !== textPreviewReqIdRef.current || !isTextPreviewLeaseCurrent(lease) || !canShowHoverPreview(textPreviewAnchorRef.current)) return;
     const textContentResolved = await resolveTextPreviewContent();
     if (!textContentResolved) return;
-    if (!textPreviewHoveringRef.current || reqId !== textPreviewReqIdRef.current || !isTextPreviewLeaseCurrent(lease)) return;
+    if (!textPreviewHoveringRef.current || reqId !== textPreviewReqIdRef.current || !isTextPreviewLeaseCurrent(lease) || !canShowHoverPreview(textPreviewAnchorRef.current)) return;
 
     const bounds = await getPreviewBounds(previewPosition, textPreviewAnchorRef.current);
-    if (!textPreviewHoveringRef.current || reqId !== textPreviewReqIdRef.current || !isTextPreviewLeaseCurrent(lease)) return;
+    if (!textPreviewHoveringRef.current || reqId !== textPreviewReqIdRef.current || !isTextPreviewLeaseCurrent(lease) || !canShowHoverPreview(textPreviewAnchorRef.current)) return;
     const availableCssW = Math.max(260, Math.floor(bounds.maxW / bounds.scale));
     const availableCssH = Math.max(140, Math.floor(bounds.maxH / bounds.scale));
     const sampled = sampleTextPreview(textContentResolved);
@@ -220,7 +221,7 @@ export function useTextPreview({
         fontSize: uiState.previewFontSize,
         token: lease,
       });
-      if (!textPreviewHoveringRef.current || reqId !== textPreviewReqIdRef.current || !isTextPreviewLeaseCurrent(lease)) {
+      if (!textPreviewHoveringRef.current || reqId !== textPreviewReqIdRef.current || !isTextPreviewLeaseCurrent(lease) || !canShowHoverPreview(textPreviewAnchorRef.current)) {
         textPreviewVisibleRef.current = false;
         if (!isTextPreviewWanted()) {
           invoke("hide_text_preview", { token: lease }).catch((error) => {
@@ -236,7 +237,10 @@ export function useTextPreview({
     }
   }, [textPreviewEnabled, isTextLikeContent, previewPosition, resolveTextPreviewContent, sharpCorners]);
 
+  useEffect(() => registerHoverPreviewCleanup(hideTextPreview), [hideTextPreview]);
+
   const handleTextMouseEnter = useCallback(() => {
+    if (textPreviewHoveringRef.current || !canShowHoverPreview(textPreviewAnchorRef.current)) return;
     if (!textPreviewEnabled || !isTextLikeContent || batchMode) return;
     textPreviewHoveringRef.current = true;
     textPreviewReqIdRef.current += 1;

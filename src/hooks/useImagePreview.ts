@@ -6,6 +6,7 @@ import { emitTo, listen } from "@tauri-apps/api/event";
 import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
 import { useShallow } from "zustand/react/shallow";
 import { useNonPassiveWheel } from "@/hooks/useNonPassiveWheel";
+import { canShowHoverPreview, registerHoverPreviewCleanup } from "@/lib/hover-preview-interaction";
 import { logError } from "@/lib/logger";
 import { useClipboardStore } from "@/stores/clipboard";
 import { useUISettings } from "@/stores/ui-settings";
@@ -291,9 +292,9 @@ export function useImagePreview(imagePath?: string) {
   // 显示预览
   const showPreview = useCallback(async (reqId: number, lease: number, path: string) => {
     if (!containerRef.current) return;
-    if (!previewHoveringRef.current || reqId !== previewReqIdRef.current || !isImagePreviewLeaseCurrent(lease)) return;
+    if (!previewHoveringRef.current || reqId !== previewReqIdRef.current || !isImagePreviewLeaseCurrent(lease) || !canShowHoverPreview(containerRef.current)) return;
     const bounds = await getPreviewBounds(previewPosition, containerRef.current);
-    if (!previewHoveringRef.current || reqId !== previewReqIdRef.current || !isImagePreviewLeaseCurrent(lease)) return;
+    if (!previewHoveringRef.current || reqId !== previewReqIdRef.current || !isImagePreviewLeaseCurrent(lease) || !canShowHoverPreview(containerRef.current)) return;
     const { imgNatural } = ps.current;
     const boundedMaxCssW = bounds.maxW / bounds.scale;
     const boundedMaxCssH = bounds.maxH / bounds.scale;
@@ -335,7 +336,7 @@ export function useImagePreview(imagePath?: string) {
         align,
         token: lease,
       });
-      if (!previewHoveringRef.current || reqId !== previewReqIdRef.current || !isImagePreviewLeaseCurrent(lease)) {
+      if (!previewHoveringRef.current || reqId !== previewReqIdRef.current || !isImagePreviewLeaseCurrent(lease) || !canShowHoverPreview(containerRef.current)) {
         ps.current.visible = false;
         ps.current.bounds = null;
         ps.current.windowCss = null;
@@ -356,7 +357,10 @@ export function useImagePreview(imagePath?: string) {
 
   const batchMode = useClipboardStore((s) => s.batchMode);
 
+  useEffect(() => registerHoverPreviewCleanup(hidePreview), [hidePreview]);
+
   const handleMouseEnter = useCallback(() => {
+    if (previewHoveringRef.current || !canShowHoverPreview(containerRef.current)) return;
     if (!imagePath || !imagePreviewEnabled || batchMode) return;
     previewHoveringRef.current = true;
     previewReqIdRef.current += 1;

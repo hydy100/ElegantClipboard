@@ -25,7 +25,7 @@ const flight = fs.existsSync(flightPath) ? load('src/lib/single-flight.ts', {}) 
 const tests = [];
 tests.push(['window refresh is independent of a hung filesystem check', async () => {
   const effects = [], listeners = new Map();
-  let refreshes = 0;
+  let refreshes = 0, previewCancellations = 0;
   const invoke = command => command === 'refresh_files_validity'
     ? new Promise(() => {}) : Promise.resolve(false);
   const { useWindowLifecycle } = load('src/hooks/useWindowLifecycle.ts', {
@@ -34,6 +34,7 @@ tests.push(['window refresh is independent of a hung filesystem check', async ()
     '@tauri-apps/api/event': { listen: (name, fn) => { listeners.set(name, fn); return Promise.resolve(() => listeners.delete(name)); } },
     '@/hooks/useInputFocus': { focusWindowImmediately: () => Promise.resolve(), releaseWebViewFocus() {} },
     '@/components/ui/tooltip': { closeAllTooltips() {} },
+    '@/lib/hover-preview-interaction': { cancelHoverPreviews() { ++previewCancellations; } },
     '@/lib/logger': { logError() {} },
     '@/lib/single-flight': flight,
     '@/stores/clipboard': { useClipboardStore: { getState: () => ({ batchMode: false }) } },
@@ -50,6 +51,9 @@ tests.push(['window refresh is independent of a hung filesystem check', async ()
     listeners.get('window-shown')();
     await Promise.resolve();
     assert.equal(refreshes, 1, 'list waited on refresh_files_validity');
+    assert.equal(previewCancellations, 1, 'showing the window reused stale hover intent');
+    listeners.get('cancel-hover-previews')();
+    assert.equal(previewCancellations, 2, 'native settings-open cancellation did not reach preview controller');
   } finally { cleanup.forEach(f => f()); }
 }]);
 tests.push(['first translation waits for settings instead of reporting disabled', async () => {

@@ -108,6 +108,7 @@ export const ImagePreview = memo(function ImagePreview({
       className="relative w-full rounded-sm overflow-hidden bg-muted/30 flex items-center justify-center"
       style={containerStyle}
       onMouseEnter={handleMouseEnter}
+      onMouseMove={handleMouseEnter}
       onMouseLeave={hidePreview}
     >
       <img

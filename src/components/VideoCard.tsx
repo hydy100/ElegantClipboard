@@ -225,6 +225,7 @@ export const VideoContent = memo(function VideoContent({
         ref={videoPreviewRef}
         className="flex-1 min-w-0 px-3 py-2.5"
         onMouseEnter={handleVideoMouseEnter}
+      onMouseMove={handleVideoMouseEnter}
         onMouseLeave={hideVideoPreview}
       >
         <div className="relative w-full rounded-sm overflow-hidden bg-muted/30">
@@ -259,6 +260,7 @@ export const VideoContent = memo(function VideoContent({
     <div
       ref={videoPreviewRef}
       onMouseEnter={handleVideoMouseEnter}
+      onMouseMove={handleVideoMouseEnter}
       onMouseLeave={hideVideoPreview}
     >
       <FileIconLayout

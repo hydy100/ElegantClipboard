@@ -4,7 +4,7 @@ use tauri::{
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager,
+    AppHandle, Emitter, Manager,
 };
 use tracing::info;
 
@@ -111,6 +111,11 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
 
 /// 打开或聚焦设置窗口，居中于主窗口所在的显示器
 pub(crate) fn open_settings_window(app: &AppHandle) -> Result<(), String> {
+    // Cancel frontend timers/leases as well as already visible native previews.
+    let _ = app.emit("cancel-hover-previews", ());
+    for label in ["image-preview", "text-preview"] {
+        if let Some(window) = app.get_webview_window(label) { let _ = window.hide(); }
+    }
     // Called only from the serialized creation worker, never the event loop.
     // 设置窗口已存在则聚焦
     if let Some(window) = app.get_webview_window("settings") {

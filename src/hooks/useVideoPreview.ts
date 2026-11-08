@@ -11,6 +11,7 @@ import {
   isImagePreviewLeaseCurrent,
   isImagePreviewWanted,
 } from "@/hooks/useImagePreview";
+import { canShowHoverPreview, registerHoverPreviewCleanup } from "@/lib/hover-preview-interaction";
 import { logError } from "@/lib/logger";
 import { useClipboardStore } from "@/stores/clipboard";
 import { useUISettings } from "@/stores/ui-settings";
@@ -85,10 +86,10 @@ export function useVideoPreview(videoPath?: string) {
 
   const showPreview = useCallback(async (reqId: number, lease: number, path: string) => {
     if (!containerRef.current) return;
-    if (!hoveringRef.current || reqId !== reqIdRef.current || !isImagePreviewLeaseCurrent(lease)) return;
+    if (!hoveringRef.current || reqId !== reqIdRef.current || !isImagePreviewLeaseCurrent(lease) || !canShowHoverPreview(containerRef.current)) return;
 
     const bounds = await getPreviewBounds(previewPosition, containerRef.current);
-    if (!hoveringRef.current || reqId !== reqIdRef.current || !isImagePreviewLeaseCurrent(lease)) return;
+    if (!hoveringRef.current || reqId !== reqIdRef.current || !isImagePreviewLeaseCurrent(lease) || !canShowHoverPreview(containerRef.current)) return;
 
     const maxCssW = bounds.maxW / bounds.scale;
     const maxCssH = bounds.maxH / bounds.scale;
@@ -127,7 +128,7 @@ export function useVideoPreview(videoPath?: string) {
         token: lease,
       });
 
-      if (!hoveringRef.current || reqId !== reqIdRef.current || !isImagePreviewLeaseCurrent(lease)) {
+      if (!hoveringRef.current || reqId !== reqIdRef.current || !isImagePreviewLeaseCurrent(lease) || !canShowHoverPreview(containerRef.current)) {
         if (!isImagePreviewWanted()) {
           invoke("hide_image_preview", { token: lease }).catch((e) =>
             logError("Failed to hide stale video preview:", e),
@@ -139,7 +140,10 @@ export function useVideoPreview(videoPath?: string) {
     }
   }, [previewPosition, videoPreviewDuration]);
 
+  useEffect(() => registerHoverPreviewCleanup(hidePreview), [hidePreview]);
+
   const handleMouseEnter = useCallback(() => {
+    if (hoveringRef.current || !canShowHoverPreview(containerRef.current)) return;
     if (!videoPath || !videoPreviewEnabled || batchMode) return;
     hoveringRef.current = true;
     reqIdRef.current += 1;
