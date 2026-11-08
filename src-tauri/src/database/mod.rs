@@ -1,6 +1,8 @@
 mod repository;
 pub mod repos;
 mod schema;
+#[cfg(test)]
+mod gpui_regression_tests;
 
 pub use repository::*;
 pub use repos::*;
@@ -75,6 +77,7 @@ impl Database {
         Self::run_migrations(&conn)?;
 
         conn.execute_batch(SCHEMA_SQL)?;
+        Self::run_post_schema_migrations(&conn)?;
         info!("Database schema initialized");
 
         Ok(())
@@ -277,7 +280,6 @@ impl Database {
             )?;
         }
 
-        Self::backfill_semantic_hashes(conn)?;
 
         conn.execute_batch(
             "DROP INDEX IF EXISTS idx_clipboard_semantic_hash_default;
@@ -359,73 +361,8 @@ impl Database {
             info!("Migration complete: files_valid column added");
         }
 
-        // Migration 13: add 'video' to content_type CHECK constraint
-        // Check if the CHECK constraint already includes 'video' by trying an insert
-        let needs_video_migration = {
-            let test_result = conn.execute(
-                "INSERT INTO clipboard_items (content_type, content_hash, semantic_hash) VALUES ('video', '__test__', '__test__')",
-                [],
-            );
-            match test_result {
-                Ok(_) => {
-                    // Clean up test row
-                    conn.execute("DELETE FROM clipboard_items WHERE content_hash = '__test__'", []).ok();
-                    false // constraint already allows 'video'
-                }
-                Err(_) => true, // constraint rejects 'video', need migration
-            }
-        };
-
-        if needs_video_migration {
-            info!("Migrating database: adding 'video' to content_type CHECK constraint");
-            let tx = conn.unchecked_transaction()?;
-
-            tx.execute_batch(
-                "CREATE TABLE clipboard_items_new (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    content_type TEXT NOT NULL,
-                    text_content TEXT,
-                    html_content TEXT,
-                    rtf_content TEXT,
-                    image_path TEXT,
-                    file_paths TEXT,
-                    content_hash TEXT NOT NULL,
-                    semantic_hash TEXT NOT NULL,
-                    preview TEXT,
-                    byte_size INTEGER DEFAULT 0,
-                    image_width INTEGER,
-                    image_height INTEGER,
-                    is_pinned INTEGER DEFAULT 0,
-                    is_favorite INTEGER DEFAULT 0,
-                    sort_order INTEGER DEFAULT 0,
-                    created_at TEXT DEFAULT (datetime('now', 'localtime')),
-                    updated_at TEXT DEFAULT (datetime('now', 'localtime')),
-                    access_count INTEGER DEFAULT 0,
-                    last_accessed_at TEXT,
-                    char_count INTEGER,
-                    source_app_name TEXT,
-                    source_app_icon TEXT,
-                    files_valid INTEGER DEFAULT 1
-                );
-                INSERT INTO clipboard_items_new (id, content_type, text_content, html_content, rtf_content, image_path, file_paths, content_hash, semantic_hash, preview, byte_size, image_width, image_height, is_pinned, is_favorite, sort_order, created_at, updated_at, access_count, last_accessed_at, char_count, source_app_name, source_app_icon, files_valid)
-                SELECT id, content_type, text_content, html_content, rtf_content, image_path, file_paths, content_hash, semantic_hash, preview, byte_size, image_width, image_height, is_pinned, is_favorite, sort_order, created_at, updated_at, access_count, last_accessed_at, char_count, source_app_name, source_app_icon, files_valid FROM clipboard_items;
-                DROP TABLE clipboard_items;
-                ALTER TABLE clipboard_items_new RENAME TO clipboard_items;"
-            )?;
-
-            // Migrate existing video files from 'files' to 'video' content_type
-            Self::migrate_video_content_type(&tx);
-
-            tx.commit()?;
-            info!("Migration complete: 'video' content_type added");
-        } else {
-            // Even if constraint already allows 'video', migrate existing video files
-            Self::migrate_video_content_type(conn);
-        }
-
-        // Migration 14: add URL as a first-class text content type and
-        // classify existing standalone links without changing their payload.
-        Self::migrate_url_content_type(conn)?;
+        // Content-type constraints and data backfills run after the settings
+        // table exists. Do not probe constraints by inserting/deleting real rows.
 
         // Drop old group-related indexes (safe even if they don't exist)
         conn.execute_batch(
@@ -472,119 +409,92 @@ impl Database {
         Ok(())
     }
 
-    /// Migrate existing 'files' type items that are actually videos to 'video' content_type
-    fn migrate_video_content_type(conn: &Connection) {
+    fn migration_done(conn: &Connection, key: &str) -> Result<bool, rusqlite::Error> {
+        conn.query_row(
+            "SELECT COALESCE((SELECT value FROM settings WHERE key = ?1), '') = 'done'",
+            [key], |row| row.get(0),
+        )
+    }
+
+    fn mark_migration_done(conn: &Connection, key: &str) -> Result<(), rusqlite::Error> {
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?1, 'done')", [key])?;
+        Ok(())
+    }
+
+    fn run_post_schema_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
+        Self::migrate_url_content_type(conn)?;
+        Self::migrate_video_content_type(conn)?;
+        Self::backfill_semantic_hashes(conn)?;
+        Ok(())
+    }
+
+    fn migrate_video_content_type(conn: &Connection) -> Result<(), rusqlite::Error> {
+        const KEY: &str = "_migration_video_content_type";
+        if Self::migration_done(conn, KEY)? { return Ok(()); }
         const VIDEO_EXTENSIONS: &[&str] = &[
             "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "mpeg", "mpg",
         ];
-
-        let mut stmt = match conn.prepare(
-            "SELECT id, file_paths FROM clipboard_items WHERE content_type = 'files' AND file_paths IS NOT NULL"
-        ) {
-            Ok(s) => s,
-            Err(_) => return,
+        let tx = conn.unchecked_transaction()?;
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, file_paths FROM clipboard_items WHERE content_type = 'files' AND file_paths IS NOT NULL"
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
         };
-
-        let rows: Vec<(i64, String)> = stmt
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
-            .ok()
-            .map(|iter| iter.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default();
-        drop(stmt);
-
-        let mut count = 0usize;
-        for (id, paths_json) in &rows {
-            let paths: Vec<String> = serde_json::from_str(paths_json).unwrap_or_default();
-            if !paths.is_empty() && paths.iter().all(|f| {
-                let ext = f.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        let mut update = tx.prepare_cached("UPDATE clipboard_items SET content_type = 'video' WHERE id = ?1")?;
+        for (id, json) in rows {
+            let paths: Vec<String> = match serde_json::from_str(&json) {
+                Ok(paths) => paths,
+                Err(_) => continue, // Preserve invalid legacy JSON unchanged, never delete it.
+            };
+            if !paths.is_empty() && paths.iter().all(|path| {
+                let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
                 VIDEO_EXTENSIONS.contains(&ext.as_str())
             }) {
-                if conn.execute(
-                    "UPDATE clipboard_items SET content_type = 'video' WHERE id = ?1",
-                    rusqlite::params![id],
-                ).is_ok() {
-                    count += 1;
-                }
+                update.execute([id])?;
             }
         }
-        if count > 0 {
-            info!("Migrated {} files items to video content_type", count);
+        drop(update);
+        Self::mark_migration_done(&tx, KEY)?;
+        tx.commit()
+    }
+
+    fn backfill_url_rows(conn: &Connection) -> Result<(), rusqlite::Error> {
+        conn.execute_batch("UPDATE clipboard_items SET semantic_hash = content_hash
+            WHERE semantic_hash IS NULL OR semantic_hash = ''; ")?;
+        let rows: Vec<(i64, String)> = {
+            let mut stmt = conn.prepare("SELECT id, text_content FROM clipboard_items
+                WHERE content_type = 'text' AND text_content IS NOT NULL")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut update = conn.prepare_cached(
+            "UPDATE clipboard_items SET content_type = 'url', semantic_hash = content_hash WHERE id = ?1"
+        )?;
+        for (id, text) in rows {
+            if is_url(&text) { update.execute([id])?; }
         }
+        Self::mark_migration_done(conn, "_migration_url_content_type")
     }
 
     fn migrate_url_content_type(conn: &Connection) -> Result<(), rusqlite::Error> {
-        let table_sql: Option<String> = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='clipboard_items'",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
-        let Some(table_sql) = table_sql else {
-            return Ok(());
-        };
-
-        // New schemas intentionally do not constrain content_type.  Use a
-        // marker so URL backfill is performed once instead of rebuilding the
-        // table on every startup.
-        let migration_done: bool = conn
-            .query_row(
-                "SELECT COALESCE((SELECT value FROM settings WHERE key = '_migration_url_content_type' LIMIT 1), '') = 'done'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        let normalized_table_sql: String = table_sql
-            .to_ascii_lowercase()
-            .chars()
-            .filter(|ch| !ch.is_ascii_whitespace())
-            .collect();
-        let has_content_type_check = normalized_table_sql.contains("check(content_type");
-        if migration_done {
-            return Ok(());
-        }
-
-        info!("Migrating database: adding url content_type");
-        // Older semantic-hash migrations permitted NULL/empty values. Fill
-        // them before copying into the current NOT NULL table.
-        conn.execute_batch(
-            "UPDATE clipboard_items
-             SET semantic_hash = content_hash
-             WHERE semantic_hash IS NULL OR semantic_hash = '';",
+        if Self::migration_done(conn, "_migration_url_content_type")? { return Ok(()); }
+        let table_sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='clipboard_items'", [], |row| row.get(0)
         )?;
-
-        // `item_tags` references the parent table. SQLite cascades those rows
-        // when a referenced table is dropped, so keep foreign-key enforcement
-        // off only for this atomic table rebuild and restore it immediately.
-        if !has_content_type_check {
-            let mut stmt = conn.prepare(
-                "SELECT id, text_content FROM clipboard_items
-                 WHERE content_type = 'text' AND text_content IS NOT NULL",
-            )?;
-            let rows: Vec<(i64, String)> = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<Result<_, _>>()?;
-            drop(stmt);
-            let mut update = conn.prepare_cached(
-                "UPDATE clipboard_items SET content_type = 'url', semantic_hash = content_hash WHERE id = ?1",
-            )?;
-            for (id, text) in rows {
-                if is_url(&text) {
-                    update.execute(params![id])?;
-                }
-            }
-            conn.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES ('_migration_url_content_type', 'done')",
-                [],
-            ).ok();
-            return Ok(());
+        let normalized: String = table_sql.to_ascii_lowercase().chars()
+            .filter(|ch| !ch.is_ascii_whitespace()).collect();
+        if !normalized.contains("check(content_type") {
+            let tx = conn.unchecked_transaction()?;
+            Self::backfill_url_rows(&tx)?;
+            return tx.commit();
         }
-
-        let foreign_keys_enabled: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
-        if foreign_keys_enabled {
-            conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
-        }
-        let rebuild_result = (|| -> Result<(), rusqlite::Error> {
+        // Dropping a parent table with foreign keys enabled cascades item_tags.
+        // Disable enforcement only around the atomic rebuild and always restore it.
+        let foreign_keys: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        if foreign_keys { conn.execute_batch("PRAGMA foreign_keys = OFF;")?; }
+        let result = (|| -> Result<(), rusqlite::Error> {
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(
             "CREATE TABLE clipboard_items_new (
@@ -647,59 +557,17 @@ impl Database {
                 UPDATE clipboard_items SET updated_at = datetime('now', 'localtime') WHERE id = new.id;
             END;",
             )?;
-            tx.commit()?;
-            Ok(())
+            Self::backfill_url_rows(&tx)?;
+            tx.commit()
         })();
-        if foreign_keys_enabled {
-            let restore_result = conn.execute_batch("PRAGMA foreign_keys = ON;");
-            if rebuild_result.is_ok() {
-                restore_result?;
-            }
-        }
-        rebuild_result?;
-
-        let mut stmt = conn.prepare(
-            "SELECT id, text_content FROM clipboard_items
-             WHERE content_type = 'text' AND text_content IS NOT NULL",
-        )?;
-        let rows: Vec<(i64, String)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<_, _>>()?;
-        drop(stmt);
-
-        let mut update = conn.prepare_cached(
-            "UPDATE clipboard_items SET content_type = 'url', semantic_hash = content_hash WHERE id = ?1",
-        )?;
-        for (id, text) in rows {
-            if is_url(&text) {
-                update.execute(params![id])?;
-            }
-        }
-
-        info!("Migration complete: url content_type added");
-        Ok(())
+        let restored = if foreign_keys { conn.execute_batch("PRAGMA foreign_keys = ON;") } else { Ok(()) };
+        result?;
+        restored
     }
 
     fn backfill_semantic_hashes(conn: &Connection) -> Result<(), rusqlite::Error> {
-        // 版本守卫：已完成的迁移不再执行，避免每次启动全表扫描
-        let settings_exist: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='settings'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        if settings_exist {
-            let already_done: bool = conn
-                .query_row(
-                    "SELECT COALESCE((SELECT value FROM settings WHERE key = '_migration_backfill_semantic_hash' LIMIT 1), '') = 'done'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or(false);
-            if already_done {
-                return Ok(());
-            }
+        if Self::migration_done(conn, "_migration_backfill_semantic_hash")? {
+            return Ok(());
         }
 
         let mut stmt = conn.prepare(
@@ -748,13 +616,7 @@ impl Database {
             );
         }
 
-        // 写入版本标记，后续启动跳过
-        if settings_exist {
-            tx.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES ('_migration_backfill_semantic_hash', 'done')",
-                [],
-            )?;
-        }
+        Self::mark_migration_done(&tx, "_migration_backfill_semantic_hash")?;
         tx.commit()?;
         Ok(())
     }
