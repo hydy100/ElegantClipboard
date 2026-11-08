@@ -335,7 +335,7 @@ pub async fn reset_all_data(state: State<'_, Arc<AppState>>) -> Result<(), Strin
         use tracing::info;
 
         let clipboard_repo = ClipboardRepository::new(&state.db);
-        let image_paths = clipboard_repo.get_all_image_paths().unwrap_or_default();
+        let image_paths = clipboard_repo.get_all_image_paths().map_err(|e| e.to_string())?;
         clipboard_repo.clear_all().map_err(|e| e.to_string())?;
         crate::clipboard::cleanup_image_files(&image_paths);
 

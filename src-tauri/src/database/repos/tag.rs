@@ -50,9 +50,7 @@ impl TagRepository {
                     created_at: row.get(3)?,
                     item_count: row.get(4)?,
                 })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+            })?.collect::<Result<_, _>>()?;
         Ok(tags)
     }
 
@@ -155,9 +153,7 @@ impl TagRepository {
                     created_at: row.get(3)?,
                     item_count: row.get(4)?,
                 })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+            })?.collect::<Result<_, _>>()?;
         Ok(tags)
     }
 
@@ -205,9 +201,7 @@ impl TagRepository {
                     created_at: row.get(2)?,
                     associations: Vec::new(),
                 })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+            })?.collect::<Result<_, _>>()?;
 
         let mut stmt = conn.prepare(
             "SELECT ci.content_hash, t.name, it.sort_order \

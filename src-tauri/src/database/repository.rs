@@ -494,9 +494,7 @@ impl ClipboardRepository {
             params_vec.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&sql)?;
         let items = stmt
-            .query_map(params_refs.as_slice(), Self::row_to_item)?
-            .filter_map(|r| r.ok())
-            .collect();
+            .query_map(params_refs.as_slice(), Self::row_to_item)?.collect::<Result<_, _>>()?;
 
         Ok(items)
     }
@@ -569,7 +567,8 @@ impl ClipboardRepository {
         if ids.is_empty() {
             return Ok((0, vec![]));
         }
-        let conn = self.write_conn.lock();
+        let connection = self.write_conn.lock();
+        let conn = connection.unchecked_transaction()?;
         let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
         let in_clause = placeholders.join(",");
 
@@ -580,10 +579,12 @@ impl ClipboardRepository {
         let mut stmt = conn.prepare(&sql)?;
         let params_ref: Vec<&dyn rusqlite::ToSql> =
             ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-        let candidate_paths: Vec<String> = stmt
-            .query_map(params_ref.as_slice(), |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+        let mut candidate_paths: Vec<String> = stmt
+            .query_map(params_ref.as_slice(), |row| row.get(0))?.collect::<Result<_, _>>()?;
+
+        drop(stmt);
+        candidate_paths.sort_unstable();
+        candidate_paths.dedup();
 
         let del_sql = format!("DELETE FROM clipboard_items WHERE id IN ({})", in_clause);
         let params_ref2: Vec<&dyn rusqlite::ToSql> =
@@ -604,9 +605,7 @@ impl ClipboardRepository {
             let path_params: Vec<&dyn rusqlite::ToSql> =
                 candidate_paths.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
             let still_referenced: std::collections::HashSet<String> = check_stmt
-                .query_map(path_params.as_slice(), |row| row.get::<_, String>(0))?
-                .filter_map(|r| r.ok())
-                .collect();
+                .query_map(path_params.as_slice(), |row| row.get::<_, String>(0))?.collect::<Result<_, _>>()?;
 
             candidate_paths
                 .into_iter()
@@ -615,6 +614,7 @@ impl ClipboardRepository {
         };
 
         debug!("Batch deleted {} clipboard items", deleted);
+        conn.commit()?;
         Ok((deleted, safe_paths))
     }
 
@@ -637,9 +637,7 @@ impl ClipboardRepository {
         let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&sql)?;
         let paths: Vec<String> = stmt
-            .query_map(params_refs.as_slice(), |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .query_map(params_refs.as_slice(), |row| row.get::<_, String>(0))?.collect::<Result<_, _>>()?;
         Ok(paths)
     }
 
@@ -670,9 +668,7 @@ impl ClipboardRepository {
             "SELECT image_path FROM clipboard_items WHERE image_path IS NOT NULL",
         )?;
         let paths = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .query_map([], |row| row.get::<_, String>(0))?.collect::<Result<_, _>>()?;
         Ok(paths)
     }
 
@@ -683,9 +679,7 @@ impl ClipboardRepository {
             "SELECT DISTINCT source_app_icon FROM clipboard_items WHERE source_app_icon IS NOT NULL",
         )?;
         let paths = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .query_map([], |row| row.get::<_, String>(0))?.collect::<Result<_, _>>()?;
         Ok(paths)
     }
 
@@ -709,9 +703,7 @@ impl ClipboardRepository {
              AND created_at < datetime('now', 'localtime', '-' || ? || ' days')",
         )?;
         let image_paths: Vec<String> = stmt
-            .query_map(params![days], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .query_map(params![days], |row| row.get::<_, String>(0))?.collect::<Result<_, _>>()?;
 
         let deleted = conn.execute(
             "DELETE FROM clipboard_items \
@@ -753,9 +745,7 @@ impl ClipboardRepository {
              ORDER BY created_at ASC LIMIT ?",
         )?;
         let image_paths: Vec<String> = stmt
-            .query_map(params![to_delete], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .query_map(params![to_delete], |row| row.get::<_, String>(0))?.collect::<Result<_, _>>()?;
 
         let deleted = conn.execute(
             "DELETE FROM clipboard_items WHERE id IN (\
@@ -934,9 +924,7 @@ impl ClipboardRepository {
         );
         let mut stmt = conn.prepare(&sql)?;
         let items = stmt
-            .query_map(params![max_byte_size], Self::row_to_item)?
-            .filter_map(|r| r.ok())
-            .collect();
+            .query_map(params![max_byte_size], Self::row_to_item)?.collect::<Result<_, _>>()?;
         Ok(items)
     }
 
@@ -952,9 +940,7 @@ impl ClipboardRepository {
              ORDER BY created_at DESC",
         )?;
         let items = stmt
-            .query_map([], Self::row_to_item)?
-            .filter_map(|r| r.ok())
-            .collect();
+            .query_map([], Self::row_to_item)?.collect::<Result<_, _>>()?;
         Ok(items)
     }
 
@@ -985,7 +971,7 @@ impl ClipboardRepository {
         )?;
         let items = stmt.query_map([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<bool>>(2)?))
-        })?.filter_map(|r| r.ok()).collect();
+        })?.collect::<Result<_, _>>()?;
         Ok(items)
     }
 
@@ -1015,7 +1001,7 @@ impl ClipboardRepository {
         )?;
         let items = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<bool>>(1)?))
-        })?.filter_map(|r| r.ok()).collect();
+        })?.collect::<Result<_, _>>()?;
         Ok(items)
     }
 
@@ -1027,7 +1013,7 @@ impl ClipboardRepository {
         )?;
         let items = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<bool>>(2)?))
-        })?.filter_map(|r| r.ok()).collect();
+        })?.collect::<Result<_, _>>()?;
         Ok(items)
     }
 

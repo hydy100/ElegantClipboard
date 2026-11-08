@@ -28,6 +28,67 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn gpui_list_reports_corrupt_row_without_hiding_history() {
+    let f = Fixture::new();
+    f.insert("valid");
+    let bad = f.insert("invalid");
+    f.db().write_connection().lock().execute("UPDATE clipboard_items SET byte_size = X'01', image_path = 'fixture.png' WHERE id = ?", [bad]).unwrap();
+    let repo = ClipboardRepository::new(f.db());
+    assert!(repo.list(QueryOptions::default()).is_err());
+    assert!(repo.query_media_items().is_err());
+    assert_eq!(repo.count(QueryOptions::default()).unwrap(), 2);
+}
+
+#[test]
+fn gpui_media_reference_reads_reject_partial_results() {
+    let f = Fixture::new();
+    let id = f.insert("media");
+    f.db().write_connection().lock().execute("UPDATE clipboard_items SET image_path = X'01', source_app_icon = X'01' WHERE id = ?", [id]).unwrap();
+    let repo = ClipboardRepository::new(f.db());
+    assert!(repo.get_all_image_paths().is_err());
+    assert!(repo.get_all_icon_paths().is_err());
+    assert!(repo.get_clearable_image_paths(None).is_err());
+}
+
+#[test]
+fn gpui_orphan_cleanup_aborts_on_unreadable_references() {
+    let f = Fixture::new();
+    let id = f.insert("unreadable media");
+    f.db().write_connection().lock().execute("UPDATE clipboard_items SET image_path = X'01', source_app_icon = X'01' WHERE id = ?", [id]).unwrap();
+    for name in ["images", "icons"] {
+        std::fs::create_dir(f.dir.join(name)).unwrap();
+        std::fs::write(f.dir.join(name).join("keep.png"), b"fixture").unwrap();
+    }
+    crate::clipboard::cleanup_orphan_files(f.db(), &f.dir);
+    assert!(f.dir.join("images/keep.png").exists());
+    assert!(f.dir.join("icons/keep.png").exists());
+}
+
+#[test]
+fn gpui_batch_delete_rejects_unreadable_candidates_without_deleting_rows() {
+    let f = Fixture::new();
+    let a = f.insert("first");
+    let b = f.insert("second");
+    f.db().write_connection().lock().execute("UPDATE clipboard_items SET image_path = X'01' WHERE id = ?", [b]).unwrap();
+    let repo = ClipboardRepository::new(f.db());
+    assert!(repo.batch_delete(&[a, b]).is_err());
+    assert_eq!(repo.count(QueryOptions::default()).unwrap(), 2);
+}
+
+#[test]
+fn gpui_settings_and_tag_export_reject_partial_results() {
+    let f = Fixture::new();
+    let conn = f.db().write_connection();
+    conn.lock().execute_batch("INSERT INTO settings(key, value) VALUES ('broken', X'01'); INSERT INTO tags(name) VALUES (X'01');").unwrap();
+    let settings = SettingsRepository::new(f.db());
+    assert!(settings.get_all().is_err());
+    assert!(settings.get_multiple(&["broken", "hotkey"]).is_err());
+    let tags = TagRepository::new(f.db());
+    assert!(tags.list_with_count().is_err());
+    assert!(tags.export_tags_sync_data().is_err());
+}
+
+#[test]
 fn gpui_first_open_completes_post_schema_migrations() {
     let f = Fixture::new();
     for key in ["_migration_url_content_type", "_migration_backfill_semantic_hash", "_migration_video_content_type"] {
@@ -111,4 +172,50 @@ fn gpui_constraint_rebuild_and_marker_failure_restore_original_table_and_tags() 
     conn.execute_batch("DROP TRIGGER reject_marker;").unwrap();
     Database::migrate_url_content_type(&conn).unwrap();
     assert_eq!(conn.query_row("SELECT content_type FROM clipboard_items", [], |r| r.get::<_, String>(0)).unwrap(), "url");
+}
+
+#[test]
+fn gpui_batch_delete_keeps_shared_images_and_deduplicates_cleanup_paths() {
+    let f = Fixture::new();
+    let a = f.insert("a"); let b = f.insert("b"); let keep = f.insert("keep");
+    f.db().write_connection().lock().execute_batch("UPDATE clipboard_items SET image_path='shared.png';").unwrap();
+    let repo = ClipboardRepository::new(f.db());
+    assert_eq!(repo.batch_delete(&[a, b]).unwrap(), (2, vec![]));
+    let c = f.insert("c");
+    f.db().write_connection().lock().execute("UPDATE clipboard_items SET image_path='shared.png' WHERE id=?", [c]).unwrap();
+    assert_eq!(repo.batch_delete(&[keep, c]).unwrap(), (2, vec!["shared.png".into()]));
+}
+
+#[test]
+fn gpui_sync_export_never_publishes_partial_settings_or_tags() {
+    for corrupt in ["INSERT INTO settings(key, value) VALUES ('broken', X'01')", "INSERT INTO tags(name) VALUES (X'01')"] {
+        let f = Fixture::new();
+        f.insert("valid history");
+        f.db().write_connection().lock().execute(corrupt, []).unwrap();
+        let result = crate::webdav::export_sync_data_to_file(f.db(), &f.dir, &crate::webdav::SyncOptions::default());
+        assert!(result.is_err(), "export succeeded with incomplete settings/tags");
+        assert!(!std::fs::read_dir(&f.dir).unwrap().flatten().any(|entry| entry.path().extension().is_some_and(|ext| ext == "zip")), "failed archive was not removed");
+    }
+}
+
+#[test]
+fn gpui_valid_sync_export_keeps_flags_tags_and_compact_schema() {
+    use std::io::Read;
+    let f = Fixture::new();
+    let id = f.insert("roundtrip");
+    let repo = ClipboardRepository::new(f.db());
+    repo.toggle_favorite(id).unwrap();
+    repo.toggle_pin(id).unwrap();
+    let tags = TagRepository::new(f.db());
+    let tag = tags.create("keep").unwrap(); tags.add_tag_to_item(id, tag.id).unwrap();
+    let (path, _) = crate::webdav::export_sync_data_to_file(f.db(), &f.dir, &crate::webdav::SyncOptions::default()).unwrap();
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+    let mut json = String::new(); archive.by_name("items.json").unwrap().read_to_string(&mut json).unwrap();
+    let items: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(items[0]["is_favorite"], true); assert_eq!(items[0]["is_pinned"], true);
+    json.clear(); archive.by_name("tags.json").unwrap().read_to_string(&mut json).unwrap();
+    let data: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(data["tags"][0]["name"], "keep");
+    assert_eq!(data["tags"][0]["associations"][0]["content_hash"], "roundtrip");
+    assert!(data.get("associations").is_none());
 }

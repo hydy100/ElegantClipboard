@@ -506,12 +506,12 @@ pub fn export_sync_data_to_file(
         // 导出设置
         if options.sync_settings {
             let settings_repo = crate::database::SettingsRepository::new(db);
-            if let Ok(all_settings) = settings_repo.get_all() {
-                zip.start_file("settings.json", zip_options)
-                    .map_err(|e| e.to_string())?;
-                serde_json::to_writer(&mut zip, &all_settings)
-                    .map_err(|e| format!("序列化设置失败: {}", e))?;
-            }
+            let all_settings = settings_repo.get_all()
+                .map_err(|e| format!("读取同步设置失败: {}", e))?;
+            zip.start_file("settings.json", zip_options)
+                .map_err(|e| e.to_string())?;
+            serde_json::to_writer(&mut zip, &all_settings)
+                .map_err(|e| format!("序列化设置失败: {}", e))?;
         }
 
         let content_types = build_type_filter(options);
@@ -535,7 +535,9 @@ pub fn export_sync_data_to_file(
 
         // 导出标签及其条目关联
         let tag_repo = crate::database::TagRepository::new(db);
-        if let Ok(tags_data) = tag_repo.export_tags_sync_data() {
+        {
+            let tags_data = tag_repo.export_tags_sync_data()
+                .map_err(|e| format!("读取同步标签失败: {}", e))?;
             if !tags_data.tags.is_empty() {
                 zip.start_file("tags.json", zip_options)
                     .map_err(|e| e.to_string())?;
@@ -1822,9 +1824,19 @@ pub fn start_auto_sync_task(
                                 let tf = content_types.join(",");
                                 crate::database::ClipboardRepository::new(&db)
                                     .query_items_for_sync(&tf, max_bs)
-                                    .unwrap_or_default()
+                                    .map_err(|error| error.to_string())
                             } else {
-                                Vec::new()
+                                Ok(Vec::new())
+                            };
+                            let local_items = match local_items {
+                                Ok(items) => items,
+                                Err(error) => {
+                                    tracing::warn!(%error, "Skipping media synchronization: incomplete local references");
+                                    MEDIA_SYNC_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
+                                    cycle_count = cycle_count.wrapping_add(1);
+                                    std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+                                    continue;
+                                }
                             };
                             let local_map =
                                 build_media_map(&local_items, &data_dir, &options, &device_id);
@@ -1845,7 +1857,16 @@ pub fn start_auto_sync_task(
                                     }
                                 }
                             } else {
-                                download_media_map(&config).unwrap_or_default()
+                                match download_media_map(&config) {
+                                    Ok(map) => map,
+                                    Err(error) => {
+                                        tracing::warn!(%error, "Skipping media synchronization: remote map unavailable");
+                                        MEDIA_SYNC_RUNNING.store(false, std::sync::atomic::Ordering::Relaxed);
+                                        cycle_count = cycle_count.wrapping_add(1);
+                                        std::thread::sleep(std::time::Duration::from_secs(interval_secs));
+                                        continue;
+                                    }
+                                }
                             };
 
                             // 清理云端不再被任何设备引用的媒体文件

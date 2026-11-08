@@ -124,7 +124,7 @@ pub async fn webdav_upload(
         // 没有启用任何媒体同步时，不读取、创建或清理 media_map。
         if options.sync_image || options.sync_files || options.sync_video {
             let device_id = webdav::get_or_create_device_id(&db);
-            let local_map = build_local_media_map(&db, &data_dir, &options, &device_id);
+            let local_map = build_local_media_map(&db, &data_dir, &options, &device_id)?;
             let merged_map = if !local_map.is_empty() {
                 match webdav::upload_media_map(&config, &local_map, &device_id) {
                     Ok(map) => Some(map),
@@ -134,7 +134,7 @@ pub async fn webdav_upload(
                     }
                 }
             } else {
-                Some(webdav::download_media_map(&config).unwrap_or_default())
+                Some(webdav::download_media_map(&config)?)
             };
 
             if let Some(ref merged_map) = merged_map {
@@ -214,17 +214,17 @@ fn build_local_media_map(
     data_dir: &std::path::Path,
     options: &SyncOptions,
     device_id: &str,
-) -> Vec<webdav::MediaEntry> {
+) -> Result<Vec<webdav::MediaEntry>, String> {
     let max_bs = webdav::calc_max_query_size(options);
     let content_types = webdav::build_type_filter(options);
     if content_types.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let tf = content_types.join(",");
     let items = crate::database::ClipboardRepository::new(db)
         .query_items_for_sync(&tf, max_bs)
-        .unwrap_or_default();
-    webdav::build_media_map(&items, data_dir, options, device_id)
+        .map_err(|e| format!("读取本地媒体引用失败: {}", e))?;
+    Ok(webdav::build_media_map(&items, data_dir, options, device_id))
 }
 
 /// 启动单类媒体上传线程

@@ -47,9 +47,7 @@ impl SettingsRepository {
         let settings = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+            })?.collect::<Result<_, _>>()?;
         Ok(settings)
     }
 
@@ -69,9 +67,7 @@ impl SettingsRepository {
         let rows = stmt
             .query_map(params.as_slice(), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+            })?.collect::<Result<_, _>>()?;
         Ok(rows)
     }
 

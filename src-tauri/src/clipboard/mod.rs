@@ -40,14 +40,21 @@ pub fn cleanup_orphan_files(db: &crate::database::Database, data_dir: &std::path
 
     let repo = crate::database::ClipboardRepository::new(db);
 
+    // An unreadable row is not evidence that its file is orphaned. Gather both
+    // complete reference sets before touching disk; never substitute an empty set.
+    let (image_paths, icon_paths) = match (repo.get_all_image_paths(), repo.get_all_icon_paths()) {
+        (Ok(images), Ok(icons)) => (images, icons),
+        (images, icons) => {
+            tracing::warn!(image_error = ?images.err(), icon_error = ?icons.err(),
+                "Skipping orphan cleanup: database references could not be read completely");
+            return;
+        }
+    };
+
     // 清理孤立图片
     let images_dir = data_dir.join("images");
     if images_dir.is_dir() {
-        let referenced: HashSet<String> = repo
-            .get_all_image_paths()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        let referenced: HashSet<String> = image_paths.into_iter().collect();
 
         let mut orphan_count = 0usize;
         if let Ok(entries) = std::fs::read_dir(&images_dir) {
@@ -79,11 +86,7 @@ pub fn cleanup_orphan_files(db: &crate::database::Database, data_dir: &std::path
     // 清理孤立图标
     let icons_dir = data_dir.join("icons");
     if icons_dir.is_dir() {
-        let referenced: HashSet<String> = repo
-            .get_all_icon_paths()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        let referenced: HashSet<String> = icon_paths.into_iter().collect();
 
         let mut orphan_count = 0usize;
         if let Ok(entries) = std::fs::read_dir(&icons_dir) {

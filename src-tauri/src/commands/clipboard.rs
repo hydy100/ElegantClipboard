@@ -489,7 +489,7 @@ pub async fn clear_all_history(state: State<'_, Arc<AppState>>) -> Result<i64, S
         use tracing::info;
 
         let repo = ClipboardRepository::new(&state.db);
-        let image_paths = repo.get_all_image_paths().unwrap_or_default();
+        let image_paths = repo.get_all_image_paths().map_err(|e| e.to_string())?;
         let deleted = repo.clear_all().map_err(|e| e.to_string())?;
         let deleted_files = crate::clipboard::cleanup_image_files(&image_paths);
         state.db.vacuum().ok();
@@ -515,7 +515,7 @@ pub async fn clear_history(
         let repo = ClipboardRepository::new(&state.db);
         let image_paths = repo
             .get_clearable_image_paths(content_type.as_deref())
-            .unwrap_or_default();
+            .map_err(|e| e.to_string())?;
         let deleted = repo
             .clear_history(content_type.as_deref())
             .map_err(|e| e.to_string())?;

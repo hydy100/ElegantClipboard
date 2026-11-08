@@ -305,8 +305,8 @@ pub async fn export_data(
         // 导出数据库引用的图片和图标文件（跳过孤立的磁盘文件）
         let repo = database::ClipboardRepository::new(&state.db);
         {
-            let referenced_images = repo.get_all_image_paths().unwrap_or_default();
-            let referenced_icons = repo.get_all_icon_paths().unwrap_or_default();
+            let referenced_images = repo.get_all_image_paths().map_err(|e| e.to_string())?;
+            let referenced_icons = repo.get_all_icon_paths().map_err(|e| e.to_string())?;
             let mut exported_icon_filenames = std::collections::HashSet::new();
             for image_path in &referenced_images {
                 let p = std::path::Path::new(image_path);
